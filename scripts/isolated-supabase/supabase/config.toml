@@ -1,0 +1,44 @@
+# REVIEW ONLY. Do not start until CLI compatibility and resource guards are verified.
+project_id = "trueblue-http-isolated-test"
+
+[api]
+enabled = true
+port = 55421
+
+[db]
+port = 55422
+shadow_port = 55420
+major_version = 15
+
+[db.pooler]
+enabled = false
+port = 55429
+
+[db.migrations]
+enabled = false
+
+[db.seed]
+enabled = false
+
+[studio]
+enabled = false
+port = 55423
+
+[local_smtp]
+enabled = false
+port = 55424
+smtp_port = 55425
+pop3_port = 55426
+
+[analytics]
+enabled = false
+port = 55427
+vector_port = 55430
+
+[edge_runtime]
+enabled = false
+inspector_port = 55428
+
+[auth]
+enabled = true
+site_url = "http://127.0.0.1:3300"

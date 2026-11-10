@@ -1,0 +1,6 @@
+import React from 'react';
+import type {StockItem,Warehouse} from '../types';
+export default function WarehouseOverview({warehouses,stock,onViewStock}:{warehouses:Warehouse[];stock:StockItem[];onViewStock:(id:string)=>void}){
+ const ids=Array.from(new Set([...warehouses.map(w=>w.id),...stock.map(s=>s.warehouseId||'WH-CENTRAL')]));
+ return <section className="trueblue-warehouse-overview"><header><h1>Warehouse</h1><p>Semua warehouse di cabang aktif. Pilih cabang lain melalui pilihan cabang di atas.</p><span className="trueblue-readonly">Hanya lihat · seluruh cabang</span></header><div className="trueblue-warehouse-grid">{ids.map(id=>{const wh=warehouses.find(w=>w.id===id),rows=stock.filter(s=>(s.warehouseId||'WH-CENTRAL')===id);return <article key={id}><small>{id}</small><h2>{wh?.name||rows[0]?.warehouseName||(id==='WH-CENTRAL'?'Gudang Pusat':id)}</h2><p>{wh?.city||'Lokasi gudang'}</p><dl><div><dt>SKU</dt><dd>{new Set(rows.map(s=>s.skuId)).size.toLocaleString('id-ID')}</dd></div><div><dt>Stok (pcs)</dt><dd>{rows.reduce((n,s)=>n+(Number(s.qty)||0),0).toLocaleString('id-ID')}</dd></div></dl><button onClick={()=>onViewStock(id)}>Lihat stok</button></article>})}</div>{!ids.length&&<p>Belum ada warehouse di cabang ini.</p>}</section>
+}

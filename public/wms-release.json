@@ -1,0 +1,10 @@
+{
+  "release": "2026-11-05-audited-purge-and-flow-review",
+  "assistantFix": "2026-11-06-session-forwarding-and-config-status",
+  "menuAuditFixes": "2026-11-06-all-menu-audit-12-fixes",
+  "menuAuditFixGroups": 12,
+  "completeDataLoading": "2026-11-06-cursor-pagination-and-stale-response-guard",
+  "darkTheme": "2026-11-07-complete-dark-surfaces",
+  "inventoryView": "2026-11-07-grouped-sku-pickable-availability",
+  "dashboardView": "2026-11-07-dashboard-and-order-queue-alignment"
+}

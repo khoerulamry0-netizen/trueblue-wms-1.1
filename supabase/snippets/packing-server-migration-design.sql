@@ -1,0 +1,62 @@
+-- REVIEW DRAFT ONLY: this file is not a migration and does not implement the
+-- server guard. Do not execute it against any database.
+--
+-- Proposed private data:
+-- * scan_sessions: branch, order reference, phase (sorting/packing), actor,
+--   basket, state and snapshot of every order document ID and revision.
+-- * scan_events: session, unique client request UUID, matched document ID,
+--   canonical SKU and server timestamp. One accepted event represents one unit.
+--   Unique request IDs must make retries idempotent, including after timeouts.
+-- * direct_outbound_requests: request UUID, actor, branch, nonempty reason and
+--   transaction identity, with immutable audit via activity_events.
+-- No direct authenticated insert/update/delete permissions on these tables.
+--
+-- Proposed SECURITY DEFINER RPCs with fixed empty search_path, explicit EXECUTE
+-- grants, auth.uid(), active role and branch checks:
+-- 1. Start sorting: lock the branch and all pending picked order rows, capture
+--    IDs/revisions, required SKU/quantity and basket; reject ambiguous orders.
+-- 2. Record sorting scan: resolve input against the trusted catalog barcode,
+--    validate session actor, branch, snapshot and SKU, lock session/line, add
+--    exactly one event, reject foreign SKU and excess. Bind retries to request
+--    UUID and identical request body. Multiple rows with the same SKU must be
+--    assigned deterministically without allowing any line over its quantity.
+-- 3. Finish sorting: in one transaction lock and recheck all current order
+--    revisions and exact per-line event totals; write basket and server-owned
+--    sorting metadata atomically. No client-supplied sortedAt is evidence.
+-- 4. Start and record packing: require server-confirmed sorting for all lines,
+--    record scans separately with the same actor, idempotency and bounds rules.
+-- 5. Finish packing: under the same branch lock, verify unchanged complete
+--    order snapshot, exact sorting and packing events and valid roles; atomically
+--    write Completed, audit and a server-issued receipt authorization. A retry
+--    must return the same result without repeating stock or audit changes.
+-- 6. Direct outbound: separate Administrator-only RPC, new order identities
+--    only, mandatory bounded reason, stock validation and immutable audit in
+--    the same transaction. Existing pending orders cannot use this path.
+-- 7. Resume/status and receipt evidence: an authenticated, branch- and
+--    actor-checked status RPC must return authoritative per-line event counts,
+--    the session state and the outcome of an ambiguous finish. Receipt reprint
+--    must use server-issued proof bound to the committed order, rather than a
+--    browser-supplied Completed status or sortedAt value. Define explicitly
+--    how pre-existing completed orders without that proof are handled.
+--
+-- The candidate now sketches status, retry and receipt-proof RPCs. These
+-- changes have not yet been run on PostgreSQL or integrated into the UI and
+-- are not a final migration. Test lost responses, replay, stale snapshots and
+-- real HTTP/JWT authorization before considering deployment.
+--
+-- Replace/guard every generic commit path, including public and private
+-- commit_wms_write, batch/legacy entry points and triggers: reject client-owned
+-- sorting metadata and transitions to Completed unless produced by the
+-- corresponding trusted server transaction. Do not rely on a caller-settable
+-- custom GUC as authorization. Preserve picking, cancellation, imports, and
+-- legitimate existing data; account for BEFORE INSERT on UPSERT.
+--
+-- Concurrency tests must cover replay, duplicate request/body mismatch,
+-- foreign branch and role, changed revisions or order lines, duplicate SKUs,
+-- over-scan, stale sessions, simultaneous scans, rollback, network timeout,
+-- direct completion/forged metadata and direct-outbound privilege/audit.
+-- Run only against an independently provisioned disposable database after
+-- approval, never against the existing development data as an offline test.
+--
+-- Server-validated barcode events establish what was submitted, not that a
+-- trusted physical scanner scanned the goods.

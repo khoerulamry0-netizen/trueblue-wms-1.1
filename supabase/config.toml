@@ -1,0 +1,7 @@
+project_id = "unified-wms-dev"
+
+[db.pooler]
+enabled = true
+
+[functions.admin-users]
+verify_jwt = true

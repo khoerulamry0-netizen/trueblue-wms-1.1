@@ -1,0 +1,78 @@
+diff --git a/src/components/MabangWmsOutbound.tsx b/src/components/MabangWmsOutbound.tsx
+index ee43c70..7689491 100644
+--- a/src/components/MabangWmsOutbound.tsx
++++ b/src/components/MabangWmsOutbound.tsx
+@@ -632,6 +632,11 @@ export default function MabangWmsOutbound({
+   const [sortLastAssignedSlot, setSortLastAssignedSlot] = useState<number | null>(null);
+   const [sortSelectedSlotNumber, setSortSelectedSlotNumber] = useState<number | null>(null);
+   const [sortNotification, setSortNotification] = useState<{ type: 'success' | 'error' | 'info'; message: string } | null>(null);
++  const [bigBasketDisplay, setBigBasketDisplay] = useState(false);
++  const [lastVisualScan, setLastVisualScan] = useState<{slot: SortBasketSlot; basket: string} | null>(null);
++  const sortProductRef = useRef<HTMLInputElement>(null);
++  const visibleScan = lastVisualScan && sortSlots.includes(lastVisualScan.slot) &&
++    lastVisualScan.slot.basketCode === lastVisualScan.basket ? lastVisualScan : null;
+ 
+   // Cek apakah semua slot yang aktif sudah diinput keranjangnya
+   const allBasketsBound = useMemo(() => {
+@@ -887,6 +892,16 @@ export default function MabangWmsOutbound({
+     }
+   };
+ 
++  const handleVisualSortScan = (e: React.FormEvent) => {
++    const previousCounts = sortSlots.map(slot => Object.values(slot.itemsDecomposed).reduce((sum, qty) => sum + qty, 0));
++    handleSortScanProduct(e);
++    // The archived handler increments the selected slot synchronously.
++    const slot = sortSlots.find((candidate, index) =>
++      Object.values(candidate.itemsDecomposed).reduce((sum, qty) => sum + qty, 0) > previousCounts[index]);
++    setLastVisualScan(slot ? {slot, basket: slot.basketCode} : null);
++    sortProductRef.current?.focus();
++  };
++
+   const handleEndSorting = async () => {
+     if (sortSlots.length === 0) return;
+     
+@@ -1860,7 +1875,7 @@ export default function MabangWmsOutbound({
+             </div>
+ 
+             {/* Scan Product Form (Aktif jika seluruh keranjang sudah diikat) */}
+-            <form onSubmit={handleSortScanProduct} className={`flex items-center text-xs border rounded-md overflow-hidden bg-white ${
++            <form onSubmit={handleVisualSortScan} className={`flex items-center text-xs border rounded-md overflow-hidden bg-white ${
+               allBasketsBound 
+                 ? 'border-emerald-400 ring-2 ring-emerald-200' 
+                 : 'border-slate-300 opacity-60'
+@@ -1871,6 +1886,7 @@ export default function MabangWmsOutbound({
+               <input
+                 type="text"
+                 placeholder={allBasketsBound ? "Tembak barcode SKU untuk sortir..." : "Wajib input basket dulu..."}
++                ref={sortProductRef}
+                 value={sortProductInput}
+                 onChange={e => setSortProductInput(e.target.value)}
+                 disabled={!allBasketsBound}
+@@ -1892,13 +1908,26 @@ export default function MabangWmsOutbound({
+               <span>End of sorting</span>
+             </button>
+ 
++            <button type="button" onClick={() => { setBigBasketDisplay(value => !value); sortProductRef.current?.focus(); }}
++              aria-pressed={bigBasketDisplay}
++              className="px-3 py-1.5 text-xs font-bold rounded-md bg-slate-700 text-white">
++              BIG BASKET {bigBasketDisplay ? 'ON' : 'OFF'}
++            </button>
++
+             {/* Last Assigned Indicator */}
+-            {sortLastAssignedSlot && (
++            {sortLastAssignedSlot && visibleScan && (
+               <div className="animate-pulse bg-amber-400 text-slate-950 px-3 py-1 rounded-md text-xs font-black ml-auto">
+                 👉 Masukkan ke Keranjang: {sortSlots.find(s => s.slotNumber === sortLastAssignedSlot)?.basketCode}
+               </div>
+             )}
+ 
++            {bigBasketDisplay && visibleScan && (
++              <div role="status" aria-live="polite" className="w-full rounded-xl p-6 text-center font-black text-white bg-green-700">
++                <div className="text-xl">MASUKKAN KE KERANJANG</div>
++                <div className="text-6xl sm:text-8xl break-all">{visibleScan.basket}</div>
++              </div>
++            )}
++
+             {/* Notification alert (DIPERBESAR KHUSUSNYA JIKA ERROR / SALAH SCAN KARENA TANPA SPEAKER) */}
+             {sortNotification && (
+               sortNotification.type === 'error' ? (

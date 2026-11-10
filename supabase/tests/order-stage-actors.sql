@@ -1,0 +1,21 @@
+begin;
+insert into public.branches(id,name) values('TST_ACTOR','Synthetic actors');
+do $t$ declare a uuid=gen_random_uuid();b uuid=gen_random_uuid();c uuid=gen_random_uuid();p jsonb;begin
+insert into auth.users(id,email,raw_user_meta_data) values(a,'input-'||a||'@example.invalid','{}'),(b,'picker-'||b||'@example.invalid','{}'),(c,'packer-'||c||'@example.invalid','{}');
+update public.profiles set full_name='Synthetic Input',role='Administrator',is_active=true where id=a;
+update public.profiles set full_name='Synthetic Picker',role='Picker',is_active=true,branch_id='TST_ACTOR' where id=b;
+update public.profiles set full_name='Synthetic Sorter Packer',role='Packer',is_active=true,branch_id='TST_ACTOR' where id=c;
+perform set_config('request.jwt.claim.sub',a::text,true);
+insert into public.wms_documents(branch_id,collection_name,document_id,payload) values('TST_ACTOR','orders','SYNTH_ACTOR','{"id":"SYNTH_ACTOR","referenceNumber":"SYNTH_REF","qty":1,"status":"Pending","stockDeducted":false,"picked":false,"createdBy":"FORGED"}');
+perform set_config('request.jwt.claim.sub',b::text,true);
+update public.wms_documents set payload=payload||'{"picked":true,"stockDeducted":true,"pickedBy":"FORGED","createdBy":"FORGED"}'::jsonb where branch_id='TST_ACTOR' and document_id='SYNTH_ACTOR';
+perform set_config('request.jwt.claim.sub',c::text,true);
+update public.wms_documents set payload=payload||'{"sortedAt":"requested","sortedBy":"FORGED"}'::jsonb where branch_id='TST_ACTOR' and document_id='SYNTH_ACTOR';
+update public.wms_documents set payload=payload||'{"status":"Completed","packedBy":"FORGED"}'::jsonb where branch_id='TST_ACTOR' and document_id='SYNTH_ACTOR';
+select payload into p from public.wms_documents where branch_id='TST_ACTOR' and document_id='SYNTH_ACTOR';
+if p->>'createdBy'<>'Synthetic Input' or p->>'pickedBy'<>'Synthetic Picker' or p->>'sortedBy'<>'Synthetic Sorter Packer' or p->>'packedBy'<>'Synthetic Sorter Packer' or p->>'completedAt' is null then raise exception 'Actor transition attribution failed: %',p;end if;
+update public.wms_documents set payload=payload||'{"createdBy":"FORGED","pickedBy":"FORGED","sortedBy":"FORGED","packedBy":"FORGED","notes":"metadata edit"}'::jsonb where branch_id='TST_ACTOR' and document_id='SYNTH_ACTOR';
+select payload into p from public.wms_documents where branch_id='TST_ACTOR' and document_id='SYNTH_ACTOR';
+if p->>'createdBy'<>'Synthetic Input' or p->>'pickedBy'<>'Synthetic Picker' or p->>'sortedBy'<>'Synthetic Sorter Packer' or p->>'packedBy'<>'Synthetic Sorter Packer' then raise exception 'History could be overwritten';end if;
+if exists(select 1 from jsonb_each_text(p) where key in ('createdAt','pickedAt','sortedAt','packedAt','completedAt') and value !~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}T') then raise exception 'Stage timestamp must include date';end if; end;$t$;
+rollback;

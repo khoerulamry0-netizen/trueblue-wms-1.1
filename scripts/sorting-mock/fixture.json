@@ -1,0 +1,5 @@
+[
+  {"id":"mock-line-1","referenceNumber":"MOCK-ORDER-001","skuId":"DEV-SKU-001","skuName":"Produk Dummy Satu","expiredDate":"31/12/2030","qty":2,"location":"A-01","timestamp":"2026-01-01T00:00:00Z","scanned":false,"status":"Pending","picked":true,"stockDeducted":true,"basketNumber":"MOCK-BATCH","customerName":"Dummy 1"},
+  {"id":"mock-line-2","referenceNumber":"MOCK-ORDER-002","skuId":"DEV-SKU-002","skuName":"Produk Dummy Dua","expiredDate":"31/12/2030","qty":1,"location":"A-02","timestamp":"2026-01-01T00:00:00Z","scanned":false,"status":"Pending","picked":true,"stockDeducted":true,"basketNumber":"MOCK-BATCH","customerName":"Dummy 2"},
+  {"id":"mock-line-3","referenceNumber":"MOCK-ORDER-003","skuId":"DEV-SKU-001","skuName":"Produk Dummy Satu","expiredDate":"31/12/2030","qty":1,"location":"A-01","timestamp":"2026-01-01T00:00:00Z","scanned":false,"status":"Pending","picked":true,"stockDeducted":true,"basketNumber":"MOCK-BATCH","customerName":"Dummy 3"}
+]
