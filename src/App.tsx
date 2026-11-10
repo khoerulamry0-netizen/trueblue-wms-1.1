@@ -39,6 +39,7 @@ import CrossDevice from './components/CrossDevice';
 import WarehouseMap from './components/WarehouseMap';
 import StockOpnamePerLocation from './components/StockOpnamePerLocation';
 import ThermalLabelPrinter from './components/ThermalLabelPrinter';
+import MarketplaceWebhook from './components/MarketplaceWebhook';
 
 import AuditTrail from './components/AuditTrail';
 import { 
@@ -2995,6 +2996,18 @@ export default function App() {
                 onUpdateUser={handleUpdateUser}
                 onDeleteUser={handleDeleteUser}
               />
+            </motion.div>
+          )}
+
+          {activeTab === 'marketplace-webhook' && (currentUser?.role === 'Administrator' || currentUser?.role === 'Admin') && (
+            <motion.div
+              key="marketplace-webhook"
+              initial={{ opacity: 0, y: 15 }}
+              animate={{ opacity: 1, y: 0 }}
+              exit={{ opacity: 0, y: -15 }}
+              transition={{ duration: 0.15 }}
+            >
+              <MarketplaceWebhook stock={stock} onNavigateTab={navigateFromMenu} />
             </motion.div>
           )}
 

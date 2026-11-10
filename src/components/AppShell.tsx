@@ -1,6 +1,6 @@
 import AccountSecurity from './AccountSecurity';
 import React, {useState,useEffect,useRef} from 'react';
-import {LayoutDashboard,Package,Truck,ClipboardList,Boxes,ClipboardCheck,ArrowLeftRight,Calendar,LineChart,Database,Users,MessageSquare,Menu,X,KeyRound,LogOut,RefreshCw,UploadCloud,ChevronRight,Moon,Sun,Shield} from 'lucide-react';
+import {LayoutDashboard,Package,Truck,ClipboardList,Boxes,ClipboardCheck,ArrowLeftRight,Calendar,LineChart,Database,Users,MessageSquare,Menu,X,KeyRound,LogOut,RefreshCw,UploadCloud,ChevronRight,Moon,Sun,Shield,Webhook} from 'lucide-react';
 import BranchPanel from './BranchPanel';
 import WriteStatus from './WriteStatus';
 import type {UiTheme} from '../utils/uiTheme';
@@ -13,7 +13,7 @@ const operators=[...management,'Picker','Packer','Shipping'];
 const menus=[
  {group:'Ringkasan',items:[{id:'dashboard',label:'Dashboard DC',icon:LayoutDashboard},{id:'analytics',label:'Analitik',icon:LineChart,roles:management}]},
  {group:'Operasional',items:[{id:'inventory',label:'Stok',icon:Package,roles:[...management,'Viewer']},{id:'inbound',label:'Inbound',icon:Truck,roles:management},{id:'bulk',label:'Outbound',icon:ClipboardList,roles:operators},{id:'mabang',label:'Picking/Packing',icon:Boxes,roles:operators},{id:'quick-outbound',label:'Outbound Cepat',icon:ClipboardCheck,roles:management},{id:'bulk-transfer',label:'Warehouse & Transfer',icon:ArrowLeftRight,roles:[...management,'Viewer']},{id:'daily-cycle-count',label:'Stock Opname (DCC)',icon:Calendar,roles:management}]},
- {group:'Master data',items:[{id:'catalog',label:'Katalog Produk',icon:Database,roles:management},{id:'users',label:'Kelola Operator',icon:Users,roles:management}]}
+ {group:'Master data',items:[{id:'catalog',label:'Katalog Produk',icon:Database,roles:management},{id:'users',label:'Kelola Operator',icon:Users,roles:management},{id:'marketplace-webhook',label:'Webhook API',icon:Webhook,roles:management}]}
 ];
 export default function AppShell({theme,onToggleTheme,children,activeTab,onNavigate,currentUser,connected,stockSyncState,onLogout,onRefresh,onUpload,totalQty}:Props){
  const [securityOpen,setSecurityOpen]=useState(false);
