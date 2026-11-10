@@ -24,7 +24,6 @@ import Dashboard from './components/Dashboard';
 import InventoryList from './components/InventoryList';
 import BulkOutbound from './components/BulkOutbound';
 import BatchDashboard from './components/BatchDashboard';
-import AiChatbot from './components/AiChatbot';
 import AnalyticsDashboard from './components/AnalyticsDashboard';
 import BasketLabelGeneratorModal from './components/BasketLabelGeneratorModal';
 import MabangWmsOutbound from './components/MabangWmsOutbound';
@@ -1125,12 +1124,16 @@ export default function App() {
   // - Administrator: full access termasuk 'users' (Kelola Akun)
   useEffect(() => {
     if (!isLoggedIn) return;
+    if (activeTab === 'ai-chat') {
+      setActiveTab('dashboard');
+      return;
+    }
     if (currentUser?.role === 'Packer' || currentUser?.role === 'Picker' || currentUser?.role === 'Shipping') {
-      if (!['dashboard', 'bulk', 'mabang', 'ai-chat'].includes(activeTab)) {
+      if (!['dashboard', 'bulk', 'mabang'].includes(activeTab)) {
         setActiveTab('bulk');
       }
     } else if (currentUser?.role === 'Viewer') {
-      if (!['dashboard', 'inventory', 'bulk-transfer', 'ai-chat'].includes(activeTab)) {
+      if (!['dashboard', 'inventory', 'bulk-transfer'].includes(activeTab)) {
         setActiveTab('dashboard');
       }
     }
@@ -2792,12 +2795,6 @@ export default function App() {
           {activeTab === 'analytics' && (
             <motion.div key="analytics" initial={{ opacity: 0, y: 15 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: -15 }}>
               <AnalyticsDashboard stock={stock} logs={logs} />
-            </motion.div>
-          )}
-
-          {activeTab === 'ai-chat' && (
-            <motion.div key="ai-chat" initial={{ opacity: 0, y: 15 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: -15 }}>
-              <AiChatbot stock={stock} orderHistory={orderHistory} currentUser={currentUser} onNavigateTab={navigateFromMenu} />
             </motion.div>
           )}
 
