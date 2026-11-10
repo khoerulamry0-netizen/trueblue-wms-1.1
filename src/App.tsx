@@ -858,9 +858,17 @@ export default function App() {
 
   const runAdminAction = async (body: Record<string, unknown>) => {
     if (!supabase) throw new Error('Supabase belum dikonfigurasi.');
+    const { data: rpcData, error: rpcError } = await supabase.rpc('admin_manage_user', { body });
+    if (!rpcError) {
+      if (rpcData && typeof rpcData === 'object' && 'error' in rpcData) {
+        throw new Error(String((rpcData as Record<string, unknown>).error));
+      }
+      return rpcData;
+    }
     const { data, error } = await supabase.functions.invoke('admin-users', { body });
     if (error) throw new Error(error.message);
     if (data?.error) throw new Error(String(data.error));
+    return data;
   };
 
   const handleAddUser = async (newUser: UserAccount) => {
