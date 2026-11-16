@@ -92,7 +92,6 @@ interface BulkOutboundProps {
     refNum: string,
     sessionData: OrderSessionData
   ) => Promise<OrderSessionResult | false>;
-  onUpdateOrdersShipped?: (orderRefs: string[], manifestInfo: any, isCancelled?: boolean) => Promise<boolean>;
   onAssignOrderType?: (assignments: Array<{ id?: string; referenceNumber?: string; orderType: ChannelOperationType }>) => Promise<boolean>;
 }
 
@@ -123,7 +122,6 @@ export default function BulkOutbound({
   onClearAllOrderHistory,
   onBatchEditExpiredDate,
   onUpdateOrderSession,
-  onUpdateOrdersShipped,
   onAssignOrderType,
   channelMode,
   initialMode,

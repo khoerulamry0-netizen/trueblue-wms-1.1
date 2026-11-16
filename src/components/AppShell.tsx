@@ -37,7 +37,7 @@ export default function AppShell({theme,onToggleTheme,children,activeTab,onNavig
    {
      group: t('nav.summary'),
      items: [
-       { id: 'dashboard', label: t('nav.dashboard'), icon: LayoutDashboard, roles: [...management, 'Viewer'] },
+       { id: 'dashboard', label: t('nav.dashboard'), icon: LayoutDashboard, roles: [...management, 'Viewer', 'Shipping'] },
        { id: 'analytics', label: t('nav.analytics'), icon: LineChart, roles: management }
      ]
    },
@@ -74,12 +74,6 @@ export default function AppShell({theme,onToggleTheme,children,activeTab,onNavig
      ]
    }] : []),
    {
-     group: t('nav.shippingGroup'),
-     items: [
-       { id: 'shipping-manifest', label: t('nav.shippingManifest'), icon: Truck, roles: [...management, 'Shipping'] }
-     ]
-   },
-   {
      group: t('nav.masterData'),
      items: [
        { id: 'catalog', label: t('nav.catalog'), icon: Database, roles: management },
@@ -90,7 +84,7 @@ export default function AppShell({theme,onToggleTheme,children,activeTab,onNavig
  }, [t, branchOperationType]);
 
  const homeRoute = currentUser?.role === 'Shipping'
-  ? 'shipping-manifest'
+  ? 'dashboard'
   : currentUser?.role === 'Picker'
     ? 'picker-hub'
     : currentUser?.role === 'Packer'
@@ -142,7 +136,7 @@ export default function AppShell({theme,onToggleTheme,children,activeTab,onNavig
   </aside>
   <div className="blues-workspace" inert={open?true:undefined}>
    <header className="blues-topbar"><div className="blues-topbar-start"><button ref={toggle} className="blues-menu-toggle blues-icon-button" aria-label={isDesktop&&!desktopCollapsed?'Sembunyikan menu navigasi':'Buka menu navigasi'} aria-expanded={isDesktop?!desktopCollapsed:open} aria-controls="blues-sidebar" onClick={()=>{if(isDesktop)setDesktopCollapsed(value=>!value);else setOpen(true)}}><Menu size={22}/></button><div className="blues-breadcrumb"><span>{t('topbar.workspace')}</span><ChevronRight size={14}/><strong>{active?.label||t('topbar.operations')}</strong></div></div>
-    <div className="blues-topbar-end"><BranchPanel currentUser={currentUser} navigationTarget={adminTarget} onAction={()=>setOpen(false)} onOpenWebhook={()=>navigate('marketplace-webhook')} onBranchOperationTypeChange={onBranchOperationTypeChange}/><button type="button" className="blues-icon-button blues-lang-toggle" aria-label={language === 'id' ? t('topbar.switchToEnglish') : t('topbar.switchToIndonesian')} title={language === 'id' ? t('topbar.switchToEnglish') : t('topbar.switchToIndonesian')} onClick={toggleLanguage}><span className="font-extrabold text-[11px] font-mono tracking-tight select-none px-1">{language === 'id' ? 'EN' : 'ID'}</span></button><div className="blues-accent-control" ref={accentMenu}><button className="blues-icon-button" aria-label="Pilih warna aksen" title="Warna aksen" aria-haspopup="menu" aria-expanded={accentOpen} onClick={()=>setAccentOpen(value=>!value)}><Palette size={19}/></button>{accentOpen&&<div className="blues-accent-menu" role="menu" aria-label="Warna aksen">{accentOptions.map(option=><div className="blues-accent-row" key={option.id}>{option.id==='custom'?<><label className="blues-accent-option"><span className="blues-accent-swatch" style={{background:customAccent}}/><span>Kustom</span><input className="blues-custom-color" type="color" value={customAccent} aria-label="Pilih warna aksen kustom" onChange={event=>{setCustomAccent(event.target.value);setAccent('custom')}}/>{accent==='custom'&&<Check size={18}/>}</label></>:<button role="menuitemradio" aria-checked={accent===option.id} className="blues-accent-option" onClick={()=>{setAccent(option.id);setAccentOpen(false)}}><span className="blues-accent-swatch" style={{background:option.color}}/><span>{option.label}</span>{accent===option.id&&<Check size={18}/>}</button>}</div>)}</div>}</div><button className="blues-icon-button blues-theme-toggle" aria-label={theme==='dark'?'Gunakan mode terang':'Gunakan mode gelap'} title={theme==='dark'?'Gunakan mode terang':'Gunakan mode gelap'} aria-pressed={theme==='dark'} onClick={onToggleTheme}>{theme==='dark'?<Sun size={19}/>:<Moon size={19}/>}</button><div className="blues-user"><span className="blues-avatar">{currentUser?.fullName?.charAt(0)||'U'}</span><div><strong>{currentUser?.fullName}</strong><small>{currentUser?.role}</small></div></div><button className="blues-icon-button" aria-label={t('topbar.changePassword')} title={t('topbar.changePassword')} onClick={()=>setSecurityOpen(true)}><KeyRound size={18}/></button><button id="header-logout-btn" className="blues-icon-button blues-logout" aria-label={t('topbar.logout')} title={t('topbar.logout')} onClick={onLogout}><LogOut size={18}/></button></div>
+    <div className="blues-topbar-end"><BranchPanel currentUser={currentUser} navigationTarget={adminTarget} onAction={()=>setOpen(false)} onBranchOperationTypeChange={onBranchOperationTypeChange}/><button type="button" className="blues-icon-button blues-lang-toggle" aria-label={language === 'id' ? t('topbar.switchToEnglish') : t('topbar.switchToIndonesian')} title={language === 'id' ? t('topbar.switchToEnglish') : t('topbar.switchToIndonesian')} onClick={toggleLanguage}><span className="font-extrabold text-[11px] font-mono tracking-tight select-none px-1">{language === 'id' ? 'EN' : 'ID'}</span></button><div className="blues-accent-control" ref={accentMenu}><button className="blues-icon-button" aria-label="Pilih warna aksen" title="Warna aksen" aria-haspopup="menu" aria-expanded={accentOpen} onClick={()=>setAccentOpen(value=>!value)}><Palette size={19}/></button>{accentOpen&&<div className="blues-accent-menu" role="menu" aria-label="Warna aksen">{accentOptions.map(option=><div className="blues-accent-row" key={option.id}>{option.id==='custom'?<><label className="blues-accent-option"><span className="blues-accent-swatch" style={{background:customAccent}}/><span>Kustom</span><input className="blues-custom-color" type="color" value={customAccent} aria-label="Pilih warna aksen kustom" onChange={event=>{setCustomAccent(event.target.value);setAccent('custom')}}/>{accent==='custom'&&<Check size={18}/>}</label></>:<button role="menuitemradio" aria-checked={accent===option.id} className="blues-accent-option" onClick={()=>{setAccent(option.id);setAccentOpen(false)}}><span className="blues-accent-swatch" style={{background:option.color}}/><span>{option.label}</span>{accent===option.id&&<Check size={18}/>}</button>}</div>)}</div>}</div><button className="blues-icon-button blues-theme-toggle" aria-label={theme==='dark'?'Gunakan mode terang':'Gunakan mode gelap'} title={theme==='dark'?'Gunakan mode terang':'Gunakan mode gelap'} aria-pressed={theme==='dark'} onClick={onToggleTheme}>{theme==='dark'?<Sun size={19}/>:<Moon size={19}/>}</button><div className="blues-user"><span className="blues-avatar">{currentUser?.fullName?.charAt(0)||'U'}</span><div><strong>{currentUser?.fullName}</strong><small>{currentUser?.role}</small></div></div><button className="blues-icon-button" aria-label={t('topbar.changePassword')} title={t('topbar.changePassword')} onClick={()=>setSecurityOpen(true)}><KeyRound size={18}/></button><button id="header-logout-btn" className="blues-icon-button blues-logout" aria-label={t('topbar.logout')} title={t('topbar.logout')} onClick={onLogout}><LogOut size={18}/></button></div>
    </header>
    <WriteStatus/>
    {showSyncBanner && (

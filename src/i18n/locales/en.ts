@@ -6,7 +6,6 @@ export const en: Record<TranslationKey, string> = {
   'nav.operations': 'Operations',
   'nav.outboundB2bGroup': 'OUTBOUND B2B',
   'nav.outboundOnlineGroup': 'OUTBOUND ONLINE',
-  'nav.shippingGroup': 'SHIPPING & MANIFEST',
   'nav.masterData': 'Master Data',
   'nav.administration': 'Administration',
   
@@ -29,8 +28,6 @@ export const en: Record<TranslationKey, string> = {
   'nav.onlineSorting': 'Basket Sorting',
   'nav.onlinePacking': 'Online Packing',
   'nav.onlineHistory': 'Online Order History',
-  'nav.shippingManifest': 'Courier Manifest & Shipping',
-  'nav.webhookApi': 'Marketplace Webhook',
   'nav.outboundQuick': 'Quick Outbound',
   'nav.warehouseTransfer': 'Warehouse & Transfer',
   'nav.stockOpname': 'Stock Opname (DCC)',

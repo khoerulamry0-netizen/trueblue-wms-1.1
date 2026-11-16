@@ -13,8 +13,7 @@ import {
   X,
   AlertCircle,
   Save,
-  Plus,
-  Webhook
+  Plus
 } from 'lucide-react';
 import HqDashboard from './HqDashboard';
 import BackupRecovery from './BackupRecovery';
@@ -35,13 +34,11 @@ export default function BranchPanel({
   currentUser,
   navigationTarget,
   onAction,
-  onOpenWebhook,
   onBranchOperationTypeChange,
 }: {
   currentUser: UserAccount | null;
   navigationTarget?: HTMLElement | null;
   onAction?: () => void;
-  onOpenWebhook?: () => void;
   onBranchOperationTypeChange?: (op: BranchOperationType) => void;
 }) {
   const { language } = useLanguage();
@@ -316,12 +313,6 @@ export default function BranchPanel({
               <button className="blues-nav-link" onClick={() => setOpen(true)}>
                 <Building2 size={18} />
                 <span>{language === 'en' ? 'Branch Master' : 'Master Cabang'}</span>
-              </button>
-            )}
-            {onOpenWebhook && (
-              <button className="blues-nav-link" onClick={onOpenWebhook}>
-                <Webhook size={18} />
-                <span>{language === 'en' ? 'Marketplace Webhook' : 'Webhook Marketplace'}</span>
               </button>
             )}
           </nav>,

@@ -4,7 +4,6 @@ export const id = {
   'nav.operations': 'Operasional',
   'nav.outboundB2bGroup': 'OUTBOUND B2B',
   'nav.outboundOnlineGroup': 'OUTBOUND ONLINE',
-  'nav.shippingGroup': 'SHIPPING & MANIFEST',
   'nav.masterData': 'Master Data',
   'nav.administration': 'Administrasi',
   
@@ -27,8 +26,6 @@ export const id = {
   'nav.onlineSorting': 'Sorting Basket',
   'nav.onlinePacking': 'Packing Online',
   'nav.onlineHistory': 'Riwayat Order Online',
-  'nav.shippingManifest': 'Manifest & Ekspedisi',
-  'nav.webhookApi': 'Webhook Marketplace',
   'nav.outboundQuick': 'Outbound Cepat',
   'nav.warehouseTransfer': 'Warehouse & Transfer',
   'nav.stockOpname': 'Stock Opname (DCC)',

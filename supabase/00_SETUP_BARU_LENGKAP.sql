@@ -3809,10 +3809,10 @@ revoke all on function wms_private.stock_pickable(jsonb),wms_private.validate_op
 insert into public.branches(id, name) values ('KOL', 'KOL - Gudang Utama') on conflict (id) do nothing;
 
 -- =====================================================================
--- B2B, ONLINE, HYBRID & SHIPPING MANIFEST SCHEMA & RPCS
+-- B2B, ONLINE & HYBRID SCHEMA & RPCS
 -- =====================================================================
 
--- B2B, Online, Hybrid Branch Configuration, Shipping & Manifest, and Unassigned Order Classification
+-- B2B, Online, Hybrid Branch Configuration, and Unassigned Order Classification
 
 alter table public.branches
   add column if not exists operation_type text not null default 'HYBRID';
@@ -4790,4 +4790,10 @@ $$;
 
 revoke all on function public.marketplace_order_webhook(jsonb, text) from public, anon;
 grant execute on function public.marketplace_order_webhook(jsonb, text) to authenticated;
+
+-- Shipping Manifest dan Marketplace Webhook sudah dipensiunkan.
+-- Drop ulang di akhir setup untuk memastikan database baru tidak menyisakan fitur tersebut.
+drop function if exists public.commit_shipping_manifest(uuid, text, text[], jsonb, text);
+drop function if exists public.marketplace_order_webhook(jsonb, text);
+drop table if exists public.shipping_manifests cascade;
 

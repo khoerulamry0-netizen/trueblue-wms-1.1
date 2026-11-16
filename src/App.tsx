@@ -17,7 +17,6 @@ import { collection, onSnapshot, doc, setDoc, deleteDoc, writeBatch, getDocs, ha
 import { supabase, isSupabaseConfigured } from './supabase';
 import { branchSupportsOperation } from './utils/orderType';
 import { UnassignedOrdersBanner } from './components/UnassignedOrdersBanner';
-import type { ShippingManifest } from './components/CourierManifestManager';
 import type { MabangScreen } from './components/MabangWmsOutbound';
 import { calculatePackQuantities, getExpiredStatus, formatNumber, getProductPackSizes, deduplicateAndMergeStock, updateDynamicCatalogRegistry, normalizeDateToDmy, getCanonicalStockId, findStockIndex, isZoneOrUrbanLocation, getLockedStockSummary, isNoExpiryDate } from './utils/calculations';
 import { buildCatalogLookupMap, getCatalogItemName, isPlaceholderSkuName, normalizeSkuKey, planCatalogStockBidirectionalSync, resolvePreferredSkuName } from './utils/catalogSync';
@@ -101,8 +100,6 @@ const ThermalLabelPrinter = React.lazy(() => import('./components/ThermalLabelPr
 const AuditTrail = React.lazy(() => import('./components/AuditTrail'));
 const InventoryReconciliation = React.lazy(() => import('./components/InventoryReconciliation'));
 const PickerHub = React.lazy(() => import('./components/PickerHub'));
-const CourierManifestManager = React.lazy(() => import('./components/CourierManifestManager'));
-const MarketplaceWebhook = React.lazy(() => import('./components/MarketplaceWebhook'));
 
 export default function App() {
   const { t, language, setLanguage } = useLanguage();
@@ -1499,7 +1496,7 @@ export default function App() {
   };
 
   // Enforce role-based and branch-operation-type tab containment:
-  // - Shipping: hanya 'shipping-manifest'
+  // - Shipping: dashboard read-only (fitur Shipping Manifest sudah dihapus)
   // - Picker: 'picker-hub', 'b2b-picking' (B2B/HYBRID), 'online-picking' (ONLINE/HYBRID)
   // - Packer: 'b2b-packing' (B2B/HYBRID), 'online-sorting' & 'online-packing' (ONLINE/HYBRID)
   // - Viewer: 'dashboard', 'inventory', 'bulk-transfer'
@@ -1509,13 +1506,6 @@ export default function App() {
     const showB2b = branchSupportsOperation(branchOperationType, 'B2B');
     const showOnline = branchSupportsOperation(branchOperationType, 'ONLINE');
     const role = currentUser?.role;
-
-    if (role === 'Shipping') {
-      if (activeTab !== 'shipping-manifest') {
-        setActiveTab('shipping-manifest');
-      }
-      return;
-    }
 
     if (role === 'Picker') {
       const allowedPickerTabs = [
@@ -1541,6 +1531,13 @@ export default function App() {
         if (fallbackPackerTab === 'online-sorting') setMabangScreen('sorting');
         else if (fallbackPackerTab === 'online-packing') setMabangScreen('delivery');
         setActiveTab(fallbackPackerTab);
+      }
+      return;
+    }
+
+    if (role === 'Shipping') {
+      if (activeTab !== 'dashboard') {
+        setActiveTab('dashboard');
       }
       return;
     }
@@ -3205,55 +3202,6 @@ export default function App() {
         })
   );
 
-  const handleUpdateOrdersShipped = async (orderRefs: string[], manifestInfo: Partial<ShippingManifest> = {}, isCancelled = false): Promise<boolean> => {
-    try {
-      if (!orderRefs || orderRefs.length === 0) return true;
-      const refSet = new Set(orderRefs.map(r => r.trim().toUpperCase()));
-      const nowIso = new Date().toISOString();
-      const updated = orderHistoryRef.current.map(item => {
-        const ref1 = (item.referenceNumber || '').trim().toUpperCase();
-        const ref2 = (item.orderNumber || '').trim().toUpperCase();
-        const ref3 = (item.id || '').trim().toUpperCase();
-        if ((ref1 && refSet.has(ref1)) || (ref2 && refSet.has(ref2)) || (ref3 && refSet.has(ref3))) {
-          return {
-            ...item,
-            shipped: !isCancelled,
-            shippedAt: !isCancelled ? (manifestInfo.handedOverAt || nowIso) : undefined,
-            shippedBy: !isCancelled ? (manifestInfo.handedOverBy || currentUser?.fullName || currentUser?.username || 'Petugas Ekspedisi') : undefined,
-            manifestId: !isCancelled ? manifestInfo.manifestId : undefined
-          };
-        }
-        return item;
-      });
-
-      if (supabase) {
-        const { error } = await supabase.rpc('commit_shipping_manifest', {
-          p_request_id: generateRpcRequestId(),
-          p_branch_id: getActiveBranch(),
-          p_order_refs: orderRefs,
-          p_manifest: manifestInfo as Record<string, unknown>,
-          p_action: isCancelled ? 'cancel' : 'create',
-        });
-        if (!error) {
-          setOrderHistory(updated);
-          return true;
-        }
-        if (error.code === 'PGRST202' && currentUser?.role !== 'Shipping') {
-          saveOrderHistoryState(updated);
-          return true;
-        }
-        throw new Error(error.message || 'Gagal memperbarui status manifest pengiriman.');
-      }
-
-      saveOrderHistoryState(updated);
-      return true;
-    } catch (e) {
-      console.error('Failed to update orders shipped status:', e);
-      alert(e instanceof Error ? e.message : 'Gagal memperbarui status manifest pengiriman.');
-      return false;
-    }
-  };
-
   const handleAssignOrderType = async (
     assignments: Array<{ id?: string; referenceNumber?: string; orderType: ChannelOperationType }>
   ): Promise<boolean> => {
@@ -3748,7 +3696,6 @@ export default function App() {
                   onDeleteMultipleOrders={handleDeleteMultipleOrders}
                   onClearAllOrderHistory={undefined}
                   onUpdateOrderSession={handleUpdateOrderSession}
-                  onUpdateOrdersShipped={handleUpdateOrdersShipped}
                   onAssignOrderType={handleAssignOrderType}
                 />
               </motion.div>
@@ -3791,30 +3738,6 @@ export default function App() {
                   setActiveTab(screen === 'sorting' ? 'online-sorting' : screen === 'delivery' ? 'online-packing' : 'online-picking');
                 }}
                 requireExplicitOnlineType={true}
-              />
-            </motion.div>
-          )}
-
-          {activeTab === 'shipping-manifest' && (
-            <motion.div key="shipping-manifest" initial={{ opacity: 0, y: 15 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: -15 }}>
-              <CourierManifestManager
-                orderHistory={orderHistory}
-                currentUser={currentUser}
-                onUpdateOrdersShipped={handleUpdateOrdersShipped}
-                warehouses={warehouses}
-                selectedWarehouseId={activeWarehouseFilter !== 'ALL' ? activeWarehouseFilter : (warehouses.find(w => w.isCentral)?.id || 'WH-CENTRAL')}
-                onSelectWarehouseId={setActiveWarehouseFilter}
-                branchOperationType={branchOperationType}
-              />
-            </motion.div>
-          )}
-
-          {activeTab === 'marketplace-webhook' && (currentUser?.role === 'Administrator' || currentUser?.role === 'Admin') && (
-            <motion.div key="marketplace-webhook" initial={{ opacity: 0, y: 15 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: -15 }}>
-              <MarketplaceWebhook
-                currentUser={currentUser}
-                branchOperationType={branchOperationType}
-                onNavigateTab={navigateFromMenu}
               />
             </motion.div>
           )}

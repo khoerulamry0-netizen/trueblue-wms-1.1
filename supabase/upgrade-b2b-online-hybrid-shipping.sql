@@ -977,3 +977,8 @@ $$;
 revoke all on function public.marketplace_order_webhook(jsonb, text) from public, anon;
 grant execute on function public.marketplace_order_webhook(jsonb, text) to authenticated;
 
+-- Shipping Manifest dan Marketplace Webhook sudah dipensiunkan.
+drop function if exists public.commit_shipping_manifest(uuid, text, text[], jsonb, text);
+drop function if exists public.marketplace_order_webhook(jsonb, text);
+drop table if exists public.shipping_manifests cascade;
+
