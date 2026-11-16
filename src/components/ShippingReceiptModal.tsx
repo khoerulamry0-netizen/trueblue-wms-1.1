@@ -1,4 +1,5 @@
 import {supabase,getActiveBranch} from '../supabase';
+import { useLanguage } from '../i18n/LanguageContext';
 import React, { useEffect, useRef, useState } from 'react';
 import JsBarcode from 'jsbarcode';
 import { 
@@ -29,6 +30,7 @@ export interface ShippingOrderData {
   courier?: string;
   trackingNumber?: string;
   timestamp?: string;
+  weight?: string | number;
   items: Array<{
     id: string;
     skuId: string;
@@ -58,6 +60,7 @@ export default function ShippingReceiptModal({
   currentUser,
   autoPrint = false
 }: ShippingReceiptModalProps) {
+  const { t, language } = useLanguage();
   const senderBranch = order?.branchId || getActiveBranch();
   const [sender, setSender] = useState<{ branch: string; name: string; phone: string }>({
     branch: senderBranch,
@@ -161,13 +164,14 @@ export default function ShippingReceiptModal({
             JsBarcode(barcodeSvgRef.current, resolvedOrderId, {
               format: 'CODE128',
               lineColor: '#000000',
-              width: 2.2,
-              height: 55,
+              width: 2.1,
+              height: 56,
               displayValue: true,
               text: resolvedOrderId,
-              fontSize: 14,
-              font: 'monospace',
-              textMargin: 5,
+              fontSize: 18,
+              font: 'sans-serif',
+              fontOptions: 'bold',
+              textMargin: 6,
               margin: 4,
               background: '#ffffff'
             });
@@ -360,11 +364,12 @@ export default function ShippingReceiptModal({
             }
             .print-page-wrapper {
               width: 4in !important;
-              min-height: 5.8in !important;
+              height: 5.95in !important;
+              max-height: 5.95in !important;
               max-width: 4in !important;
               box-sizing: border-box !important;
               margin: 0 !important;
-              padding: 0.25in 0.22in !important;
+              padding: 0.12in 0.14in !important;
               background: #fff !important;
               color: #000 !important;
               page-break-inside: avoid !important;
@@ -374,10 +379,15 @@ export default function ShippingReceiptModal({
               display: flex !important;
               flex-direction: column !important;
               justify-content: space-between !important;
+              overflow: hidden !important;
             }
             .print-page-wrapper:last-child {
               page-break-after: auto !important;
               break-after: auto !important;
+            }
+            #receipt-page-1 {
+              border: 2px solid #000 !important;
+              border-radius: 16px !important;
             }
             .no-print {
               display: none !important;
@@ -389,33 +399,52 @@ export default function ShippingReceiptModal({
             /* Native layout fallbacks for printable element inside iframe */
             .border-dashed { border-style: dashed !important; }
             .border-black { border-color: #000 !important; }
-            .border-2 { border-width: 2px !important; }
-            .border-b-2 { border-bottom-width: 2px !important; }
+            .border-2 { border-width: 2px !important; border-style: solid !important; }
+            .border-b-2 { border-bottom-width: 2px !important; border-bottom-style: solid !important; border-color: #000 !important; }
+            .border-b { border-bottom-width: 1px !important; border-bottom-style: solid !important; border-color: #000 !important; }
             .border { border-width: 1px !important; border-style: solid !important; }
-            .border-t { border-top-width: 1px !important; }
+            .border-t { border-top-width: 1px !important; border-top-style: solid !important; border-color: #000 !important; }
+            .border-t-2 { border-top-width: 2px !important; border-top-style: solid !important; border-color: #000 !important; }
             .rounded-lg { border-radius: 8px !important; }
             .rounded-xl { border-radius: 12px !important; }
+            .rounded-2xl { border-radius: 16px !important; }
             .p-5 { padding: 1.25rem !important; }
+            .p-4 { padding: 1rem !important; }
+            .p-3 { padding: 0.75rem !important; }
             .p-2 { padding: 0.5rem !important; }
             .px-2 { padding-left: 0.5rem !important; padding-right: 0.5rem !important; }
             .py-1 { padding-top: 0.25rem !important; padding-bottom: 0.25rem !important; }
+            .py-2 { padding-top: 0.5rem !important; padding-bottom: 0.5rem !important; }
+            .py-2\\.5 { padding-top: 0.625rem !important; padding-bottom: 0.625rem !important; }
             .py-1\\.5 { padding-top: 0.375rem !important; padding-bottom: 0.375rem !important; }
             .text-black { color: #000 !important; }
             .bg-white { background-color: #fff !important; }
             .font-bold { font-weight: 700 !important; }
+            .font-extrabold { font-weight: 800 !important; }
             .font-black { font-weight: 900 !important; }
             .font-mono { font-family: monospace, Courier, sans-serif !important; }
             .flex { display: flex !important; }
             .flex-col { flex-direction: column !important; }
+            .flex-1 { flex: 1 1 0% !important; }
             .justify-between { justify-content: space-between !important; }
+            .justify-start { justify-content: flex-start !important; }
             .items-center { align-items: center !important; }
             .grid { display: grid !important; }
+            .grid-cols-\\[85px_22px_1fr\\] { grid-template-columns: 85px 22px 1fr !important; }
             .grid-cols-12 { grid-template-columns: repeat(12, minmax(0, 1fr)) !important; }
             .col-span-1 { grid-column: span 1 / span 1 !important; }
             .col-span-2 { grid-column: span 2 / span 2 !important; }
             .col-span-7 { grid-column: span 7 / span 7 !important; }
+            .col-span-8 { grid-column: span 8 / span 8 !important; }
+            .col-span-3 { grid-column: span 3 / span 3 !important; }
             .text-center { text-align: center !important; }
             .text-right { text-align: right !important; }
+            .text-base { font-size: 15px !important; }
+            .text-sm { font-size: 13px !important; }
+            .text-xs { font-size: 11px !important; }
+            .uppercase { text-transform: uppercase !important; }
+            .break-words { word-break: break-word !important; overflow-wrap: break-word !important; }
+            .break-all { word-break: break-all !important; }
           </style>
         </head>
         <body>
@@ -594,14 +623,23 @@ export default function ShippingReceiptModal({
                   justify-content: space-between !important;
                   box-sizing: border-box !important;
                   margin: 0 !important;
-                  padding: 0.25in 0.22in !important;
+                  padding: 0.12in 0.14in !important;
                   width: 4in !important;
-                  min-height: 5.8in !important;
+                  height: 5.95in !important;
+                  max-height: 5.95in !important;
+                  overflow: hidden !important;
                   max-width: 4in !important;
-                  border: none !important;
                   box-shadow: none !important;
                   background: white !important;
                   color: black !important;
+                }
+                #receipt-page-1 {
+                  border: 2px solid #000 !important;
+                  border-radius: 16px !important;
+                }
+                #receipt-page-2 {
+                  border: 1px solid #cbd5e1 !important;
+                  border-radius: 12px !important;
                 }
                 .shipping-receipt-page:last-child {
                   page-break-after: auto !important;
@@ -625,85 +663,77 @@ export default function ShippingReceiptModal({
                 <span>Ukuran: 4 x 6 Inci</span>
               </div>
 
-              <div id="receipt-page-1" className="shipping-receipt-page print-page-wrapper bg-white text-slate-900 rounded-xl p-5 sm:p-6 shadow-md font-sans text-xs space-y-4 max-w-[420px] mx-auto border border-slate-200">
-                {/* 1. BARCODE OF ORDER ID (ABOVE THE TEMPLATE) */}
-                <div className="flex flex-col items-center justify-center pt-1 pb-1">
+              <div id="receipt-page-1" className="shipping-receipt-page print-page-wrapper bg-white text-black rounded-2xl p-3 sm:p-4 shadow-md font-sans text-xs flex flex-col justify-between max-w-[420px] mx-auto border-2 border-black">
+                {/* 1. TOP BARCODE OF ORDER ID */}
+                <div className="flex flex-col items-center justify-center pt-1 pb-2 border-b border-black">
                   <svg ref={barcodeSvgRef} className="max-w-full h-auto"></svg>
                 </div>
 
-                  {/* 2. THE DASHED TEMPLATE BOX */}
-                  <div className="border-2 border-dashed border-black rounded-lg p-5 space-y-4 bg-white flex-1 flex flex-col justify-between">
-                    
-                    {/* RECIPIENT SECTION */}
-                    <div className="space-y-3 text-sm text-black">
-                      {/* Dear */}
-                      <div className="flex items-start">
-                        <span className="w-24 font-bold text-black shrink-0">Dear</span>
-                        <span className="w-4 font-bold text-black text-center">:</span>
-                        <span className="font-semibold text-black break-words flex-1 pl-1">
-                          {resolvedCustomer}
-                        </span>
-                      </div>
-
-                      {/* Order id */}
-                      <div className="flex items-start">
-                        <span className="w-24 font-bold text-black shrink-0">Order id</span>
-                        <span className="w-4 font-bold text-black text-center">:</span>
-                        <span className="font-bold text-black break-all flex-1 pl-1">
-                          {resolvedOrderId}
-                        </span>
-                      </div>
-
-                      {/* Address */}
-                      <div className="flex items-start pt-1">
-                        <span className="w-24 font-bold text-black shrink-0">Address</span>
-                        <span className="w-4 font-bold text-black text-center">:</span>
-                        <span className="font-medium text-black leading-snug break-words flex-1 pl-1 whitespace-pre-wrap">
-                          {resolvedAddress}
-                        </span>
-                      </div>
-
-                      {/* Phone */}
-                      <div className="flex items-start pt-1">
-                        <span className="w-24 font-bold text-black shrink-0">Phone</span>
-                        <span className="w-4 font-bold text-black text-center">:</span>
-                        <span className="font-semibold text-black break-words flex-1 pl-1">
-                          {resolvedPhone}
-                        </span>
-                      </div>
-                    </div>
-
-                    {/* HORIZONTAL SOLID DIVIDER */}
-                    <div className="border-b-2 border-black my-3"></div>
-
-                    {senderError&&<p role="alert" className="text-red-700 no-print">{senderError}</p>}
-                    {/* SENDER (FROM) SECTION */}
-                    <div className="space-y-3 text-sm text-black pt-1">
-                      <div className="flex items-start">
-                        <span className="w-24 font-bold text-black shrink-0">From</span>
-                        <span className="w-4 font-bold text-black text-center">:</span>
-                        <span className="font-black text-black tracking-wide text-base flex-1 pl-1">
-                          {senderReady ? sender.name : 'Memuat pengirim…'}
-                        </span>
-                      </div>
-
-                      <div className="flex items-start">
-                        <span className="w-24 font-bold text-black shrink-0">Phone</span>
-                        <span className="w-4 font-bold text-black text-center">:</span>
-                        <span className="font-black text-black text-base flex-1 pl-1">
-                          {senderReady ? sender.phone : '—'}
-                        </span>
-                      </div>
-                    </div>
-
+                {/* 2. SIX ROWS WITH SOLID SEPARATOR LINES */}
+                <div className="flex-1 flex flex-col justify-start text-black pt-1">
+                  {/* Row 1: Dear */}
+                  <div className="grid grid-cols-[85px_22px_1fr] items-center py-2.5 px-2 border-b border-black">
+                    <span className="font-bold text-base text-black">Dear</span>
+                    <span className="font-bold text-base text-center text-black">:</span>
+                    <span className="font-extrabold text-base text-black break-words">
+                      {resolvedCustomer || '-'}
+                    </span>
                   </div>
 
-                  {/* Footer tag on page 1 */}
-                  <div className="border-t border-neutral-300 pt-1 flex items-center justify-between text-[9px] font-mono text-neutral-500">
-                    <span>DEVELOPMENT STORE</span>
-                    <span>HALAMAN 1 DARI {includePage2 ? '2' : '1'}</span>
+                  {/* Row 2: Order id */}
+                  <div className="grid grid-cols-[85px_22px_1fr] items-center py-2.5 px-2 border-b border-black">
+                    <span className="font-bold text-base text-black">Order id</span>
+                    <span className="font-bold text-base text-center text-black">:</span>
+                    <span className="font-extrabold text-base text-black font-mono break-all">
+                      {resolvedOrderId}
+                    </span>
+                  </div>
+
+                  {/* Row 3: Address */}
+                  <div className="grid grid-cols-[85px_22px_1fr] items-center py-2.5 px-2 border-b border-black">
+                    <span className="font-bold text-base text-black">Address</span>
+                    <span className="font-bold text-base text-center text-black">:</span>
+                    <span className="font-bold text-base text-black leading-snug break-words whitespace-pre-wrap">
+                      {resolvedAddress || '-'}
+                    </span>
+                  </div>
+
+                  {/* Row 4: Phone */}
+                  <div className="grid grid-cols-[85px_22px_1fr] items-center py-2.5 px-2 border-b border-black">
+                    <span className="font-bold text-base text-black">Phone</span>
+                    <span className="font-bold text-base text-center text-black">:</span>
+                    <span className="font-bold text-base text-black font-mono break-words">
+                      {resolvedPhone || '-'}
+                    </span>
+                  </div>
+
+                  {/* Row 5: From */}
+                  <div className="grid grid-cols-[85px_22px_1fr] items-center py-2.5 px-2 border-b border-black">
+                    <span className="font-bold text-base text-black">From</span>
+                    <span className="font-bold text-base text-center text-black">:</span>
+                    <span className="font-extrabold text-base text-black break-words leading-tight">
+                      {senderReady ? sender.name : 'TEST ORDER'}
+                    </span>
+                  </div>
+
+                  {/* Row 6: Phone */}
+                  <div className="grid grid-cols-[85px_22px_1fr] items-center py-2.5 px-2 border-b border-black">
+                    <span className="font-bold text-base text-black">Phone</span>
+                    <span className="font-bold text-base text-center text-black">:</span>
+                    <span className="font-extrabold text-base text-black font-mono">
+                      {senderReady ? (sender.phone || '-') : '085649452864'}
+                    </span>
                   </div>
                 </div>
+
+                {/* 3. FOOTER SECTION: SOLID DIVIDER LINE & TEXT */}
+                <div className="mt-auto pt-4">
+                  <div className="border-t-2 border-black pt-2 pb-1 px-1 flex items-center justify-between text-xs sm:text-sm font-bold text-black uppercase">
+                    <span className="truncate max-w-[210px]">{senderReady ? sender.name : 'TEST ORDER'}</span>
+                    <span className="tracking-wide">HALAMAN 1 DARI {includePage2 ? '2' : '1'}</span>
+                  </div>
+                </div>
+              </div>
               </div>
 
             {/* ======================================================== */}
@@ -776,39 +806,28 @@ export default function ShippingReceiptModal({
                   {/* TABEL DESKRIPSI ISI PAKET */}
                   <div className="flex-1 flex flex-col justify-between">
                     <div className="border border-black rounded-lg overflow-hidden">
-                      <div className="bg-neutral-900 text-white font-extrabold text-[9px] uppercase px-2 py-1.5 grid grid-cols-12 gap-1 tracking-wider">
+                      <div className="bg-neutral-900 text-white font-extrabold text-[10px] uppercase px-3 py-1.5 grid grid-cols-12 gap-2 tracking-wider">
                         <div className="col-span-1 text-center">No</div>
-                        <div className="col-span-7">SKU & Deskripsi Barang</div>
-                        <div className="col-span-2 text-center">Lokasi/Exp</div>
-                        <div className="col-span-2 text-right">Qty</div>
+                        <div className="col-span-8">SKU ID</div>
+                        <div className="col-span-3 text-right">Qty</div>
                       </div>
 
-                      <div className="divide-y divide-neutral-200 max-h-[220px] print:max-h-none overflow-y-auto print:overflow-visible">
+                      <div className="divide-y divide-neutral-200 max-h-[240px] print:max-h-none overflow-y-auto print:overflow-visible">
                         {itemsList.map((item, idx) => (
                           <div 
                             key={`item-${item.id || idx}`} 
-                            className={`px-2 py-1.5 grid grid-cols-12 gap-1 text-[10px] items-center ${
+                            className={`px-3 py-2 grid grid-cols-12 gap-2 text-xs items-center ${
                               idx % 2 === 1 ? 'bg-neutral-50' : 'bg-white'
                             }`}
                           >
                             <div className="col-span-1 text-center font-mono font-bold text-neutral-500">
                               {idx + 1}
                             </div>
-                            <div className="col-span-7 leading-tight pr-1">
-                              <span className="font-mono font-bold text-black block text-[10px]">
-                                {item.skuId}
-                              </span>
-                              <span className="text-neutral-800 text-[9px] line-clamp-2">
-                                {item.skuName}
-                              </span>
+                            <div className="col-span-8 font-mono font-bold text-black text-xs sm:text-sm break-all">
+                              {item.skuId}
                             </div>
-                            <div className="col-span-2 text-center font-mono text-[8.5px] leading-tight text-neutral-600">
-                              {item.location && <div className="font-bold text-black">{item.location}</div>}
-                              {item.expiredDate && <div className="text-[7.5px] text-neutral-500">{item.expiredDate}</div>}
-                              {!item.location && !item.expiredDate && '-'}
-                            </div>
-                            <div className="col-span-2 text-right font-mono font-black text-black text-xs">
-                              {item.qty} <span className="text-[9px] font-normal text-neutral-600">pcs</span>
+                            <div className="col-span-3 text-right font-mono font-black text-black text-xs sm:text-sm">
+                              {item.qty} <span className="text-[10px] font-normal text-neutral-600">pcs</span>
                             </div>
                           </div>
                         ))}
@@ -818,27 +837,13 @@ export default function ShippingReceiptModal({
                       <div className="bg-neutral-100 border-t-2 border-black px-2.5 py-1.5 flex items-center justify-between text-[11px] font-bold">
                         <div className="flex items-center gap-1 text-neutral-700">
                           <Boxes className="w-3.5 h-3.5 text-black" />
-                          <span>TOTAL ISI PAKET:</span>
+                          <span>{t('receipt.totalItems')}</span>
                           <span className="font-mono font-normal text-[10px]">({itemsList.length} SKU)</span>
                         </div>
                         <div className="font-mono font-black text-sm text-black">
                           {formatNumber(totalCalculatedQty)} <span className="text-[10px]">Pcs</span>
                         </div>
                       </div>
-                    </div>
-
-                    {/* Quality Assurance & Unboxing Instructions */}
-                    <div className="mt-2 p-2 bg-neutral-50 rounded-lg border border-neutral-300 text-[8.5px] leading-snug text-neutral-700 space-y-1">
-                      <div className="font-extrabold text-[9px] uppercase tracking-wide text-black flex items-center justify-between">
-                        <span>✓ QUALITY CONTROL & PACKING SLIP</span>
-                        <span className="text-[8px] font-mono text-neutral-500">TRUEBLUE WMS WMS QC</span>
-                      </div>
-                      <p>
-                        • Paket ini telah diverifikasi & dikemas untuk lingkungan development.
-                      </p>
-                      <p>
-                        • <strong>Wajib Video Unboxing:</strong> Mohon rekam video pembukaan paket tanpa jeda untuk bukti klaim jika terjadi kerusakan/ketidaksesuaian isi.
-                      </p>
                     </div>
 
                     {/* Operator Signatures / Audit Footer */}
@@ -888,7 +893,7 @@ export default function ShippingReceiptModal({
           >
             <Printer className="w-4 h-4" />
             <span>
-              {includePage2 ? 'Cetak Resi & Isi Paket (2 Lembar 4x6)' : 'Cetak Resi Saja (1 Lembar 4x6)'}
+              {includePage2 ? t('receipt.printTwoPages') : t('receipt.printOnePage')}
             </span>
           </button>
 
@@ -902,7 +907,7 @@ export default function ShippingReceiptModal({
             }`}
           >
             <ClipboardList className="w-4 h-4" />
-            {copiedReceipt ? 'Tersalin!' : 'Salin Teks'}
+            {copiedReceipt ? t('receipt.copied') : t('receipt.copyText')}
           </button>
 
           <button
@@ -912,14 +917,14 @@ export default function ShippingReceiptModal({
             title="Unduh resi sebagai file .txt"
           >
             <FileText className="w-4 h-4 text-emerald-450" />
-            Unduh (.txt)
+            {t('receipt.downloadTxt')}
           </button>
           
           <button
             onClick={onClose}
             className="px-4 py-2.5 bg-slate-800 hover:bg-slate-700 text-slate-300 hover:text-white text-xs font-bold rounded-xl transition-colors cursor-pointer flex items-center justify-center gap-1"
           >
-            Tutup
+            {t('action.close')}
           </button>
         </div>
 

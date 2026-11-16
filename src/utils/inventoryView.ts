@@ -1,5 +1,5 @@
 import type { StockItem } from '../types';
-import { getItemStockBreakdown, getStockStatus, isNoExpiryDate, isStockPickable, normalizeDateToDmy, type LockedStockSummary } from './calculations';
+import { calculateRemainingExpiry, getItemStockBreakdown, getStockStatus, isNoExpiryDate, isStockPickable, normalizeDateToDmy, type LockedStockSummary, type RemainingExpiryResult } from './calculations';
 
 export const inventorySkuKey = (sku: string) => sku.trim().toUpperCase();
 
@@ -39,27 +39,72 @@ export function getInventorySkuTotals(stock: StockItem[], locked: LockedStockSum
   return totals;
 }
 
-export function inventoryDateLabel(item: StockItem): string {
+export function inventoryDateLabel(item: StockItem, lang: 'id' | 'en' = 'id'): string {
   const value = normalizeDateToDmy(item.expiredDate);
   if (/^\d{2}\/\d{2}\/\d{4}$/.test(value)) return value;
-  if (!value || value === 'No Expired' || value === '--' || isNoExpiryDate(item.expiredDate) || isNoExpiryDate(value)) return 'Tanpa kedaluwarsa';
+  if (!value || value === 'No Expired' || value === '--' || isNoExpiryDate(item.expiredDate) || isNoExpiryDate(value)) {
+    return lang === 'en' ? 'No expiry date' : 'Tanpa kedaluwarsa';
+  }
   if (/damage|rusak|expired|kedaluwarsa/i.test(value || item.expiredDate || '')) return '—';
-  return 'Periksa tanggal';
+  return lang === 'en' ? 'Check date' : 'Periksa tanggal';
 }
 
-export function inventoryStatus(item: StockItem): { label: string; tone: 'safe' | 'warning' | 'danger' } {
+export function inventoryStatus(item: StockItem, lang: 'id' | 'en' = 'id'): { label: string; tone: 'safe' | 'amber' | 'warning' | 'danger' | 'neutral' } {
   const status = getStockStatus(item);
-  if (status === 'Damage') return { label: 'Rusak', tone: 'danger' };
-  if (status === 'Expired') return { label: 'Kedaluwarsa', tone: 'danger' };
-  if (status === 'Karantina') return { label: 'Karantina', tone: 'warning' };
+  if (status === 'Damage') return { label: lang === 'en' ? 'Damaged' : 'Rusak', tone: 'danger' };
+  if (status === 'Karantina') return { label: lang === 'en' ? 'Quarantine' : 'Karantina', tone: 'warning' };
   if (!isStockPickable(item)) return { label: 'Buffer', tone: 'warning' };
-  if (status === 'AMAN') return { label: 'Aman', tone: 'safe' };
-  const months = status.match(/(?:under\s*)(\d+)/i)?.[1];
-  if (months) return { label: '< ' + months + ' bulan', tone: 'warning' };
-  if (status === 'Near ED') return { label: 'Mendekati kedaluwarsa', tone: 'warning' };
-  return { label: status, tone: 'warning' };
+
+  // Hitung sisa ED presisi (Bulan & Hari) sesuai Gambar No 2
+  const remaining = calculateRemainingExpiry(item.expiredDate);
+  if (remaining.isExpired || status === 'Expired') {
+    if (remaining.totalDays < 0) {
+      const d = Math.abs(remaining.totalDays);
+      return { 
+        label: lang === 'en' ? `Expired (${d} d ago)` : `Lewat ED (${d} hr)`, 
+        tone: 'danger' 
+      };
+    }
+    return { label: lang === 'en' ? 'Expired' : 'Kedaluwarsa', tone: 'danger' };
+  }
+  if (remaining.label === 'Tanpa ED') {
+    return { label: lang === 'en' ? 'No Expiry' : 'Tanpa ED', tone: 'safe' };
+  }
+  if (remaining.label === 'Rusak') {
+    return { label: lang === 'en' ? 'Damaged' : 'Rusak', tone: 'danger' };
+  }
+
+  // Format bilingual: "20 bln 21 hari" vs "20 mos 21 days"
+  const mUnit = lang === 'en' ? 'mos' : 'bln';
+  const dUnit = lang === 'en' ? (remaining.days === 1 ? 'day' : 'days') : 'hari';
+  let formattedLabel = remaining.label;
+
+  if (remaining.months > 0 && remaining.days > 0) {
+    formattedLabel = `${remaining.months} ${mUnit} ${remaining.days} ${dUnit}`;
+  } else if (remaining.months > 0) {
+    formattedLabel = `${remaining.months} ${mUnit}`;
+  } else if (remaining.days > 0) {
+    formattedLabel = `${remaining.days} ${dUnit}`;
+  }
+
+  return { label: formattedLabel, tone: remaining.tone };
 }
 
-export function inventoryMovementLabel(category: string) {
-  return ({ 'FAST MOVING': 'Pergerakan cepat', MEDIUM: 'Pergerakan sedang', 'SLOW MOVING': 'Pergerakan lambat', 'BELUM ADA OUTBOUND': 'Belum ada outbound', 'DEAD STOCK': 'Tanpa pergerakan' } as Record<string, string>)[category] || category;
+export function inventoryMovementLabel(category: string, lang: 'id' | 'en' = 'id') {
+  if (lang === 'en') {
+    return ({ 
+      'FAST MOVING': 'Fast Moving', 
+      'MEDIUM': 'Medium Moving', 
+      'SLOW MOVING': 'Slow Moving', 
+      'BELUM ADA OUTBOUND': 'No Outbound Yet', 
+      'DEAD STOCK': 'Dead Stock' 
+    } as Record<string, string>)[category] || category;
+  }
+  return ({ 
+    'FAST MOVING': 'Pergerakan cepat', 
+    MEDIUM: 'Pergerakan sedang', 
+    'SLOW MOVING': 'Pergerakan lambat', 
+    'BELUM ADA OUTBOUND': 'Belum ada outbound', 
+    'DEAD STOCK': 'Tanpa pergerakan' 
+  } as Record<string, string>)[category] || category;
 }

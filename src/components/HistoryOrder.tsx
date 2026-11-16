@@ -1,9 +1,20 @@
 import {createPortal} from 'react-dom';
 import ShippingReceiptModal,{type ShippingOrderData} from './ShippingReceiptModal';
 import {getOrderStageHistory} from '../utils/orderStageHistory';
-import React, { useState, useMemo, useEffect } from 'react';
+import {resolveItemBasketCodes} from '../utils/masterBasketTracker';
+import {
+  buildGroupedHistory,
+  buildOrderAddressMap,
+  buildOrderHistoryExportRows,
+  buildOrderPhoneMap,
+  getOrderHistoryExportColWidths,
+  resolveOrderCustomerAddress,
+  type HistoryOrderGroup
+} from '../utils/historyOrderHelpers';
+import { useLanguage } from '../i18n/LanguageContext';
+import React, { useState, useMemo, useEffect, useDeferredValue } from 'react';
 import { OutboundItem } from '../types';
-import { formatNumber, formatToWibString, normalizeDateToDmy, isZoneOrUrbanLocation } from '../utils/calculations';
+import { formatNumber, formatToWibString, normalizeDateToDmy } from '../utils/calculations';
 import * as XLSX from 'xlsx';
 import { 
   Printer,
@@ -12,6 +23,7 @@ import {
   FileText, 
   ShoppingBag, 
   User, 
+  MapPin,
   Tag, 
   Layers, 
   FileSpreadsheet,
@@ -21,8 +33,17 @@ import {
   AlertTriangle,
   ChevronDown,
   ChevronUp,
-  List
+  ChevronLeft,
+  ChevronRight,
+  Minimize2,
+  Maximize2,
+  List,
+  Copy,
+  Check,
+  Camera
 } from 'lucide-react';
+
+const HISTORY_PAGE_SIZES = { batch: 25, order: 50, flat: 100 } as const;
 
 interface HistoryOrderProps {
   orderHistory: OutboundItem[];
@@ -41,6 +62,7 @@ export default function HistoryOrder({
   onDeleteMultipleOrders,
   onClearAllOrderHistory
 }: HistoryOrderProps) {
+  const { t, language } = useLanguage();
   const [receiptOrder,setReceiptOrder]=useState<ShippingOrderData|null>(null);
   const getBatchKey = (item: OutboundItem) =>
     item.batchNumber?.trim() || item.referenceNumber?.trim() || item.orderNumber?.trim() || 'TANPA-BATCH';
@@ -50,11 +72,17 @@ export default function HistoryOrder({
     const sourceItems = activeItems.length > 0 ? activeItems : items;
     if (sourceItems.length === 0) return;
     const first = sourceItems[0];
+    const pickField = (getter: (i: OutboundItem) => string | undefined) =>
+      sourceItems.find(i => getter(i)?.trim()) ? getter(sourceItems.find(i => getter(i)?.trim())!)?.trim() : undefined;
+
     setReceiptOrder({
       referenceNumber: first.referenceNumber || batchLabel || '-',
-      orderNumber: first.orderNumber,
-      noPo: first.noPo,
-      customerName: first.customerName,
+      orderNumber: pickField(i => i.orderNumber) || first.orderNumber,
+      orderId: pickField(i => i.orderNumber) || first.referenceNumber || batchLabel,
+      noPo: pickField(i => i.noPo) || first.noPo,
+      customerName: pickField(i => i.customerName) || first.customerName,
+      customerAddress: pickField(i => i.customerAddress),
+      customerPhone: pickField(i => i.customerPhone),
       batchNumber: batchLabel || getBatchKey(first),
       timestamp: first.completedAt || first.pickedAt || first.timestamp,
       items: sourceItems.map(i => ({
@@ -66,9 +94,9 @@ export default function HistoryOrder({
         qty: i.qty
       })),
       totalQty: sourceItems.reduce((sum, i) => sum + i.qty, 0),
-      packerName: first.packedBy,
-      pickerName: first.pickedBy,
-      inputByName: first.createdBy
+      packerName: pickField(i => i.packedBy) || first.packedBy,
+      pickerName: pickField(i => i.pickedBy) || first.pickedBy,
+      inputByName: pickField(i => i.createdBy) || first.createdBy
     });
   };
 
@@ -80,11 +108,35 @@ export default function HistoryOrder({
     openReceiptForItems(sameBatchItems.length > 0 ? sameBatchItems : [item], bKey);
   };
 
-  const [viewMode, setViewMode] = useState<'batch' | 'flat'>('batch');
-  const [collapsedBatches, setCollapsedBatches] = useState<Record<string, boolean>>({});
+  const [viewMode, setViewMode] = useState<'batch' | 'order' | 'flat'>('batch');
+  const [expandedBatches, setExpandedBatches] = useState<Record<string, boolean>>({});
+  const [expandedOrders, setExpandedOrders] = useState<Record<string, boolean>>({});
+  const orderAddressMap = useMemo(() => buildOrderAddressMap(orderHistory), [orderHistory]);
+  const orderPhoneMap = useMemo(() => buildOrderPhoneMap(orderHistory), [orderHistory]);
+  const resolveCustomerAddress = (item: OutboundItem) => resolveOrderCustomerAddress(item, orderAddressMap);
   const [showCancelled,setShowCancelled]=useState(false);
-  const cancelledCount=orderHistory.filter(item=>item.status==='Cancelled').length;
   const [searchTerm, setSearchTerm] = useState('');
+  const deferredSearchTerm = useDeferredValue(searchTerm);
+  const [currentPage, setCurrentPage] = useState(1);
+  const [customPageSize, setCustomPageSize] = useState<number | null>(null);
+  const pageSize = customPageSize ?? HISTORY_PAGE_SIZES[viewMode];
+
+  // Batch query state (Pencarian massal banyak nomor sekaligus)
+  const [isBatchModalOpen, setIsBatchModalOpen] = useState(false);
+  const [batchRawInput, setBatchRawInput] = useState('');
+  const [batchTargetField, setBatchTargetField] = useState<'all' | 'order' | 'sku' | 'po_batch'>('all');
+  const [batchMatchMode, setBatchMatchMode] = useState<'exact' | 'contains'>('exact');
+  const [activeBatchKeywords, setActiveBatchKeywords] = useState<string[]>([]);
+
+  const parseBatchKeywords = (raw: string): string[] => {
+    if (!raw) return [];
+    const tokens = raw
+      .split(/[\r\n,;\t]+/)
+      .map(k => k.trim())
+      .filter(k => k.length > 0);
+    return Array.from(new Set(tokens));
+  };
+  const detectedKeywords = useMemo(() => parseBatchKeywords(batchRawInput), [batchRawInput]);
   const [customerFilter, setCustomerFilter] = useState('ALL');
   const [batchFilter, setBatchFilter] = useState('ALL');
   const [statusFilter, setStatusFilter] = useState<'ALL' | 'Completed' | 'Pending' | 'Cancelled'>('ALL');
@@ -101,10 +153,42 @@ export default function HistoryOrder({
   // Optional columns to export
   const [includeDescription, setIncludeDescription] = useState(true);
 
+  // State & handler for copy to clipboard
+  const [copiedKey, setCopiedKey] = useState<string | null>(null);
+
+  const handleCopyText = async (text: string, key: string, e?: React.MouseEvent) => {
+    if (e) {
+      e.stopPropagation();
+      e.preventDefault();
+    }
+    if (!text || text === 'TANPA-BATCH') return;
+    try {
+      if (navigator?.clipboard?.writeText) {
+        await navigator.clipboard.writeText(text);
+      } else {
+        const textArea = document.createElement('textarea');
+        textArea.value = text;
+        textArea.style.position = 'fixed';
+        textArea.style.left = '-999999px';
+        document.body.appendChild(textArea);
+        textArea.select();
+        document.execCommand('copy');
+        document.body.removeChild(textArea);
+      }
+      setCopiedKey(key);
+      setTimeout(() => {
+        setCopiedKey(prev => (prev === key ? null : prev));
+      }, 1800);
+    } catch (err) {
+      console.error('Failed to copy: ', err);
+    }
+  };
+
   // Edit item states
   const [editingItem, setEditingItem] = useState<OutboundItem | null>(null);
   const [editBatchNumber, setEditBatchNumber] = useState('');
   const [editCustomerName, setEditCustomerName] = useState('');
+  const [editCustomerAddress, setEditCustomerAddress] = useState('');
   const [editOrderNumber, setEditOrderNumber] = useState('');
   const [editNoPo, setEditNoPo] = useState('');
   const [editQty, setEditQty] = useState(0);
@@ -130,6 +214,7 @@ export default function HistoryOrder({
     setEditingItem(item);
     setEditBatchNumber(item.batchNumber || item.referenceNumber || '');
     setEditCustomerName(item.customerName || '');
+    setEditCustomerAddress(resolveCustomerAddress(item));
     setEditOrderNumber(item.orderNumber || '');
     setEditNoPo(item.noPo || '');
     setEditQty(item.qty);
@@ -152,6 +237,7 @@ export default function HistoryOrder({
       ...editingItem,
       batchNumber: editBatchNumber.trim() || editingItem.batchNumber,
       customerName: editCustomerName.trim() || undefined,
+      customerAddress: editCustomerAddress.trim() || undefined,
       orderNumber: editOrderNumber.trim() || undefined,
       noPo: editNoPo.trim() || undefined,
       qty: editQty,
@@ -168,11 +254,11 @@ export default function HistoryOrder({
   };
 
   const handleDelete = (item: OutboundItem) => {
-    if(item.status==='Cancelled'||item.shipped)return;
+    if(item.status==='Cancelled')return;
     setConfirmDialog({
       isOpen: true,
       title: 'Batalkan Order',
-      message: `Apakah Anda yakin ingin membatalkan order ini?\n\nSKU: ${item.skuId}\nCustomer: ${item.customerName || '-'}\nQty: ${formatNumber(item.qty)} Pcs\n\nRiwayat tetap disimpan. Stok hanya dikembalikan jika sebelumnya sudah dipotong dan barang belum dikirim.`,
+      message: `Apakah Anda yakin ingin membatalkan order ini?\n\nSKU: ${item.skuId}\nCustomer: ${item.customerName || '-'}\nQty: ${formatNumber(item.qty)} Pcs\n\nRiwayat tetap disimpan. Stok akan dikembalikan jika sebelumnya sudah dipotong.`,
       type: 'danger',
       onConfirm: () => {
         if (onDeleteOrderHistory) {
@@ -184,13 +270,14 @@ export default function HistoryOrder({
   };
 
   const handleDeleteSelected = () => {
-    const itemsToDelete = filteredHistory.filter(item => selectedIds.includes(item.id)&&item.status!=='Cancelled'&&!item.shipped);
+    const selectedSet = new Set(selectedIds);
+    const itemsToDelete = filteredHistory.filter(item => selectedSet.has(item.id) && item.status !== 'Cancelled');
     if (itemsToDelete.length === 0) return;
 
     setConfirmDialog({
       isOpen: true,
       title: 'Batalkan Order Terpilih',
-      message: `Apakah Anda yakin ingin membatalkan ${itemsToDelete.length} order terpilih?\n\nAnda akan diminta mengisi alasan. Order yang sudah dikirim tidak dapat dibatalkan.`,
+      message: `Apakah Anda yakin ingin membatalkan ${itemsToDelete.length} order terpilih?\n\nAnda akan diminta mengisi alasan pembatalan.`,
       type: 'danger',
       onConfirm: () => {
         if (onDeleteMultipleOrders) {
@@ -214,26 +301,98 @@ export default function HistoryOrder({
     });
   };
 
-  // List unique customers for filtering
-  const uniqueCustomers = useMemo(() => {
+  // Pre-index orderHistory in a single pass so typing, date filtering, sorting & dropdown options stay O(N)
+  const { indexedHistory, uniqueCustomers, uniqueBatches, cancelledCount } = useMemo(() => {
     const customers = new Set<string>();
-    orderHistory.forEach(item => {
-      if (item.customerName) {
-        customers.add(item.customerName);
-      }
-    });
-    return Array.from(customers);
-  }, [orderHistory]);
-
-  // List unique batch numbers for filtering
-  const uniqueBatches = useMemo(() => {
     const batches = new Set<string>();
-    orderHistory.forEach(item => {
+    let cancelled = 0;
+
+    const indexed = orderHistory.map(item => {
+      if (item.status === 'Cancelled') cancelled++;
       const bKey = getBatchKey(item);
       if (bKey) batches.add(bKey);
+      if (item.customerName) customers.add(item.customerName);
+
+      const addr = resolveOrderCustomerAddress(item, orderAddressMap);
+      const skuLower = item.skuId.toLowerCase();
+      const skuNameLower = item.skuName.toLowerCase();
+      const batchKeyLower = bKey.toLowerCase();
+      const batchLower = item.batchNumber ? item.batchNumber.toLowerCase() : '';
+      const orderLower = item.orderNumber ? item.orderNumber.toLowerCase() : '';
+      const noPoLower = item.noPo ? item.noPo.toLowerCase() : '';
+      const customerLower = item.customerName ? item.customerName.toLowerCase() : '';
+      const addrLower = addr ? addr.toLowerCase() : '';
+      const refLower = item.referenceNumber.toLowerCase();
+      const basketLower = item.basketNumber ? item.basketNumber.toLowerCase() : '';
+      const masterLower = item.masterBasketNumber ? item.masterBasketNumber.toLowerCase() : '';
+
+      const searchFields = [
+        skuLower,
+        skuNameLower,
+        batchKeyLower,
+        batchLower,
+        orderLower,
+        noPoLower,
+        customerLower,
+        addrLower,
+        refLower,
+        basketLower,
+        masterLower,
+        item.createdBy?.toLowerCase() || '',
+        item.pickedBy?.toLowerCase() || '',
+        item.sortedBy?.toLowerCase() || '',
+        item.packedBy?.toLowerCase() || ''
+      ];
+
+      const batchHaystack = [
+        skuLower,
+        skuNameLower,
+        batchKeyLower,
+        batchLower,
+        orderLower,
+        refLower,
+        noPoLower,
+        customerLower,
+        basketLower,
+        masterLower,
+        addrLower
+      ].join(' ');
+
+      return {
+        item,
+        tsMs: Date.parse(item.timestamp),
+        batchKey: bKey,
+        skuLower,
+        skuNameLower,
+        batchKeyLower,
+        batchLower,
+        orderLower,
+        noPoLower,
+        customerLower,
+        refLower,
+        basketLower,
+        masterLower,
+        searchHaystack: searchFields.filter(Boolean).join('\u0001'),
+        batchHaystack
+      };
     });
-    return Array.from(batches);
-  }, [orderHistory]);
+
+    return {
+      indexedHistory: indexed,
+      uniqueCustomers: Array.from(customers),
+      uniqueBatches: Array.from(batches),
+      cancelledCount: cancelled
+    };
+  }, [orderHistory, orderAddressMap]);
+
+  const batchSelectOptions = useMemo(
+    () => uniqueBatches.map(b => <option key={b} value={b}>{b}</option>),
+    [uniqueBatches]
+  );
+  const customerSelectOptions = useMemo(
+    () => uniqueCustomers.map(cust => <option key={cust} value={cust}>{cust}</option>),
+    [uniqueCustomers]
+  );
 
   // Handle Sort
   const toggleSort = (field: 'timestamp' | 'qty') => {
@@ -245,144 +404,170 @@ export default function HistoryOrder({
     }
   };
 
-  // Filter and Search
+  // Filter and Search using deferred term & pre-parsed timestamps
   const filteredHistory = useMemo(() => {
-    let result = orderHistory.filter(item => (showCancelled || statusFilter === 'Cancelled') || item.status !== 'Cancelled');
+    const startMs = startDate ? (() => { const d = new Date(startDate); d.setHours(0, 0, 0, 0); return d.getTime(); })() : null;
+    const endMs = endDate ? (() => { const d = new Date(endDate); d.setHours(23, 59, 59, 999); return d.getTime(); })() : null;
+    const term = deferredSearchTerm.trim().toLowerCase();
+    const hasBatchQuery = activeBatchKeywords.length > 0;
+    const keywordSet = hasBatchQuery && batchMatchMode === 'exact'
+      ? new Set(activeBatchKeywords.map(k => k.toLowerCase()))
+      : null;
+    const lowerKeywords = hasBatchQuery && batchMatchMode !== 'exact'
+      ? activeBatchKeywords.map(k => k.toLowerCase())
+      : null;
 
-    // Filter by status
-    if (statusFilter !== 'ALL') {
-      result = result.filter(item => item.status === statusFilter);
+    const matched: typeof indexedHistory = [];
+    for (let i = 0; i < indexedHistory.length; i++) {
+      const entry = indexedHistory[i];
+      const item = entry.item;
+
+      if (!showCancelled && statusFilter !== 'Cancelled' && item.status === 'Cancelled') continue;
+      if (statusFilter !== 'ALL' && item.status !== statusFilter) continue;
+      if (batchFilter !== 'ALL' && entry.batchKey !== batchFilter) continue;
+      if (customerFilter !== 'ALL' && item.customerName !== customerFilter) continue;
+      if (startMs !== null && !(entry.tsMs >= startMs)) continue;
+      if (endMs !== null && !(entry.tsMs <= endMs)) continue;
+
+      if (term !== '' && !entry.searchHaystack.includes(term)) continue;
+
+      if (keywordSet) {
+        let hit = false;
+        if (batchTargetField === 'sku') {
+          hit = keywordSet.has(entry.skuLower);
+        } else if (batchTargetField === 'order') {
+          hit = Boolean((entry.orderLower && keywordSet.has(entry.orderLower)) || (entry.refLower && keywordSet.has(entry.refLower)));
+        } else if (batchTargetField === 'po_batch') {
+          hit = Boolean((entry.batchLower && keywordSet.has(entry.batchLower)) || (entry.noPoLower && keywordSet.has(entry.noPoLower)) || keywordSet.has(entry.batchKeyLower));
+        } else {
+          hit =
+            keywordSet.has(entry.skuLower) ||
+            keywordSet.has(entry.skuNameLower) ||
+            keywordSet.has(entry.batchKeyLower) ||
+            Boolean(entry.batchLower && keywordSet.has(entry.batchLower)) ||
+            Boolean(entry.orderLower && keywordSet.has(entry.orderLower)) ||
+            Boolean(entry.refLower && keywordSet.has(entry.refLower)) ||
+            Boolean(entry.noPoLower && keywordSet.has(entry.noPoLower)) ||
+            Boolean(entry.customerLower && keywordSet.has(entry.customerLower)) ||
+            Boolean(entry.basketLower && keywordSet.has(entry.basketLower)) ||
+            Boolean(entry.masterLower && keywordSet.has(entry.masterLower));
+        }
+        if (!hit) continue;
+      } else if (lowerKeywords) {
+        let hit = false;
+        if (batchTargetField === 'sku') {
+          hit = lowerKeywords.some(k => entry.skuLower.includes(k));
+        } else if (batchTargetField === 'order') {
+          hit = lowerKeywords.some(k => entry.orderLower.includes(k) || entry.refLower.includes(k));
+        } else if (batchTargetField === 'po_batch') {
+          hit = lowerKeywords.some(k => entry.batchLower.includes(k) || entry.batchKeyLower.includes(k) || entry.noPoLower.includes(k));
+        } else {
+          hit = lowerKeywords.some(k => entry.batchHaystack.includes(k));
+        }
+        if (!hit) continue;
+      }
+
+      matched.push(entry);
     }
 
-    // Filter by batch number
-    if (batchFilter !== 'ALL') {
-      result = result.filter(item => getBatchKey(item) === batchFilter);
-    }
-
-    // Filter by customer
-    if (customerFilter !== 'ALL') {
-      result = result.filter(item => item.customerName === customerFilter);
-    }
-
-    // Filter by date range
-    if (startDate) {
-      const start = new Date(startDate);
-      start.setHours(0, 0, 0, 0);
-      result = result.filter(item => new Date(item.timestamp) >= start);
-    }
-    if (endDate) {
-      const end = new Date(endDate);
-      end.setHours(23, 59, 59, 999);
-      result = result.filter(item => new Date(item.timestamp) <= end);
-    }
-
-    // Search filter
-    if (searchTerm.trim() !== '') {
-      const term = searchTerm.toLowerCase();
-      result = result.filter(item => 
-        item.skuId.toLowerCase().includes(term) ||
-        item.skuName.toLowerCase().includes(term) ||
-        getBatchKey(item).toLowerCase().includes(term) ||
-        (item.batchNumber && item.batchNumber.toLowerCase().includes(term)) ||
-        (item.orderNumber && item.orderNumber.toLowerCase().includes(term)) ||
-        (item.noPo && item.noPo.toLowerCase().includes(term)) ||
-        (item.customerName && item.customerName.toLowerCase().includes(term)) ||
-        item.referenceNumber.toLowerCase().includes(term) ||
-        [item.createdBy,item.pickedBy,item.sortedBy,item.packedBy].some(name=>name?.toLowerCase().includes(term))
-      );
-    }
-
-    // Sort
-    result.sort((a, b) => {
-      let valA = sortBy === 'timestamp' ? new Date(a.timestamp).getTime() : a.qty;
-      let valB = sortBy === 'timestamp' ? new Date(b.timestamp).getTime() : b.qty;
-
+    matched.sort((a, b) => {
+      const valA = sortBy === 'timestamp' ? a.tsMs : a.item.qty;
+      const valB = sortBy === 'timestamp' ? b.tsMs : b.item.qty;
       if (valA < valB) return sortOrder === 'asc' ? -1 : 1;
       if (valA > valB) return sortOrder === 'asc' ? 1 : -1;
       return 0;
     });
 
-    return result;
-  }, [orderHistory, searchTerm, customerFilter, batchFilter, statusFilter, sortBy, sortOrder, startDate, endDate, showCancelled]);
+    return matched.map(entry => entry.item);
+  }, [indexedHistory, deferredSearchTerm, customerFilter, batchFilter, statusFilter, sortBy, sortOrder, startDate, endDate, showCancelled, activeBatchKeywords, batchTargetField, batchMatchMode]);
 
-  const groupedByBatch = useMemo(() => {
-    const map = new Map<string, OutboundItem[]>();
-    filteredHistory.forEach(item => {
-      const bKey = getBatchKey(item);
-      const list = map.get(bKey) || [];
-      list.push(item);
-      map.set(bKey, list);
+  const { groupedByBatch, groupedByOrder } = useMemo(
+    () => buildGroupedHistory(filteredHistory, orderAddressMap, sortBy, sortOrder),
+    [filteredHistory, orderAddressMap, sortBy, sortOrder]
+  );
+
+  // Reset pagination whenever filters, sorting, viewMode or pageSize change
+  useEffect(() => {
+    setCurrentPage(1);
+  }, [viewMode, pageSize, deferredSearchTerm, customerFilter, batchFilter, statusFilter, sortBy, sortOrder, startDate, endDate, showCancelled, activeBatchKeywords, batchTargetField, batchMatchMode]);
+
+  const activeTotalCount =
+    viewMode === 'batch'
+      ? groupedByBatch.length
+      : viewMode === 'order'
+      ? groupedByOrder.length
+      : filteredHistory.length;
+  const totalPages = Math.max(1, Math.ceil(activeTotalCount / pageSize));
+  const safePage = Math.min(currentPage, totalPages);
+  const pageStartIdx = (safePage - 1) * pageSize;
+  const pageEndIdx = Math.min(activeTotalCount, pageStartIdx + pageSize);
+
+  const paginatedBatches = useMemo(
+    () => groupedByBatch.slice(pageStartIdx, pageEndIdx),
+    [groupedByBatch, pageStartIdx, pageEndIdx]
+  );
+  const paginatedOrders = useMemo(
+    () => groupedByOrder.slice(pageStartIdx, pageEndIdx),
+    [groupedByOrder, pageStartIdx, pageEndIdx]
+  );
+  const paginatedFlatItems = useMemo(
+    () => filteredHistory.slice(pageStartIdx, pageEndIdx),
+    [filteredHistory, pageStartIdx, pageEndIdx]
+  );
+
+  const allOrderCollapseKeys = useMemo(
+    () =>
+      viewMode === 'order'
+        ? paginatedOrders.map(o => o.collapseKey)
+        : paginatedBatches.flatMap(g => g.orderGroups.map(o => o.collapseKey)),
+    [viewMode, paginatedBatches, paginatedOrders]
+  );
+
+  const selectedIdSet = useMemo(() => new Set(selectedIds), [selectedIds]);
+
+  const completedVolumeQty = useMemo(
+    () => filteredHistory.reduce((sum, i) => (i.status === 'Completed' ? sum + i.qty : sum), 0),
+    [filteredHistory]
+  );
+
+  const handleToggleCollapseOrderKeys = (keys: string[], parentBatchKeys?: string[]) => {
+    if (keys.length === 0) return;
+    const anyCollapsed = keys.some(k => !expandedOrders[k]);
+    setExpandedOrders(prev => {
+      const next = { ...prev };
+      for (const k of keys) {
+        if (anyCollapsed) {
+          next[k] = true;
+        } else {
+          delete next[k];
+        }
+      }
+      return next;
     });
-
-    const groups = Array.from(map.entries()).map(([batchKey, items]) => {
-      const latestTimestamp = items.reduce((latest, it) => {
-        return new Date(it.timestamp).getTime() > new Date(latest).getTime() ? it.timestamp : latest;
-      }, items[0].timestamp);
-      const totalQty = items.filter(i => i.status !== 'Cancelled').reduce((sum, it) => sum + it.qty, 0);
-      const rawTotalQty = items.reduce((sum, it) => sum + it.qty, 0);
-      const uniqueSkuCount = new Set(items.map(i => i.skuId)).size;
-      const refs = Array.from(new Set(items.map(i => i.referenceNumber).filter(Boolean)));
-      const orderNumbers = Array.from(new Set(items.map(i => i.orderNumber).filter(Boolean))) as string[];
-      const poNumbers = Array.from(new Set(items.map(i => i.noPo).filter(Boolean))) as string[];
-      const customers = Array.from(new Set(items.map(i => i.customerName).filter(Boolean))) as string[];
-
-      const allCancelled = items.every(i => i.status === 'Cancelled');
-      const allCompleted = items.filter(i => i.status !== 'Cancelled').every(i => i.status === 'Completed');
-      const hasPending = items.some(i => i.status === 'Pending');
-      const groupStatus: 'Completed' | 'Pending' | 'Cancelled' = allCancelled
-        ? 'Cancelled'
-        : hasPending
-        ? 'Pending'
-        : allCompleted
-        ? 'Completed'
-        : 'Pending';
-
-      const createdBy = Array.from(new Set(items.map(i => i.createdBy).filter(Boolean))).join(', ');
-      const pickedBy = Array.from(new Set(items.map(i => i.pickedBy).filter(Boolean))).join(', ');
-      const sortedBy = Array.from(new Set(items.map(i => i.sortedBy).filter(Boolean))).join(', ');
-      const packedBy = Array.from(new Set(items.map(i => i.packedBy).filter(Boolean))).join(', ');
-
-      return {
-        batchKey,
-        items,
-        latestTimestamp,
-        totalQty: totalQty || rawTotalQty,
-        uniqueSkuCount,
-        refs,
-        orderNumbers,
-        poNumbers,
-        customers,
-        groupStatus,
-        createdBy,
-        pickedBy,
-        sortedBy,
-        packedBy
-      };
-    });
-
-    groups.sort((a, b) => {
-      const valA = sortBy === 'timestamp' ? new Date(a.latestTimestamp).getTime() : a.totalQty;
-      const valB = sortBy === 'timestamp' ? new Date(b.latestTimestamp).getTime() : b.totalQty;
-      if (valA < valB) return sortOrder === 'asc' ? -1 : 1;
-      if (valA > valB) return sortOrder === 'asc' ? 1 : -1;
-      return 0;
-    });
-
-    return groups;
-  }, [filteredHistory, sortBy, sortOrder]);
+    if (anyCollapsed && parentBatchKeys && parentBatchKeys.length > 0) {
+      setExpandedBatches(prev => {
+        const next = { ...prev };
+        for (const bKey of parentBatchKeys) {
+          next[bKey] = true;
+        }
+        return next;
+      });
+    }
+  };
 
   const handleToggleSelectBatch = (batchItems: OutboundItem[]) => {
     const batchIds = batchItems.map(i => i.id);
-    const allSelectedInBatch = batchIds.length > 0 && batchIds.every(id => selectedIds.includes(id));
+    const allSelectedInBatch = batchIds.length > 0 && batchIds.every(id => selectedIdSet.has(id));
     if (allSelectedInBatch) {
-      setSelectedIds(prev => prev.filter(id => !batchIds.includes(id)));
+      const removeSet = new Set(batchIds);
+      setSelectedIds(prev => prev.filter(id => !removeSet.has(id)));
     } else {
       setSelectedIds(prev => Array.from(new Set([...prev, ...batchIds])));
     }
   };
 
   const handleCancelBatch = (batchKey: string, batchItems: OutboundItem[]) => {
-    const cancellable = batchItems.filter(i => i.status !== 'Cancelled' && !i.shipped);
+    const cancellable = batchItems.filter(i => i.status !== 'Cancelled');
     if (cancellable.length === 0) return;
     setConfirmDialog({
       isOpen: true,
@@ -400,25 +585,36 @@ export default function HistoryOrder({
     });
   };
 
-  useEffect(()=>{const visible=new Set(filteredHistory.map(item=>item.id));setSelectedIds(prev=>{const next=prev.filter(id=>visible.has(id));return next.length===prev.length?prev:next})},[filteredHistory]);
-  const cancellableSelected=filteredHistory.filter(item=>selectedIds.includes(item.id)&&item.status!=='Cancelled'&&!item.shipped);
+  useEffect(() => {
+    if (selectedIds.length === 0) return;
+    const visible = new Set(filteredHistory.map(item => item.id));
+    setSelectedIds(prev => {
+      const next = prev.filter(id => visible.has(id));
+      return next.length === prev.length ? prev : next;
+    });
+  }, [filteredHistory, selectedIds.length]);
+
+  const cancellableSelected = useMemo(
+    () => filteredHistory.filter(item => selectedIdSet.has(item.id) && item.status !== 'Cancelled'),
+    [filteredHistory, selectedIdSet]
+  );
+
   // Handle Select / Deselect individual row
   const handleToggleSelectRow = (id: string) => {
     setSelectedIds(prev => 
-      prev.includes(id) ? prev.filter(item => item !== id) : [...prev, id]
+      selectedIdSet.has(id) ? prev.filter(item => item !== id) : [...prev, id]
     );
   };
 
   // Handle Select / Deselect all filtered rows
   const handleToggleSelectAll = () => {
     const allFilteredIds = filteredHistory.map(item => item.id);
-    const areAllInSelected = allFilteredIds.length > 0 && allFilteredIds.every(id => selectedIds.includes(id));
+    const areAllInSelected = allFilteredIds.length > 0 && allFilteredIds.every(id => selectedIdSet.has(id));
 
     if (areAllInSelected) {
-      // Remove all filtered ids from selection
-      setSelectedIds(prev => prev.filter(id => !allFilteredIds.includes(id)));
+      const removeSet = new Set(allFilteredIds);
+      setSelectedIds(prev => prev.filter(id => !removeSet.has(id)));
     } else {
-      // Add all filtered ids to selection
       setSelectedIds(prev => {
         const union = new Set([...prev, ...allFilteredIds]);
         return Array.from(union);
@@ -426,13 +622,22 @@ export default function HistoryOrder({
     }
   };
 
-  const isAllSelected = filteredHistory.length > 0 && filteredHistory.every(item => selectedIds.includes(item.id));
-  const isSomeSelected = filteredHistory.length > 0 && filteredHistory.some(item => selectedIds.includes(item.id)) && !isAllSelected;
+  const { isAllSelected, isSomeSelected } = useMemo(() => {
+    if (filteredHistory.length === 0 || selectedIdSet.size === 0) {
+      return { isAllSelected: false, isSomeSelected: false };
+    }
+    let hitCount = 0;
+    for (let i = 0; i < filteredHistory.length; i++) {
+      if (selectedIdSet.has(filteredHistory[i].id)) hitCount++;
+    }
+    const all = hitCount === filteredHistory.length;
+    return { isAllSelected: all, isSomeSelected: hitCount > 0 && !all };
+  }, [filteredHistory, selectedIdSet]);
 
   // Export to Excel .xlsx
   const handleExportExcel = () => {
-    const itemsToExport = selectedIds.length > 0 
-      ? filteredHistory.filter(item => selectedIds.includes(item.id)) 
+    const itemsToExport = selectedIdSet.size > 0 
+      ? filteredHistory.filter(item => selectedIdSet.has(item.id)) 
       : filteredHistory;
 
     if (itemsToExport.length === 0) {
@@ -441,56 +646,13 @@ export default function HistoryOrder({
     }
 
     try {
-      const exportData = itemsToExport.map(item => {
-        const row: any = {
-          'Waktu Keluar': formatToWibString(item.timestamp),
-          'Batch Number': getBatchKey(item),
-          'No Referensi': item.referenceNumber || '-',
-          'Order Number': item.orderNumber || '-',
-          'No PO': item.noPo || '-',
-          'Customer Name': item.customerName || '-',
-          'SKU ID': item.skuId,
-          'Nama Barang': item.skuName,
-          'Expired': item.expiredDate,
-          'Lokasi Rak': item.location,
-          'Qty (Pcs)': item.qty,
-          'Status': item.status,
-          'Petugas Input': item.createdBy || 'Belum tercatat',
-          'Petugas Picking': item.pickedBy || 'Belum tercatat',
-          'Petugas Sortir': item.sortedBy || 'Belum tercatat',
-          'Petugas Packing / Validasi': item.packedBy || 'Belum tercatat',
-          ...Object.fromEntries(getOrderStageHistory(item).map(row => ['Waktu '+row.stage+' (WIB)',row.timeLabel]))
-        };
-
-        if (includeDescription) {
-          row['Deskripsi / Dokumen'] = item.referenceNumber || item.notes || '-';
-        }
-
-        return row;
+      const exportData = buildOrderHistoryExportRows(itemsToExport, orderAddressMap, {
+        includeDescription,
+        phoneMap: orderPhoneMap
       });
 
       const worksheet = XLSX.utils.json_to_sheet(exportData);
-      
-      const colWidths = [
-        { wch: 18 }, // Waktu Keluar
-        { wch: 22 }, // Batch Number
-        { wch: 22 }, // No Referensi
-        { wch: 15 }, // Order Number
-        { wch: 15 }, // No PO
-        { wch: 25 }, // Customer Name
-        { wch: 15 }, // SKU ID
-        { wch: 30 }, // Nama Barang
-        { wch: 12 }, // Expired
-        { wch: 12 }, // Lokasi Rak
-        { wch: 10 }, // Qty (Pcs)
-        { wch: 12 }, // Status
-        { wch: 24 }, { wch: 24 }, { wch: 24 }, { wch: 24 },
-        { wch: 28 }, { wch: 28 }, { wch: 28 }, { wch: 28 }
-      ];
-      if (includeDescription) {
-        colWidths.push({ wch: 25 }); // Deskripsi / Dokumen
-      }
-      worksheet['!cols'] = colWidths;
+      worksheet['!cols'] = getOrderHistoryExportColWidths(includeDescription);
 
       const workbook = XLSX.utils.book_new();
       XLSX.utils.book_append_sheet(workbook, worksheet, 'Riwayat Order');
@@ -503,6 +665,421 @@ export default function HistoryOrder({
     }
   };
 
+  const renderOrderItemsTable = (items: OutboundItem[]) => (
+    <div className="overflow-x-auto">
+      <table className="w-full text-left border-collapse">
+        <thead>
+          <tr className="bg-[#11141B] text-slate-400 uppercase font-bold text-[10px] border-b border-slate-800/60">
+            <th className="py-2.5 px-4 text-center w-10"></th>
+            <th className="py-2.5 px-4">SKU / Nama Barang</th>
+            <th className="py-2.5 px-4 text-center">Lokasi Rak</th>
+            <th className="py-2.5 px-4 text-center">Expired</th>
+            <th className="py-2.5 px-4 text-right">Qty (Pcs)</th>
+            <th className="py-2.5 px-4 text-center">Status</th>
+            <th className="py-2.5 px-4 min-w-[260px]">Petugas & Waktu Proses (WIB)</th>
+            <th className="py-2.5 px-4 text-center w-24">Aksi</th>
+          </tr>
+        </thead>
+        <tbody className="divide-y divide-slate-800/50 text-slate-300 text-xs">
+          {items.map(item => (
+            <tr
+              key={item.id}
+              className={`hover:bg-slate-800/20 transition-colors ${
+                selectedIdSet.has(item.id) ? 'bg-emerald-500/5 hover:bg-emerald-500/10' : ''
+              }`}
+            >
+              <td className="py-2.5 px-4 text-center">
+                <input
+                  type="checkbox"
+                  checked={selectedIdSet.has(item.id)}
+                  onChange={() => handleToggleSelectRow(item.id)}
+                  className="w-4 h-4 rounded border-slate-800 bg-[#161B25] text-emerald-500 focus:ring-emerald-500 cursor-pointer"
+                />
+              </td>
+              <td className="py-2.5 px-4">
+                <div className="flex flex-wrap items-center gap-1.5">
+                  <button
+                    type="button"
+                    onClick={(e) => handleCopyText(item.skuId, `sku-${item.id}`, e)}
+                    className="inline-flex items-center gap-1 font-mono font-bold text-emerald-400 bg-emerald-500/10 hover:bg-emerald-500/20 border border-emerald-500/20 hover:border-emerald-500/40 px-1.5 py-0.5 rounded text-[11px] transition-colors cursor-pointer group active:scale-95"
+                    title="Klik untuk salin SKU ID"
+                    aria-label={`Salin SKU ID ${item.skuId}`}
+                  >
+                    <span>{item.skuId}</span>
+                    {copiedKey === `sku-${item.id}` ? (
+                      <span className="inline-flex items-center text-[10px] text-emerald-300 font-sans font-semibold">
+                        <Check className="w-3 h-3 text-emerald-300 mr-0.5" />
+                        Tersalin!
+                      </span>
+                    ) : (
+                      <Copy className="w-3 h-3 text-emerald-500/60 group-hover:text-emerald-300 transition-colors" />
+                    )}
+                  </button>
+                  <span className="font-medium text-slate-200">{item.skuName}</span>
+                </div>
+                <div className="text-[10px] text-slate-400 mt-0.5 font-mono flex flex-wrap items-center gap-1">
+                  <span>Ref: {item.referenceNumber}</span>
+                  {item.orderNumber && (
+                    <>
+                      <span>•</span>
+                      <button
+                        type="button"
+                        onClick={(e) => handleCopyText(item.orderNumber!, `order-sub-${item.id}`, e)}
+                        className="inline-flex items-center gap-1 text-slate-300 hover:text-emerald-300 transition-colors cursor-pointer active:scale-95 px-1 py-0.5 rounded hover:bg-emerald-500/10"
+                        title="Klik untuk salin No Order"
+                        aria-label={`Salin No Order ${item.orderNumber}`}
+                      >
+                        <span>Order: <strong>{item.orderNumber}</strong></span>
+                        {copiedKey === `order-sub-${item.id}` ? (
+                          <Check className="w-3 h-3 text-emerald-400" />
+                        ) : (
+                          <Copy className="w-2.5 h-2.5 text-slate-500 hover:text-emerald-300" />
+                        )}
+                      </button>
+                    </>
+                  )}
+                  {item.noPo ? ` • PO: ${item.noPo}` : ''}
+                </div>
+              </td>
+              <td className="py-2.5 px-4 text-center font-mono font-bold text-slate-200">
+                {item.location}
+              </td>
+              <td className="py-2.5 px-4 text-center whitespace-nowrap font-mono text-slate-300">
+                {item.expiredDate}
+              </td>
+              <td className="py-2.5 px-4 text-right font-bold text-rose-400 font-mono">
+                {formatNumber(item.qty)}
+              </td>
+              <td className="py-2.5 px-4 text-center">
+                <span
+                  className={`px-2 py-0.5 rounded text-[10px] font-extrabold uppercase ${
+                    item.status === 'Cancelled'
+                      ? 'bg-rose-500/10 text-rose-400 border border-rose-500/20'
+                      : item.status === 'Pending'
+                      ? 'bg-amber-500/10 text-amber-400 border border-amber-500/20 animate-pulse'
+                      : 'bg-emerald-500/10 text-emerald-400 border border-emerald-500/20'
+                  }`}
+                >
+                  {item.status === 'Cancelled' ? 'Dibatalkan' : item.status}
+                </span>
+              </td>
+              <td className="py-2.5 px-4 align-top min-w-[260px]">
+                <dl className="grid grid-cols-[auto_1fr] gap-x-3 gap-y-1 text-[11px]">
+                  {getOrderStageHistory(item).map(({ stage, name, processedAt, timeLabel }) => (
+                    <React.Fragment key={stage}>
+                      <dt className="font-semibold text-slate-400">{stage}:</dt>
+                      <dd className="font-bold text-slate-200 break-words">
+                        <span>{name}</span>
+                        {timeLabel !== 'Belum tercatat' && (
+                          <time dateTime={processedAt} className="ml-1.5 font-normal text-slate-400 text-[10px] tabular-nums">
+                            ({timeLabel})
+                          </time>
+                        )}
+                      </dd>
+                    </React.Fragment>
+                  ))}
+                </dl>
+              </td>
+              <td className="py-2.5 px-4 text-center whitespace-nowrap">
+                {(currentUser?.role === 'Administrator' || currentUser?.role === 'Admin') &&
+                item.status !== 'Cancelled' ? (
+                  <>
+                    <button
+                      onClick={() => handleStartEdit(item)}
+                      className="p-1 text-sky-400 hover:text-sky-300 hover:bg-sky-500/10 rounded transition-colors mr-1.5 cursor-pointer inline-flex items-center"
+                      title="Edit Baris"
+                    >
+                      <Edit className="w-4 h-4" />
+                    </button>
+                    <button
+                      onClick={() => handleDelete(item)}
+                      className="p-1 text-rose-400 hover:text-rose-300 hover:bg-rose-500/10 rounded transition-colors cursor-pointer inline-flex items-center"
+                      title="Batalkan Baris Order"
+                      aria-label="Batalkan order"
+                    >
+                      <X className="w-4 h-4" />
+                    </button>
+                  </>
+                ) : (
+                  <span className="text-[10px] font-bold text-slate-500 uppercase tracking-wide">
+                    {item.status === 'Cancelled' ? 'Dibatalkan' : 'Hanya lihat'}
+                  </span>
+                )}
+              </td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  );
+
+  const renderBasketBadges = (masterBaskets: string[], sortBaskets: string[]) => (
+    <>
+      {masterBaskets.length > 0 && (
+        <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded bg-sky-500/10 border border-sky-500/30 text-sky-300 font-mono text-[10px] font-bold">
+          Induk: <strong>{masterBaskets.join(', ')}</strong>
+        </span>
+      )}
+      {sortBaskets.length > 0 && (
+        <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded bg-violet-500/10 border border-violet-500/30 text-violet-300 font-mono text-[10px] font-bold">
+          Sortir: <strong>{sortBaskets.join(', ')}</strong>
+        </span>
+      )}
+    </>
+  );
+
+  const renderOrderCard = (orderGroup: HistoryOrderGroup, options?: { showBatchBadge?: boolean }) => {
+    const isOrderCollapsed = !expandedOrders[orderGroup.collapseKey];
+    const orderIds = orderGroup.items.map(i => i.id);
+    const allOrderSelected = orderIds.length > 0 && orderIds.every(id => selectedIdSet.has(id));
+    const someOrderSelected = orderIds.length > 0 && orderIds.some(id => selectedIdSet.has(id)) && !allOrderSelected;
+
+    return (
+      <div
+        key={orderGroup.collapseKey}
+        className="rounded-xl border border-slate-800/80 bg-[#11141B] overflow-hidden shadow-sm"
+      >
+        <div className="bg-[#161B25]/90 px-4 py-3 border-b border-slate-800/60 flex flex-col lg:flex-row lg:items-center justify-between gap-3">
+          <div className="flex items-start sm:items-center gap-3 min-w-0">
+            <input
+              type="checkbox"
+              checked={allOrderSelected}
+              ref={el => {
+                if (el) el.indeterminate = someOrderSelected;
+              }}
+              onChange={() => handleToggleSelectBatch(orderGroup.items)}
+              className="w-4 h-4 mt-1 sm:mt-0 rounded border-slate-700 bg-[#11141B] text-emerald-500 focus:ring-emerald-500 cursor-pointer shrink-0"
+              title={`Pilih semua item di Order ${orderGroup.displayOrderLabel}`}
+            />
+
+            <div className="min-w-0 space-y-1">
+              <div className="flex flex-wrap items-center gap-2">
+                <button
+                  type="button"
+                  onClick={(e) => handleCopyText(orderGroup.displayOrderLabel, `order-card-${orderGroup.collapseKey}`, e)}
+                  className="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-lg bg-[#11141B] hover:bg-emerald-500/15 border border-slate-700/70 hover:border-emerald-500/40 text-slate-100 hover:text-emerald-300 font-mono text-xs font-extrabold transition-all cursor-pointer group active:scale-95"
+                  title="Klik untuk salin No Order"
+                  aria-label={`Salin No Order ${orderGroup.displayOrderLabel}`}
+                >
+                  <FileText className="w-3.5 h-3.5 text-emerald-400 shrink-0" />
+                  <span>{orderGroup.orderNumber ? `No Order: ${orderGroup.orderNumber}` : `Ref: ${orderGroup.displayOrderLabel}`}</span>
+                  {copiedKey === `order-card-${orderGroup.collapseKey}` ? (
+                    <span className="inline-flex items-center text-[10px] text-emerald-300 font-sans font-semibold">
+                      <Check className="w-3 h-3 text-emerald-300 mr-0.5" />
+                      Tersalin!
+                    </span>
+                  ) : (
+                    <Copy className="w-3 h-3 text-slate-400 group-hover:text-emerald-300 transition-colors" />
+                  )}
+                </button>
+
+                {options?.showBatchBadge && (
+                  <span className="inline-flex items-center gap-1 font-mono text-[11px] font-bold text-emerald-400 bg-emerald-500/10 border border-emerald-500/20 px-2 py-0.5 rounded">
+                    <Layers className="w-3 h-3 shrink-0" />
+                    Batch: {orderGroup.batchKey}
+                  </span>
+                )}
+
+                <span
+                  className={`px-2 py-0.5 rounded text-[10px] font-extrabold uppercase ${
+                    orderGroup.orderStatus === 'Cancelled'
+                      ? 'bg-rose-500/10 text-rose-400 border border-rose-500/20'
+                      : orderGroup.orderStatus === 'Pending'
+                      ? 'bg-amber-500/10 text-amber-400 border border-amber-500/20'
+                      : 'bg-emerald-500/10 text-emerald-400 border border-emerald-500/20'
+                  }`}
+                >
+                  {orderGroup.orderStatus === 'Cancelled' ? 'Dibatalkan' : orderGroup.orderStatus}
+                </span>
+
+                <span className="text-[11px] font-mono text-slate-400 flex items-center gap-1">
+                  <Calendar className="w-3 h-3 text-slate-500" />
+                  {formatToWibString(orderGroup.latestTimestamp)}
+                </span>
+
+                {orderGroup.poNumbers.length > 0 && (
+                  <span className="inline-flex items-center gap-1 text-[11px] font-mono text-slate-300">
+                    <Tag className="w-3 h-3 text-amber-400" />
+                    PO: <strong>{orderGroup.poNumbers.join(', ')}</strong>
+                  </span>
+                )}
+                {renderBasketBadges(orderGroup.masterBaskets, orderGroup.sortBaskets)}
+              </div>
+
+              {(orderGroup.customers.length > 0 || orderGroup.customerAddress) && (
+                <div className="flex flex-wrap items-start gap-x-4 gap-y-1 text-xs">
+                  {orderGroup.customers.length > 0 && (
+                    <span className="inline-flex items-center gap-1 font-bold text-slate-200">
+                      <User className="w-3.5 h-3.5 text-sky-400 shrink-0" />
+                      <span>{orderGroup.customers.join(', ')}</span>
+                    </span>
+                  )}
+                  {orderGroup.customerAddress && (
+                    <span className="inline-flex items-start gap-1 text-slate-300 break-words">
+                      <MapPin className="w-3.5 h-3.5 text-amber-400 shrink-0 mt-0.5" />
+                      <span className="whitespace-pre-line">{orderGroup.customerAddress}</span>
+                    </span>
+                  )}
+                </div>
+              )}
+            </div>
+          </div>
+
+          <div className="flex flex-wrap items-center justify-between lg:justify-end gap-2.5 shrink-0">
+            <div className="flex items-center gap-2 text-[11px] font-mono">
+              <span className="px-2 py-1 rounded bg-[#11141B] border border-slate-800 text-slate-300 font-bold">
+                {orderGroup.uniqueSkuCount} SKU ({orderGroup.items.length} baris)
+              </span>
+              <span className="px-2 py-1 rounded bg-[#11141B] border border-slate-800 text-rose-400 font-extrabold">
+                {formatNumber(orderGroup.totalQty)} Pcs
+              </span>
+            </div>
+
+            {orderGroup.orderStatus !== 'Cancelled' && (
+              <button
+                type="button"
+                onClick={() => openReceiptForItems(orderGroup.items, orderGroup.batchKey)}
+                className="inline-flex items-center gap-1 rounded-lg border border-indigo-500/30 bg-indigo-500/10 hover:bg-indigo-500/20 px-2.5 py-1 text-[11px] font-bold text-indigo-400 transition-colors cursor-pointer"
+                title={`Print resi untuk order ${orderGroup.displayOrderLabel}`}
+              >
+                <Printer className="w-3.5 h-3.5" />
+                Print Resi Order
+              </button>
+            )}
+
+            <button
+              type="button"
+              onClick={() =>
+                setExpandedOrders(prev => ({
+                  ...prev,
+                  [orderGroup.collapseKey]: !prev[orderGroup.collapseKey]
+                }))
+              }
+              className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg border text-[11px] font-bold transition-colors cursor-pointer ${
+                isOrderCollapsed
+                  ? 'bg-emerald-500/15 hover:bg-emerald-500/25 border-emerald-500/35 text-emerald-300'
+                  : 'bg-[#11141B] hover:bg-slate-800 border-slate-700/70 text-slate-300'
+              }`}
+              title={isOrderCollapsed ? 'Tampilkan rincian order' : 'Sembunyikan rincian order'}
+              aria-expanded={!isOrderCollapsed}
+            >
+              {isOrderCollapsed ? (
+                <>
+                  <Maximize2 className="w-3.5 h-3.5" />
+                  <span>{t('order.maximizeOrder')}</span>
+                </>
+              ) : (
+                <>
+                  <Minimize2 className="w-3.5 h-3.5" />
+                  <span>{t('order.minimizeOrder')}</span>
+                </>
+              )}
+            </button>
+          </div>
+        </div>
+
+        {!isOrderCollapsed && renderOrderItemsTable(orderGroup.items)}
+      </div>
+    );
+  };
+
+  const renderPaginationBar = (placement: 'top' | 'bottom') => {
+    if (activeTotalCount === 0) return null;
+    const unitLabel = viewMode === 'batch' ? 'Batch' : viewMode === 'order' ? 'Order' : 'Baris';
+    const pageOptions = Array.from(new Set([25, 50, 100, 200, 500, pageSize])).sort((a, b) => a - b);
+
+    return (
+      <div
+        className={`flex flex-wrap items-center justify-between gap-3 rounded-xl border border-slate-800/80 bg-[#151922] px-4 py-2.5 text-xs text-slate-300 ${
+          placement === 'top' ? 'shadow-sm' : 'mt-3'
+        }`}
+      >
+        <div className="flex flex-wrap items-center gap-2">
+          <span>
+            Menampilkan{' '}
+            <strong className="text-white font-mono">
+              {formatNumber(pageStartIdx + 1)}–{formatNumber(pageEndIdx)}
+            </strong>{' '}
+            dari <strong className="text-white font-mono">{formatNumber(activeTotalCount)}</strong> {unitLabel}
+          </span>
+          {searchTerm !== deferredSearchTerm && (
+            <span className="text-[11px] font-semibold text-emerald-400">Menyaring...</span>
+          )}
+        </div>
+
+        <div className="flex flex-wrap items-center gap-2">
+          <label className="inline-flex items-center gap-1.5 text-[11px] text-slate-400">
+            <span>Per halaman:</span>
+            <select
+              aria-label={`Jumlah ${unitLabel} per halaman (${placement})`}
+              value={pageSize}
+              onChange={(e) => {
+                const nextSize = Number(e.target.value);
+                if (Number.isFinite(nextSize) && nextSize > 0) {
+                  setCustomPageSize(nextSize);
+                  setCurrentPage(1);
+                }
+              }}
+              className="rounded-lg border border-slate-700 bg-[#11141B] px-2 py-1 text-xs font-bold text-slate-200 outline-none focus:ring-1 focus:ring-emerald-500 cursor-pointer"
+            >
+              {pageOptions.map(opt => (
+                <option key={opt} value={opt}>
+                  {opt}
+                </option>
+              ))}
+            </select>
+          </label>
+
+          {totalPages > 1 && (
+            <div className="inline-flex items-center gap-1">
+              <button
+                type="button"
+                onClick={() => setCurrentPage(1)}
+                disabled={safePage <= 1}
+                className="rounded-lg border border-slate-700/80 bg-[#11141B] px-2 py-1 text-[11px] font-bold text-slate-300 hover:bg-slate-800 disabled:opacity-40 disabled:cursor-not-allowed cursor-pointer"
+                title="Halaman pertama"
+              >
+                «
+              </button>
+              <button
+                type="button"
+                onClick={() => setCurrentPage(p => Math.max(1, p - 1))}
+                disabled={safePage <= 1}
+                className="inline-flex items-center gap-0.5 rounded-lg border border-slate-700/80 bg-[#11141B] px-2.5 py-1 text-[11px] font-bold text-slate-300 hover:bg-slate-800 disabled:opacity-40 disabled:cursor-not-allowed cursor-pointer"
+                title="Halaman sebelumnya"
+              >
+                <ChevronLeft className="w-3.5 h-3.5" />
+                <span>Sebelumnya</span>
+              </button>
+              <span className="px-2 font-mono text-[11px] font-bold text-slate-200">
+                Hal {safePage} / {totalPages}
+              </span>
+              <button
+                type="button"
+                onClick={() => setCurrentPage(p => Math.min(totalPages, p + 1))}
+                disabled={safePage >= totalPages}
+                className="inline-flex items-center gap-0.5 rounded-lg border border-slate-700/80 bg-[#11141B] px-2.5 py-1 text-[11px] font-bold text-slate-300 hover:bg-slate-800 disabled:opacity-40 disabled:cursor-not-allowed cursor-pointer"
+                title="Halaman berikutnya"
+              >
+                <span>Berikutnya</span>
+                <ChevronRight className="w-3.5 h-3.5" />
+              </button>
+              <button
+                type="button"
+                onClick={() => setCurrentPage(totalPages)}
+                disabled={safePage >= totalPages}
+                className="rounded-lg border border-slate-700/80 bg-[#11141B] px-2 py-1 text-[11px] font-bold text-slate-300 hover:bg-slate-800 disabled:opacity-40 disabled:cursor-not-allowed cursor-pointer"
+                title="Halaman terakhir"
+              >
+                »
+              </button>
+            </div>
+          )}
+        </div>
+      </div>
+    );
+  };
+
   return (
     <div className="space-y-6" id="history-order-view">
       {/* Header */}
@@ -510,15 +1087,15 @@ export default function HistoryOrder({
         <div>
           <h2 className="text-xl font-extrabold tracking-tight text-white flex items-center gap-2">
             <ShoppingBag className="w-5 h-5 text-emerald-400" />
-            Riwayat Order (Barang Keluar)
+            {t('order.historyTitle')}
           </h2>
           <p className="text-slate-400 mt-1 text-xs md:text-sm">
-            Pantau riwayat transaksi outbound dikelompokkan per <strong className="text-emerald-400">Batch Number</strong> atau per baris rincian SKU.
+            {t('order.historySubtitle')}
           </p>
         </div>
         
         <div className="flex flex-wrap items-center gap-3">
-          {/* View Mode Toggle: Per Batch vs Flat Table */}
+          {/* View Mode Toggle: Per Batch vs Per Order vs Flat Table */}
           <div className="flex items-center bg-[#161B25] p-1 rounded-xl border border-slate-800">
             <button
               type="button"
@@ -530,7 +1107,19 @@ export default function HistoryOrder({
               }`}
             >
               <Layers className="w-3.5 h-3.5" />
-              Per Batch ({groupedByBatch.length})
+              {t('order.viewPerBatch')} ({groupedByBatch.length})
+            </button>
+            <button
+              type="button"
+              onClick={() => setViewMode('order')}
+              className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-extrabold transition-all cursor-pointer ${
+                viewMode === 'order'
+                  ? 'bg-emerald-500 text-slate-950 shadow-sm'
+                  : 'text-slate-400 hover:text-white'
+              }`}
+            >
+              <FileText className="w-3.5 h-3.5" />
+              {t('order.viewPerOrder')} ({groupedByOrder.length})
             </button>
             <button
               type="button"
@@ -542,7 +1131,7 @@ export default function HistoryOrder({
               }`}
             >
               <List className="w-3.5 h-3.5" />
-              Tabel Baris ({filteredHistory.length})
+              {t('order.viewFlatTable')} ({filteredHistory.length})
             </button>
           </div>
 
@@ -553,14 +1142,14 @@ export default function HistoryOrder({
               onChange={(e) => setIncludeDescription(e.target.checked)}
               className="w-4 h-4 rounded border-slate-800 bg-[#11141B] text-emerald-500 focus:ring-emerald-500 cursor-pointer"
             />
-            Sertakan Kolom Deskripsi/Dokumen
+            {t('order.includeDocCol')}
           </label>
           <button
             onClick={handleExportExcel}
             className="flex items-center gap-2 px-4 py-2.5 bg-emerald-500 hover:bg-emerald-450 text-slate-950 font-extrabold rounded-xl text-xs transition-all shadow-md cursor-pointer"
           >
             <FileSpreadsheet className="w-4 h-4" />
-            Ekspor Excel (.xlsx) {selectedIds.length > 0 && `(${selectedIds.length} Terpilih)`}
+            {t('order.exportExcel')} {selectedIds.length > 0 && `(${selectedIds.length} Terpilih)`}
           </button>
           {(currentUser?.role === 'Administrator' || currentUser?.role === 'Admin') && orderHistory.length > 0 && selectedIds.length === 0 && !!onClearAllOrderHistory && (
             <button
@@ -572,7 +1161,7 @@ export default function HistoryOrder({
               className="flex items-center gap-2 px-4 py-2.5 bg-rose-600 hover:bg-rose-500 text-white font-extrabold rounded-xl text-xs transition-all shadow-md cursor-pointer"
             >
               <Trash2 className="w-4 h-4" />
-              Hapus Semua Riwayat
+              {t('order.clearAll')}
             </button>
           )}
           {cancellableSelected.length > 0 && ['Administrator','Admin'].includes(currentUser?.role||'') && (
@@ -581,7 +1170,7 @@ export default function HistoryOrder({
               className="flex items-center gap-2 px-4 py-2.5 bg-rose-600 hover:bg-rose-500 text-white font-extrabold rounded-xl text-xs transition-all shadow-md cursor-pointer"
             >
               <Trash2 className="w-4 h-4" />
-              Batalkan ({cancellableSelected.length}) Terpilih
+              {t('order.cancelSelected')} ({cancellableSelected.length})
             </button>
           )}
         </div>
@@ -595,46 +1184,77 @@ export default function HistoryOrder({
             onChange={e => setShowCancelled(e.target.checked)}
             className="h-4 w-4 rounded border-slate-800 bg-[#161B25] text-emerald-500 focus:ring-emerald-500 cursor-pointer"
           />
-          <span>Tampilkan yang dibatalkan ({cancelledCount} baris)</span>
+          <span>{t('order.showCancelled')} ({cancelledCount} baris)</span>
         </label>
 
-        {viewMode === 'batch' && groupedByBatch.length > 0 && (
-          <div className="flex items-center gap-2">
+        {(viewMode === 'batch' || viewMode === 'order') &&
+          (viewMode === 'batch' ? groupedByBatch.length > 0 : groupedByOrder.length > 0) && (
+          <div className="flex flex-wrap items-center gap-2">
             <button
               type="button"
               onClick={handleToggleSelectAll}
               className="px-3 py-2 rounded-xl border border-slate-800 bg-[#11141B] hover:bg-[#161B25] text-xs font-bold text-slate-300 transition-colors cursor-pointer"
             >
-              {isAllSelected ? 'Batal Pilih Semua' : `Pilih Semua (${filteredHistory.length} Baris)`}
+              {isAllSelected ? t('order.deselectAll') : `${t('order.selectAll')} (${filteredHistory.length} Baris)`}
             </button>
-            <button
-              type="button"
-              onClick={() => {
-                const anyCollapsed = groupedByBatch.some(g => collapsedBatches[g.batchKey]);
-                if (anyCollapsed) {
-                  setCollapsedBatches({});
-                } else {
-                  const next: Record<string, boolean> = {};
-                  groupedByBatch.forEach(g => {
-                    next[g.batchKey] = true;
-                  });
-                  setCollapsedBatches(next);
+            {viewMode === 'batch' && (
+              <button
+                type="button"
+                onClick={() => {
+                  const anyCollapsed = paginatedBatches.some(g => !expandedBatches[g.batchKey]);
+                  if (anyCollapsed) {
+                    const next: Record<string, boolean> = { ...expandedBatches };
+                    paginatedBatches.forEach(g => {
+                      next[g.batchKey] = true;
+                    });
+                    setExpandedBatches(next);
+                  } else {
+                    const next = { ...expandedBatches };
+                    paginatedBatches.forEach(g => {
+                      delete next[g.batchKey];
+                    });
+                    setExpandedBatches(next);
+                  }
+                }}
+                className="px-3 py-2 rounded-xl border border-slate-800 bg-[#11141B] hover:bg-[#161B25] text-xs font-bold text-emerald-400 transition-colors cursor-pointer flex items-center gap-1.5"
+              >
+                {paginatedBatches.some(g => !expandedBatches[g.batchKey]) ? (
+                  <>
+                    <ChevronDown className="w-3.5 h-3.5" />
+                    {t('order.expandAll')}
+                  </>
+                ) : (
+                  <>
+                    <ChevronUp className="w-3.5 h-3.5" />
+                    {t('order.collapseAll')}
+                  </>
+                )}
+              </button>
+            )}
+            {allOrderCollapseKeys.length > 0 && (
+              <button
+                type="button"
+                onClick={() =>
+                  handleToggleCollapseOrderKeys(
+                    allOrderCollapseKeys,
+                    viewMode === 'batch' ? paginatedBatches.map(g => g.batchKey) : undefined
+                  )
                 }
-              }}
-              className="px-3 py-2 rounded-xl border border-slate-800 bg-[#11141B] hover:bg-[#161B25] text-xs font-bold text-emerald-400 transition-colors cursor-pointer flex items-center gap-1.5"
-            >
-              {groupedByBatch.some(g => collapsedBatches[g.batchKey]) ? (
-                <>
-                  <ChevronDown className="w-3.5 h-3.5" />
-                  Buka Semua Batch
-                </>
-              ) : (
-                <>
-                  <ChevronUp className="w-3.5 h-3.5" />
-                  Ringkas Semua Batch
-                </>
-              )}
-            </button>
+                className="px-3 py-2 rounded-xl border border-slate-800 bg-[#11141B] hover:bg-[#161B25] text-xs font-bold text-sky-400 transition-colors cursor-pointer flex items-center gap-1.5"
+              >
+                {allOrderCollapseKeys.some(k => !expandedOrders[k]) ? (
+                  <>
+                    <Maximize2 className="w-3.5 h-3.5" />
+                    {t('order.expandAllOrders')}
+                  </>
+                ) : (
+                  <>
+                    <Minimize2 className="w-3.5 h-3.5" />
+                    {t('order.collapseAllOrders')}
+                  </>
+                )}
+              </button>
+            )}
           </div>
         )}
       </div>
@@ -644,52 +1264,85 @@ export default function HistoryOrder({
         <div className="grid grid-cols-1 md:grid-cols-3 lg:grid-cols-6 gap-4">
           {/* Search */}
           <div className="relative lg:col-span-2">
-            <label className="block text-[10px] font-bold text-slate-400 uppercase mb-1.5">Cari Batch / SKU / Order / Petugas</label>
-            <div className="relative">
+            <div className="flex items-center justify-between mb-1.5">
+              <label className="block text-[10px] font-bold text-slate-400 uppercase">{t('order.searchBatchSku')}</label>
+              <button
+                type="button"
+                onClick={() => {
+                  if (activeBatchKeywords.length > 0 && !batchRawInput) {
+                    setBatchRawInput(activeBatchKeywords.join('\n'));
+                  }
+                  setIsBatchModalOpen(true);
+                }}
+                className="text-[10px] text-blue-400 hover:text-blue-300 font-bold flex items-center gap-1 transition-colors cursor-pointer"
+                title="Buka Batch Query (Pencarian massal banyak nomor sekaligus)"
+              >
+                <Camera className="w-3.5 h-3.5" />
+                <span>{t('order.batchQuery')}</span>
+              </button>
+            </div>
+            <div className="relative flex items-center">
               <input
                 type="text"
-                placeholder="Cari Batch Number, SKU, Order, PO, Customer, Petugas..."
+                placeholder={t('order.searchBatchPlaceholder')}
+                title="Ketik pencarian atau Double-Click untuk membuka Batch Query (Pencarian Massal)"
                 value={searchTerm}
                 onChange={(e) => setSearchTerm(e.target.value)}
-                className="w-full pl-9 pr-3 py-2 text-xs bg-[#161B25] border border-slate-800 text-slate-200 rounded-lg focus:ring-1 focus:ring-emerald-500 outline-none placeholder:text-slate-500"
+                onDoubleClick={() => {
+                  if (activeBatchKeywords.length > 0 && !batchRawInput) {
+                    setBatchRawInput(activeBatchKeywords.join('\n'));
+                  }
+                  setIsBatchModalOpen(true);
+                }}
+                className="w-full pl-9 pr-20 py-2 text-xs bg-[#161B25] border border-slate-800 text-slate-200 rounded-lg focus:ring-1 focus:ring-emerald-500 outline-none placeholder:text-slate-500"
               />
-              <Search className="w-4 h-4 text-slate-500 absolute left-3 top-2.5" />
+              <Search className="w-4 h-4 text-slate-500 absolute left-3 top-2.5 pointer-events-none" />
+              <button
+                type="button"
+                onClick={() => {
+                  if (activeBatchKeywords.length > 0 && !batchRawInput) {
+                    setBatchRawInput(activeBatchKeywords.join('\n'));
+                  }
+                  setIsBatchModalOpen(true);
+                }}
+                title="Double-Click kolom atau klik tombol ini untuk membuka Batch Query"
+                className="absolute right-1.5 top-1.5 px-2 py-1 bg-blue-600/80 hover:bg-blue-600 text-white rounded text-[10px] font-bold flex items-center gap-1 transition-colors cursor-pointer shadow-sm"
+              >
+                <Camera className="w-3 h-3" />
+                <span>Batch</span>
+              </button>
             </div>
           </div>
 
           {/* Batch Filter */}
           <div>
-            <label className="block text-[10px] font-bold text-slate-400 uppercase mb-1.5">Filter Batch Number</label>
+            <label className="block text-[10px] font-bold text-slate-400 uppercase mb-1.5">{t('order.filterBatch')}</label>
             <select
               value={batchFilter}
               onChange={(e) => setBatchFilter(e.target.value)}
               className="w-full px-3 py-2 text-xs bg-[#161B25] border border-slate-800 text-slate-200 rounded-lg focus:ring-1 focus:ring-emerald-500 outline-none cursor-pointer font-mono"
             >
-              <option value="ALL">Semua Batch ({uniqueBatches.length})</option>
-              {uniqueBatches.map(b => (
-                <option key={b} value={b}>{b}</option>
-              ))}
+              <option value="ALL">{t('order.allBatches')} ({uniqueBatches.length})</option>
+              {batchSelectOptions}
             </select>
           </div>
 
           {/* Customer Filter */}
           <div>
-            <label className="block text-[10px] font-bold text-slate-400 uppercase mb-1.5">Filter Customer</label>
+            <label className="block text-[10px] font-bold text-slate-400 uppercase mb-1.5">{t('order.filterCustomer')}</label>
             <select
               value={customerFilter}
               onChange={(e) => setCustomerFilter(e.target.value)}
               className="w-full px-3 py-2 text-xs bg-[#161B25] border border-slate-800 text-slate-200 rounded-lg focus:ring-1 focus:ring-emerald-500 outline-none cursor-pointer"
             >
-              <option value="ALL">Semua Customer ({uniqueCustomers.length})</option>
-              {uniqueCustomers.map(cust => (
-                <option key={cust} value={cust}>{cust}</option>
-              ))}
+              <option value="ALL">{t('order.allCustomers')} ({uniqueCustomers.length})</option>
+              {customerSelectOptions}
             </select>
           </div>
 
           {/* Date Filter: Start Date */}
           <div>
-            <label className="block text-[10px] font-bold text-slate-400 uppercase mb-1.5">Tanggal Mulai</label>
+            <label className="block text-[10px] font-bold text-slate-400 uppercase mb-1.5">{t('order.startDate')}</label>
             <div className="relative">
               <input
                 type="date"
@@ -703,7 +1356,7 @@ export default function HistoryOrder({
 
           {/* Date Filter: End Date */}
           <div>
-            <label className="block text-[10px] font-bold text-slate-400 uppercase mb-1.5">Tanggal Selesai</label>
+            <label className="block text-[10px] font-bold text-slate-400 uppercase mb-1.5">{t('order.endDate')}</label>
             <div className="relative">
               <input
                 type="date"
@@ -733,11 +1386,11 @@ export default function HistoryOrder({
                     : 'bg-[#161B25] text-slate-400 border-slate-800 hover:text-white'
                 }`}
               >
-                {st === 'ALL' ? 'Semua Status' : st === 'Cancelled' ? 'Dibatalkan' : st}
+                {st === 'ALL' ? t('order.statusAll') : st === 'Completed' ? t('order.statusCompleted') : st === 'Pending' ? t('order.statusPending') : t('order.statusCancelled')}
               </button>
             ))}
 
-            {(searchTerm || customerFilter !== 'ALL' || batchFilter !== 'ALL' || statusFilter !== 'ALL' || startDate || endDate) && (
+            {(searchTerm || customerFilter !== 'ALL' || batchFilter !== 'ALL' || statusFilter !== 'ALL' || startDate || endDate || activeBatchKeywords.length > 0) && (
               <button
                 onClick={() => {
                   setSearchTerm('');
@@ -746,17 +1399,19 @@ export default function HistoryOrder({
                   setStatusFilter('ALL');
                   setStartDate('');
                   setEndDate('');
+                  setActiveBatchKeywords([]);
+                  setBatchRawInput('');
                 }}
                 className="text-[11px] font-bold text-emerald-400 hover:text-emerald-350 cursor-pointer flex items-center gap-1.5 ml-2"
               >
-                Reset Filter & Tanggal
+                {t('order.resetFilters')}
               </button>
             )}
           </div>
 
           {/* Sort Controls */}
           <div className="flex items-center gap-3">
-            <span className="text-[10px] font-bold text-slate-400 uppercase">Urutkan:</span>
+            <span className="text-[10px] font-bold text-slate-400 uppercase">{t('order.sortBy')}</span>
             <div className="flex gap-2">
               <button
                 onClick={() => toggleSort('timestamp')}
@@ -777,6 +1432,45 @@ export default function HistoryOrder({
         </div>
       </div>
 
+      {/* Active Batch Query Banner */}
+      {activeBatchKeywords.length > 0 && (
+        <div className="flex flex-wrap items-center justify-between gap-3 p-3.5 bg-blue-950/40 border border-blue-500/40 rounded-xl text-xs text-blue-200 shadow-md">
+          <div className="flex items-center gap-2.5">
+            <span className="px-2.5 py-1 bg-blue-500/20 border border-blue-500/30 text-blue-300 rounded-md font-bold text-[11px] flex items-center gap-1.5">
+              <Camera className="w-3.5 h-3.5" />
+              Batch Query Aktif
+            </span>
+            <span className="text-slate-200">
+              Menyaring berdasarkan <strong className="text-white font-mono">{activeBatchKeywords.length}</strong> kata kunci (Target: <strong className="text-white">{batchTargetField === 'all' ? 'Semua Kolom' : batchTargetField === 'order' ? 'Nomor Order / Ref' : batchTargetField === 'sku' ? 'SKU ID' : 'PO / Batch'}</strong>, Mode: <strong className="text-white">{batchMatchMode === 'exact' ? 'Exact Match' : 'Contains'}</strong>)
+            </span>
+          </div>
+          <div className="flex items-center gap-2">
+            <button
+              type="button"
+              onClick={() => {
+                setBatchRawInput(activeBatchKeywords.join('\n'));
+                setIsBatchModalOpen(true);
+              }}
+              className="px-3 py-1.5 bg-blue-600 hover:bg-blue-500 text-white font-bold rounded-lg text-xs transition-colors cursor-pointer"
+            >
+              Ubah Query
+            </button>
+            <button
+              type="button"
+              onClick={() => {
+                setActiveBatchKeywords([]);
+                setBatchRawInput('');
+              }}
+              className="px-3 py-1.5 bg-slate-800 hover:bg-slate-700 text-slate-300 font-bold rounded-lg text-xs transition-colors cursor-pointer"
+            >
+              Hapus Filter Batch
+            </button>
+          </div>
+        </div>
+      )}
+
+      {renderPaginationBar('top')}
+
       {/* VIEW MODE 1: GROUPED PER BATCH NUMBER */}
       {viewMode === 'batch' ? (
         <div className="space-y-4">
@@ -788,12 +1482,15 @@ export default function HistoryOrder({
                 : 'Belum ada riwayat batch transaksi order yang cocok atau diproses.'}
             </div>
           ) : (
-            groupedByBatch.map(group => {
-              const isCollapsed = !!collapsedBatches[group.batchKey];
+            paginatedBatches.map(group => {
+              const isCollapsed = !expandedBatches[group.batchKey];
               const batchIds = group.items.map(i => i.id);
-              const allBatchSelected = batchIds.length > 0 && batchIds.every(id => selectedIds.includes(id));
-              const someBatchSelected = batchIds.length > 0 && batchIds.some(id => selectedIds.includes(id)) && !allBatchSelected;
-              const cancellableInBatch = group.items.filter(i => i.status !== 'Cancelled' && !i.shipped);
+              const allBatchSelected = batchIds.length > 0 && batchIds.every(id => selectedIdSet.has(id));
+              const someBatchSelected = batchIds.length > 0 && batchIds.some(id => selectedIdSet.has(id)) && !allBatchSelected;
+              const cancellableInBatch = group.items.filter(i => i.status !== 'Cancelled');
+              const leadOrder = group.orderNumbers[0];
+              const primaryLabel = leadOrder || group.refs[0] || group.batchKey;
+              const primaryPrefix = leadOrder ? 'Order' : 'Ref';
 
               return (
                 <div
@@ -816,10 +1513,46 @@ export default function HistoryOrder({
 
                       <div>
                         <div className="flex flex-wrap items-center gap-2">
-                          <span className="inline-flex items-center gap-1.5 font-mono text-sm font-black text-emerald-400 bg-emerald-500/10 border border-emerald-500/25 px-3 py-1 rounded-lg">
-                            <Layers className="w-4 h-4 shrink-0" />
-                            BATCH: {group.batchKey}
-                          </span>
+                          <div className="inline-flex items-center gap-1.5">
+                            <span className="inline-flex items-center gap-1.5 font-mono text-sm font-black text-emerald-400 bg-emerald-500/10 border border-emerald-500/25 px-3 py-1 rounded-lg">
+                              <FileText className="w-4 h-4 shrink-0" />
+                              {primaryPrefix}: {primaryLabel}
+                            </span>
+                            <button
+                              type="button"
+                              onClick={(e) => handleCopyText(primaryLabel, `order-lead-${group.batchKey}`, e)}
+                              className="inline-flex items-center gap-1 px-2 py-1 rounded-lg bg-[#161B25] hover:bg-emerald-500/15 border border-slate-700/60 hover:border-emerald-500/40 text-slate-300 hover:text-emerald-400 text-xs font-semibold transition-all cursor-pointer shadow-sm active:scale-95"
+                              title={leadOrder ? 'Klik untuk salin No Order' : 'Salin Referensi'}
+                              aria-label={leadOrder ? `Salin No Order ${primaryLabel}` : `Salin Referensi ${primaryLabel}`}
+                            >
+                              {copiedKey === `order-lead-${group.batchKey}` ? (
+                                <>
+                                  <Check className="w-3.5 h-3.5 text-emerald-400" />
+                                  <span className="text-[11px] text-emerald-400 font-bold">Tersalin!</span>
+                                </>
+                              ) : (
+                                <>
+                                  <Copy className="w-3.5 h-3.5" />
+                                  <span className="text-[11px]">Salin</span>
+                                </>
+                              )}
+                            </button>
+                            {group.orderNumbers.length > 1 && (
+                              <button
+                                type="button"
+                                onClick={() =>
+                                  setExpandedBatches(prev => ({
+                                    ...prev,
+                                    [group.batchKey]: !prev[group.batchKey]
+                                  }))
+                                }
+                                className="inline-flex items-center px-2 py-1 rounded-lg bg-[#161B25] hover:bg-slate-800 border border-slate-700/70 text-[11px] font-bold text-sky-300 transition-colors cursor-pointer"
+                                title={`Lihat semua ${group.orderNumbers.length} No Order di batch ini`}
+                              >
+                                +{group.orderNumbers.length - 1} order
+                              </button>
+                            )}
+                          </div>
 
                           <span
                             className={`px-2.5 py-0.5 rounded-md text-[10px] font-extrabold uppercase ${
@@ -839,7 +1572,7 @@ export default function HistoryOrder({
                           </span>
                         </div>
 
-                        {/* Metadata Pills: Ref, Order No, PO, Customer */}
+                        {/* Metadata Pills: Batch, Ref, PO, Customer */}
                         <div className="flex flex-wrap items-center gap-x-4 gap-y-1.5 mt-2 text-xs text-slate-300">
                           {group.customers.length > 0 && (
                             <span className="flex items-center gap-1 font-bold text-slate-200">
@@ -847,23 +1580,53 @@ export default function HistoryOrder({
                               {group.customers.join(', ')}
                             </span>
                           )}
-                          {group.orderNumbers.length > 0 && (
-                            <span className="flex items-center gap-1 font-mono text-slate-300">
-                              <FileText className="w-3.5 h-3.5 text-emerald-400" />
-                              Order: <strong>{group.orderNumbers.join(', ')}</strong>
+                          {group.customerAddresses.length === 1 && (
+                            <span className="flex items-start gap-1 text-slate-300 break-words">
+                              <MapPin className="w-3.5 h-3.5 text-amber-400 shrink-0 mt-0.5" />
+                              <span className="whitespace-pre-line">{group.customerAddresses[0]}</span>
                             </span>
                           )}
+                          {group.customerAddresses.length > 1 && (
+                            <span className="flex items-center gap-1 text-[11px] font-semibold text-amber-300">
+                              <MapPin className="w-3.5 h-3.5 text-amber-400 shrink-0" />
+                              {group.customerAddresses.length} {language === 'en' ? 'customer addresses' : 'alamat customer'}
+                            </span>
+                          )}
+                          <div className="inline-flex items-center gap-1.5 font-mono text-slate-300">
+                            <span className="flex items-center gap-1">
+                              <Layers className="w-3.5 h-3.5 text-emerald-400 shrink-0" />
+                              BATCH:{' '}
+                            </span>
+                            <button
+                              type="button"
+                              onClick={(e) => handleCopyText(group.batchKey, `batch-${group.batchKey}`, e)}
+                              className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded bg-[#161B25] hover:bg-emerald-500/15 border border-slate-700/60 hover:border-emerald-500/40 text-slate-200 hover:text-emerald-300 text-xs font-bold transition-all cursor-pointer group active:scale-95"
+                              title="Salin Batch Number"
+                              aria-label={`Salin Batch Number ${group.batchKey}`}
+                            >
+                              <strong>{group.batchKey}</strong>
+                              {copiedKey === `batch-${group.batchKey}` ? (
+                                <span className="inline-flex items-center text-[10px] text-emerald-300 font-sans font-semibold">
+                                  <Check className="w-3 h-3 text-emerald-300 mr-0.5" />
+                                  Tersalin!
+                                </span>
+                              ) : (
+                                <Copy className="w-3 h-3 text-slate-400 group-hover:text-emerald-300 transition-colors" />
+                              )}
+                            </button>
+                          </div>
                           {group.poNumbers.length > 0 && (
                             <span className="flex items-center gap-1 font-mono text-slate-300">
                               <Tag className="w-3.5 h-3.5 text-amber-400" />
                               PO: <strong>{group.poNumbers.join(', ')}</strong>
                             </span>
                           )}
-                          {group.refs.some(r => r !== group.batchKey) && (
+                          {group.refs.some(r => r !== group.batchKey && r !== primaryLabel) && (
                             <span className="text-[11px] font-mono text-slate-400">
-                              Ref: {group.refs.join(', ')}
+                              Ref: {group.refs.filter(r => r !== primaryLabel).join(', ')}
                             </span>
                           )}
+                          {renderBasketBadges(group.masterBaskets, group.sortBaskets)}
                         </div>
                       </div>
                     </div>
@@ -914,7 +1677,7 @@ export default function HistoryOrder({
                         <button
                           type="button"
                           onClick={() =>
-                            setCollapsedBatches(prev => ({
+                            setExpandedBatches(prev => ({
                               ...prev,
                               [group.batchKey]: !prev[group.batchKey]
                             }))
@@ -929,136 +1692,52 @@ export default function HistoryOrder({
                   </div>
 
                   {/* Batch Operators Summary Strip */}
-                  <div className="bg-[#161B25] px-5 py-2 border-b border-slate-800/50 flex flex-wrap items-center gap-x-6 gap-y-1 text-[11px]">
-                    <span className="text-slate-400">
-                      Input: <strong className="text-slate-200">{group.createdBy || 'Belum tercatat'}</strong>
-                    </span>
-                    <span className="text-slate-400">
-                      Picking: <strong className="text-slate-200">{group.pickedBy || 'Belum tercatat'}</strong>
-                    </span>
-                    <span className="text-slate-400">
-                      Sortir: <strong className="text-slate-200">{group.sortedBy || 'Belum tercatat'}</strong>
-                    </span>
-                    <span className="text-slate-400">
-                      Packing: <strong className="text-slate-200">{group.packedBy || 'Belum tercatat'}</strong>
-                    </span>
+                  <div className="bg-[#161B25] px-5 py-2 border-b border-slate-800/50 flex flex-wrap items-center justify-between gap-2 text-[11px]">
+                    <div className="flex flex-wrap items-center gap-x-6 gap-y-1">
+                      <span className="text-slate-400">
+                        Input: <strong className="text-slate-200">{group.createdBy || 'Belum tercatat'}</strong>
+                      </span>
+                      <span className="text-slate-400">
+                        Picking: <strong className="text-slate-200">{group.pickedBy || 'Belum tercatat'}</strong>
+                      </span>
+                      <span className="text-slate-400">
+                        Sortir: <strong className="text-slate-200">{group.sortedBy || 'Belum tercatat'}</strong>
+                      </span>
+                      <span className="text-slate-400">
+                        Packing: <strong className="text-slate-200">{group.packedBy || 'Belum tercatat'}</strong>
+                      </span>
+                    </div>
+
+                    {!isCollapsed && group.orderGroups.length > 0 && (() => {
+                      const batchOrderKeys = group.orderGroups.map(o => o.collapseKey);
+                      const anyBatchOrderCollapsed = batchOrderKeys.some(k => !expandedOrders[k]);
+                      return (
+                        <button
+                          type="button"
+                          onClick={() => handleToggleCollapseOrderKeys(batchOrderKeys)}
+                          className="inline-flex items-center gap-1 px-2.5 py-1 rounded-md border border-slate-700/70 bg-[#11141B] hover:bg-slate-800 text-[11px] font-bold text-sky-400 transition-colors cursor-pointer"
+                          title={anyBatchOrderCollapsed ? 'Maximize semua order dalam batch ini' : 'Minimize semua order dalam batch ini'}
+                        >
+                          {anyBatchOrderCollapsed ? (
+                            <>
+                              <Maximize2 className="w-3 h-3" />
+                              <span>{t('order.maximizeOrder')} ({group.orderGroups.length} Order)</span>
+                            </>
+                          ) : (
+                            <>
+                              <Minimize2 className="w-3 h-3" />
+                              <span>{t('order.minimizeOrder')} ({group.orderGroups.length} Order)</span>
+                            </>
+                          )}
+                        </button>
+                      );
+                    })()}
                   </div>
 
-                  {/* Batch Items Table */}
+                  {/* Batch Items Grouped per No Order */}
                   {!isCollapsed && (
-                    <div className="overflow-x-auto">
-                      <table className="w-full text-left border-collapse">
-                        <thead>
-                          <tr className="bg-[#11141B] text-slate-400 uppercase font-bold text-[10px] border-b border-slate-800/60">
-                            <th className="py-2.5 px-4 text-center w-10"></th>
-                            <th className="py-2.5 px-4">SKU / Nama Barang</th>
-                            <th className="py-2.5 px-4 text-center">Lokasi Rak</th>
-                            <th className="py-2.5 px-4 text-center">Expired</th>
-                            <th className="py-2.5 px-4 text-right">Qty (Pcs)</th>
-                            <th className="py-2.5 px-4 text-center">Status</th>
-                            <th className="py-2.5 px-4 min-w-[260px]">Petugas & Waktu Proses (WIB)</th>
-                            <th className="py-2.5 px-4 text-center w-24">Aksi</th>
-                          </tr>
-                        </thead>
-                        <tbody className="divide-y divide-slate-800/50 text-slate-300 text-xs">
-                          {group.items.map(item => (
-                            <tr
-                              key={item.id}
-                              className={`hover:bg-slate-800/20 transition-colors ${
-                                selectedIds.includes(item.id) ? 'bg-emerald-500/5 hover:bg-emerald-500/10' : ''
-                              }`}
-                            >
-                              <td className="py-2.5 px-4 text-center">
-                                <input
-                                  type="checkbox"
-                                  checked={selectedIds.includes(item.id)}
-                                  onChange={() => handleToggleSelectRow(item.id)}
-                                  className="w-4 h-4 rounded border-slate-800 bg-[#161B25] text-emerald-500 focus:ring-emerald-500 cursor-pointer"
-                                />
-                              </td>
-                              <td className="py-2.5 px-4">
-                                <div className="flex flex-wrap items-center gap-1.5">
-                                  <span className="font-mono font-bold text-emerald-400 bg-emerald-500/10 px-1.5 py-0.5 rounded text-[11px]">
-                                    {item.skuId}
-                                  </span>
-                                  <span className="font-medium text-slate-200">{item.skuName}</span>
-                                </div>
-                                <div className="text-[10px] text-slate-400 mt-0.5 font-mono">
-                                  Ref: {item.referenceNumber}
-                                  {item.orderNumber ? ` • Order: ${item.orderNumber}` : ''}
-                                  {item.noPo ? ` • PO: ${item.noPo}` : ''}
-                                </div>
-                              </td>
-                              <td className="py-2.5 px-4 text-center font-mono font-bold text-slate-200">
-                                {item.location}
-                              </td>
-                              <td className="py-2.5 px-4 text-center whitespace-nowrap font-mono text-slate-300">
-                                {item.expiredDate}
-                              </td>
-                              <td className="py-2.5 px-4 text-right font-bold text-rose-400 font-mono">
-                                {formatNumber(item.qty)}
-                              </td>
-                              <td className="py-2.5 px-4 text-center">
-                                <span
-                                  className={`px-2 py-0.5 rounded text-[10px] font-extrabold uppercase ${
-                                    item.status === 'Cancelled'
-                                      ? 'bg-rose-500/10 text-rose-400 border border-rose-500/20'
-                                      : item.status === 'Pending'
-                                      ? 'bg-amber-500/10 text-amber-400 border border-amber-500/20 animate-pulse'
-                                      : 'bg-emerald-500/10 text-emerald-400 border border-emerald-500/20'
-                                  }`}
-                                >
-                                  {item.status === 'Cancelled' ? 'Dibatalkan' : item.status}
-                                </span>
-                              </td>
-                              <td className="py-2.5 px-4 align-top min-w-[260px]">
-                                <dl className="grid grid-cols-[auto_1fr] gap-x-3 gap-y-1 text-[11px]">
-                                  {getOrderStageHistory(item).map(({ stage, name, processedAt, timeLabel }) => (
-                                    <React.Fragment key={stage}>
-                                      <dt className="font-semibold text-slate-400">{stage}:</dt>
-                                      <dd className="font-bold text-slate-200 break-words">
-                                        <span>{name}</span>
-                                        {timeLabel !== 'Belum tercatat' && (
-                                          <time dateTime={processedAt} className="ml-1.5 font-normal text-slate-400 text-[10px] tabular-nums">
-                                            ({timeLabel})
-                                          </time>
-                                        )}
-                                      </dd>
-                                    </React.Fragment>
-                                  ))}
-                                </dl>
-                              </td>
-                              <td className="py-2.5 px-4 text-center whitespace-nowrap">
-                                {(currentUser?.role === 'Administrator' || currentUser?.role === 'Admin') &&
-                                item.status !== 'Cancelled' &&
-                                !item.shipped ? (
-                                  <>
-                                    <button
-                                      onClick={() => handleStartEdit(item)}
-                                      className="p-1 text-sky-400 hover:text-sky-300 hover:bg-sky-500/10 rounded transition-colors mr-1.5 cursor-pointer inline-flex items-center"
-                                      title="Edit Baris"
-                                    >
-                                      <Edit className="w-4 h-4" />
-                                    </button>
-                                    <button
-                                      onClick={() => handleDelete(item)}
-                                      className="p-1 text-rose-400 hover:text-rose-300 hover:bg-rose-500/10 rounded transition-colors cursor-pointer inline-flex items-center"
-                                      title="Batalkan Baris Order"
-                                      aria-label="Batalkan order"
-                                    >
-                                      <X className="w-4 h-4" />
-                                    </button>
-                                  </>
-                                ) : (
-                                  <span className="text-[10px] font-bold text-slate-500 uppercase tracking-wide">
-                                    {item.status === 'Cancelled' ? 'Dibatalkan' : item.shipped ? 'Sudah dikirim' : 'Hanya lihat'}
-                                  </span>
-                                )}
-                              </td>
-                            </tr>
-                          ))}
-                        </tbody>
-                      </table>
+                    <div className="p-3 sm:p-4 space-y-3 bg-[#0E121A]/60">
+                      {group.orderGroups.map(orderGroup => renderOrderCard(orderGroup))}
                     </div>
                   )}
                 </div>
@@ -1069,18 +1748,47 @@ export default function HistoryOrder({
           {/* Footer info counts for Batch View */}
           <div className="bg-[#151922] px-5 py-3.5 rounded-xl border border-slate-800/80 flex flex-col sm:flex-row sm:items-center justify-between gap-2 text-xs text-slate-400 font-medium">
             <div>
-              Menampilkan <span className="text-white font-bold">{groupedByBatch.length} Batch</span> (<span className="text-white font-bold">{filteredHistory.length}</span> baris alokasi SKU)
+              Menampilkan <span className="text-white font-bold">{paginatedBatches.length} / {groupedByBatch.length} Batch</span> · <span className="text-white font-bold">{groupedByOrder.length} Order</span> (<span className="text-white font-bold">{filteredHistory.length}</span> baris alokasi SKU)
             </div>
             <div>
               Total Volume Keluar (Completed):{' '}
               <span className="text-rose-400 font-bold">
-                {formatNumber(filteredHistory.filter(i => i.status === 'Completed').reduce((sum, i) => sum + i.qty, 0))} Pcs
+                {formatNumber(completedVolumeQty)} Pcs
               </span>
             </div>
           </div>
+          {renderPaginationBar('bottom')}
+        </div>
+      ) : viewMode === 'order' ? (
+        /* VIEW MODE 2: GROUPED PER ORDER NUMBER */
+        <div className="space-y-3">
+          {groupedByOrder.length === 0 ? (
+            <div className="bg-[#11141B] rounded-xl border border-slate-800/60 py-14 text-center text-slate-500 font-medium shadow-xl">
+              <ShoppingBag className="w-8 h-8 mx-auto mb-2 text-slate-600 stroke-1" />
+              {!showCancelled && cancelledCount > 0
+                ? 'Tidak ada riwayat order aktif yang cocok. Aktifkan “Tampilkan yang dibatalkan” untuk melihat riwayat pembatalan.'
+                : 'Belum ada riwayat transaksi order yang cocok atau diproses.'}
+            </div>
+          ) : (
+            paginatedOrders.map(orderGroup => renderOrderCard(orderGroup, { showBatchBadge: true }))
+          )}
+
+          {/* Footer info counts for Order View */}
+          <div className="bg-[#151922] px-5 py-3.5 rounded-xl border border-slate-800/80 flex flex-col sm:flex-row sm:items-center justify-between gap-2 text-xs text-slate-400 font-medium">
+            <div>
+              Menampilkan <span className="text-white font-bold">{paginatedOrders.length} / {groupedByOrder.length} Order</span> (<span className="text-white font-bold">{filteredHistory.length}</span> baris alokasi SKU)
+            </div>
+            <div>
+              Total Volume Keluar (Completed):{' '}
+              <span className="text-rose-400 font-bold">
+                {formatNumber(completedVolumeQty)} Pcs
+              </span>
+            </div>
+          </div>
+          {renderPaginationBar('bottom')}
         </div>
       ) : (
-        /* VIEW MODE 2: FLAT TABLE */
+        /* VIEW MODE 3: FLAT TABLE */
         <div className="bg-[#11141B] rounded-xl border border-slate-800/60 overflow-hidden shadow-xl">
           <div className="overflow-x-auto">
             <table className="w-full text-left border-collapse">
@@ -1100,9 +1808,9 @@ export default function HistoryOrder({
                     />
                   </th>
                   <th className="py-3 px-4">Waktu Keluar</th>
-                  <th className="py-3 px-4">Batch Number</th>
                   <th className="py-3 px-4">Order / No PO</th>
-                  <th className="py-3 px-4">Customer Name</th>
+                  <th className="py-3 px-4">Batch Number</th>
+                  <th className="py-3 px-4">{t('order.customerName')} / {t('order.customerAddress')}</th>
                   <th className="py-3 px-4">SKU / Nama Barang</th>
                   <th className="py-3 px-4 text-center">Expired</th>
                   <th className="py-3 px-4 text-center">Lokasi Rak</th>
@@ -1121,15 +1829,15 @@ export default function HistoryOrder({
                     </td>
                   </tr>
                 ) : (
-                  filteredHistory.map((item) => (
+                  paginatedFlatItems.map((item) => (
                     <tr 
                       key={item.id} 
-                      className={`hover:bg-slate-800/20 transition-colors ${selectedIds.includes(item.id) ? 'bg-emerald-500/5 hover:bg-emerald-500/10' : ''}`}
+                      className={`hover:bg-slate-800/20 transition-colors ${selectedIdSet.has(item.id) ? 'bg-emerald-500/5 hover:bg-emerald-500/10' : ''}`}
                     >
                       <td className="py-3 px-4 text-center">
                         <input 
                           type="checkbox"
-                          checked={selectedIds.includes(item.id)}
+                          checked={selectedIdSet.has(item.id)}
                           onChange={() => handleToggleSelectRow(item.id)}
                           className="w-4 h-4 rounded border-slate-800 bg-[#161B25] text-emerald-500 focus:ring-emerald-500 cursor-pointer"
                         />
@@ -1137,18 +1845,28 @@ export default function HistoryOrder({
                       <td className="py-3 px-4 whitespace-nowrap text-slate-400 font-mono">
                         {formatToWibString(item.timestamp)}
                       </td>
-                      <td className="py-3 px-4 font-mono font-bold">
-                        <span className="inline-flex items-center gap-1 text-emerald-400 bg-emerald-500/10 border border-emerald-500/20 px-2 py-0.5 rounded text-[11px]">
-                          <Layers className="w-3 h-3" />
-                          {getBatchKey(item)}
-                        </span>
-                      </td>
                       <td className="py-3 px-4 font-mono text-slate-200 space-y-0.5">
                         {item.orderNumber ? (
-                          <span className="flex items-center gap-1 font-bold">
-                            <FileText className="w-3.5 h-3.5 text-emerald-400" />
-                            {item.orderNumber}
-                          </span>
+                          <div className="flex items-center gap-1.5">
+                            <button
+                              type="button"
+                              onClick={(e) => handleCopyText(item.orderNumber!, `order-flat-${item.id}`, e)}
+                              className="inline-flex items-center gap-1 font-bold text-slate-200 hover:text-emerald-300 bg-transparent hover:bg-emerald-500/10 px-1 py-0.5 rounded transition-colors cursor-pointer group active:scale-95"
+                              title="Klik untuk salin No Order"
+                              aria-label={`Salin No Order ${item.orderNumber}`}
+                            >
+                              <FileText className="w-3.5 h-3.5 text-emerald-400 shrink-0" />
+                              <span>{item.orderNumber}</span>
+                              {copiedKey === `order-flat-${item.id}` ? (
+                                <span className="inline-flex items-center text-[10px] text-emerald-300 font-sans font-semibold ml-1">
+                                  <Check className="w-3 h-3 text-emerald-300 mr-0.5" />
+                                  Tersalin!
+                                </span>
+                              ) : (
+                                <Copy className="w-3 h-3 text-slate-500 group-hover:text-emerald-300 transition-colors ml-0.5" />
+                              )}
+                            </button>
+                          </div>
                         ) : (
                           <span className="text-slate-500 font-normal italic block">Order: -</span>
                         )}
@@ -1158,22 +1876,72 @@ export default function HistoryOrder({
                             PO: {item.noPo}
                           </span>
                         )}
+                        {(() => {
+                          const { masterBasket, sortBasket } = resolveItemBasketCodes(item);
+                          if (!masterBasket && !sortBasket) return null;
+                          return (
+                            <div className="flex flex-wrap items-center gap-1 mt-0.5">
+                              {renderBasketBadges(masterBasket ? [masterBasket] : [], sortBasket ? [sortBasket] : [])}
+                            </div>
+                          );
+                        })()}
                       </td>
-                      <td className="py-3 px-4 font-semibold text-slate-200">
+                      <td className="py-3 px-4 font-mono font-bold">
+                        <div className="inline-flex items-center gap-1.5">
+                          <span className="inline-flex items-center gap-1 text-emerald-400 bg-emerald-500/10 border border-emerald-500/20 px-2 py-0.5 rounded text-[11px]">
+                            <Layers className="w-3 h-3" />
+                            {getBatchKey(item)}
+                          </span>
+                          <button
+                            type="button"
+                            onClick={(e) => handleCopyText(getBatchKey(item), `batch-flat-${item.id}`, e)}
+                            className="p-1 rounded bg-[#161B25] hover:bg-emerald-500/15 border border-slate-700/60 hover:border-emerald-500/30 text-slate-400 hover:text-emerald-300 transition-colors cursor-pointer active:scale-95"
+                            title="Salin Batch Number"
+                            aria-label={`Salin Batch Number ${getBatchKey(item)}`}
+                          >
+                            {copiedKey === `batch-flat-${item.id}` ? (
+                              <Check className="w-3 h-3 text-emerald-400" />
+                            ) : (
+                              <Copy className="w-3 h-3" />
+                            )}
+                          </button>
+                        </div>
+                      </td>
+                      <td className="py-3 px-4 font-semibold text-slate-200 max-w-xs">
                         {item.customerName ? (
                           <span className="flex items-center gap-1">
-                            <User className="w-3.5 h-3.5 text-sky-400" />
-                            {item.customerName}
+                            <User className="w-3.5 h-3.5 text-sky-400 shrink-0" />
+                            <span>{item.customerName}</span>
                           </span>
                         ) : (
                           <span className="text-slate-500 font-normal italic">N/A</span>
                         )}
+                        {resolveCustomerAddress(item) && (
+                          <div className="flex items-start gap-1 mt-1 text-[11px] font-normal text-slate-300 leading-snug break-words">
+                            <MapPin className="w-3 h-3 text-amber-400 shrink-0 mt-0.5" />
+                            <span className="whitespace-pre-line">{resolveCustomerAddress(item)}</span>
+                          </div>
+                        )}
                       </td>
                       <td className="py-3 px-4">
-                        <div>
-                          <span className="font-mono font-bold text-emerald-400 bg-emerald-500/10 px-1.5 py-0.5 rounded text-[11px] mr-1.5">
-                            {item.skuId}
-                          </span>
+                        <div className="flex flex-wrap items-center gap-1.5">
+                          <button
+                            type="button"
+                            onClick={(e) => handleCopyText(item.skuId, `sku-flat-${item.id}`, e)}
+                            className="inline-flex items-center gap-1 font-mono font-bold text-emerald-400 bg-emerald-500/10 hover:bg-emerald-500/20 border border-emerald-500/20 hover:border-emerald-500/40 px-1.5 py-0.5 rounded text-[11px] transition-colors cursor-pointer group active:scale-95"
+                            title="Klik untuk salin SKU ID"
+                            aria-label={`Salin SKU ID ${item.skuId}`}
+                          >
+                            <span>{item.skuId}</span>
+                            {copiedKey === `sku-flat-${item.id}` ? (
+                              <span className="inline-flex items-center text-[10px] text-emerald-300 font-sans font-semibold">
+                                <Check className="w-3 h-3 text-emerald-300 mr-0.5" />
+                                Tersalin!
+                              </span>
+                            ) : (
+                              <Copy className="w-3 h-3 text-emerald-500/60 group-hover:text-emerald-300 transition-colors" />
+                            )}
+                          </button>
                           <span className="font-medium text-slate-300">{item.skuName}</span>
                         </div>
                         <div className="text-[10px] text-slate-500 mt-1">
@@ -1227,7 +1995,7 @@ export default function HistoryOrder({
                             <Printer size={14}/>Print Resi
                           </button>
                         )}
-                        {(currentUser?.role === 'Administrator' || currentUser?.role === 'Admin') && item.status!=='Cancelled'&&!item.shipped ? (
+                        {(currentUser?.role === 'Administrator' || currentUser?.role === 'Admin') && item.status!=='Cancelled' ? (
                           <>
                             <button
                               onClick={() => handleStartEdit(item)}
@@ -1245,7 +2013,7 @@ export default function HistoryOrder({
                             </button>
                           </>
                         ) : (
-                          <span className="text-[10px] font-bold text-slate-500 uppercase tracking-wide">{item.status==='Cancelled'?'Dibatalkan':item.shipped?'Sudah dikirim':'Hanya lihat'}</span>
+                          <span className="text-[10px] font-bold text-slate-500 uppercase tracking-wide">{item.status==='Cancelled'?'Dibatalkan':'Hanya lihat'}</span>
                         )}
                       </td>
                     </tr>
@@ -1258,14 +2026,16 @@ export default function HistoryOrder({
           {/* Footer info counts */}
           <div className="bg-[#151922] px-4 py-3 border-t border-slate-800/80 flex flex-col sm:flex-row sm:items-center justify-between gap-2 text-xs text-slate-400 font-medium">
             <div>
-              Menampilkan <span className="text-white font-bold">{filteredHistory.length}</span> baris riwayat order dalam <span className="text-white font-bold">{groupedByBatch.length}</span> Batch
+              Menampilkan <span className="text-white font-bold">{paginatedFlatItems.length} / {filteredHistory.length}</span> baris riwayat order dalam <span className="text-white font-bold">{groupedByBatch.length}</span> Batch
             </div>
             <div>
-              Total Volume Keluar: <span className="text-rose-400 font-bold">{formatNumber(filteredHistory.filter(i=>i.status==='Completed').reduce((sum, i) => sum + i.qty, 0))} Pcs</span>
+              Total Volume Keluar: <span className="text-rose-400 font-bold">{formatNumber(completedVolumeQty)} Pcs</span>
             </div>
           </div>
         </div>
       )}
+
+      {viewMode === 'flat' && renderPaginationBar('bottom')}
 
       {receiptOrder&&createPortal(<div className="theme-citrus fixed inset-0 z-[210]"><ShippingReceiptModal isOpen={true} onClose={()=>setReceiptOrder(null)} order={receiptOrder} currentUser={currentUser} autoPrint={false}/></div>,document.body)}
       {/* Edit Modal Dialog */}
@@ -1288,11 +2058,25 @@ export default function HistoryOrder({
 
             {/* Modal Body */}
             <div className="p-6 space-y-4">
-              <div>
-                <span className="text-[10px] font-bold text-emerald-400 uppercase bg-emerald-500/10 px-2 py-0.5 rounded font-mono">
-                  {editingItem.skuId}
-                </span>
-                <span className="text-xs font-semibold text-slate-300 ml-2">{editingItem.skuName}</span>
+              <div className="flex items-center gap-2">
+                <button
+                  type="button"
+                  onClick={(e) => handleCopyText(editingItem.skuId, `sku-edit-${editingItem.id}`, e)}
+                  className="inline-flex items-center gap-1 text-[10px] font-bold text-emerald-400 uppercase bg-emerald-500/10 hover:bg-emerald-500/20 border border-emerald-500/20 px-2 py-0.5 rounded font-mono transition cursor-pointer active:scale-95"
+                  title="Salin SKU ID"
+                  aria-label={`Salin SKU ID ${editingItem.skuId}`}
+                >
+                  <span>{editingItem.skuId}</span>
+                  {copiedKey === `sku-edit-${editingItem.id}` ? (
+                    <span className="inline-flex items-center text-[9px] text-emerald-300 font-sans font-semibold">
+                      <Check className="w-3 h-3 text-emerald-300 mr-0.5" />
+                      Tersalin!
+                    </span>
+                  ) : (
+                    <Copy className="w-3 h-3 text-emerald-500/70" />
+                  )}
+                </button>
+                <span className="text-xs font-semibold text-slate-300">{editingItem.skuName}</span>
               </div>
 
               <div className="grid grid-cols-3 gap-3">
@@ -1333,6 +2117,17 @@ export default function HistoryOrder({
                   value={editCustomerName}
                   onChange={(e) => setEditCustomerName(e.target.value)}
                   className="w-full px-3 py-2 text-xs bg-[#161B25] border border-slate-800 text-slate-200 rounded-lg focus:ring-1 focus:ring-emerald-500 outline-none"
+                />
+              </div>
+
+              <div>
+                <label className="block text-[10px] font-bold text-slate-400 uppercase mb-1">{t('order.customerAddress')}</label>
+                <textarea
+                  rows={2}
+                  value={editCustomerAddress}
+                  onChange={(e) => setEditCustomerAddress(e.target.value)}
+                  className="w-full px-3 py-2 text-xs bg-[#161B25] border border-slate-800 text-slate-200 rounded-lg focus:ring-1 focus:ring-emerald-500 outline-none"
+                  placeholder="Alamat tujuan pelanggan (opsional)"
                 />
               </div>
 
@@ -1422,6 +2217,138 @@ export default function HistoryOrder({
               >
                 Lanjut pembatalan
               </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Batch Query (Pencarian Massal) Modal Dialog */}
+      {isBatchModalOpen && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-950/80 backdrop-blur-sm">
+          <div className="w-full max-w-xl bg-[#0E121A] border border-slate-800/80 rounded-2xl shadow-2xl overflow-hidden animate-in fade-in zoom-in-95 duration-150">
+            {/* Modal Header */}
+            <div className="flex items-center justify-between px-6 py-4 bg-[#121722] border-b border-slate-850">
+              <div className="flex items-center gap-2.5">
+                <div className="p-2 bg-blue-500/10 border border-blue-500/20 text-blue-400 rounded-lg">
+                  <Camera className="w-5 h-5" />
+                </div>
+                <div>
+                  <h3 className="text-sm font-black text-slate-100">{t('order.batchModalTitle')}</h3>
+                  <p className="text-[11px] text-slate-400">{t('order.batchModalSubtitle')}</p>
+                </div>
+              </div>
+              <button
+                type="button"
+                onClick={() => setIsBatchModalOpen(false)}
+                className="p-1.5 text-slate-400 hover:text-white rounded-lg hover:bg-slate-800 transition-colors cursor-pointer"
+              >
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+
+            {/* Modal Body */}
+            <div className="p-6 space-y-4">
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                <div>
+                  <label className="block text-[10px] font-bold text-slate-400 uppercase mb-1">Target Kolom</label>
+                  <select
+                    value={batchTargetField}
+                    onChange={(e) => setBatchTargetField(e.target.value as any)}
+                    className="w-full px-3 py-2 text-xs bg-[#161B25] border border-slate-800 text-slate-200 rounded-lg focus:ring-1 focus:ring-blue-500 outline-none cursor-pointer"
+                  >
+                    <option value="all">Semua Kolom (Order, Ref, SKU, PO, Batch)</option>
+                    <option value="order">Nomor Order / No. Ref Saja</option>
+                    <option value="sku">SKU ID Saja</option>
+                    <option value="po_batch">No. PO & Batch Saja</option>
+                  </select>
+                </div>
+
+                <div>
+                  <label className="block text-[10px] font-bold text-slate-400 uppercase mb-1">Metode Pencocokan</label>
+                  <select
+                    value={batchMatchMode}
+                    onChange={(e) => setBatchMatchMode(e.target.value as any)}
+                    className="w-full px-3 py-2 text-xs bg-[#161B25] border border-slate-800 text-slate-200 rounded-lg focus:ring-1 focus:ring-blue-500 outline-none cursor-pointer"
+                  >
+                    <option value="exact">Pencocokan Persis (Exact Match - Disarankan)</option>
+                    <option value="contains">Mengandung Teks (Contains)</option>
+                  </select>
+                </div>
+              </div>
+
+              <div>
+                <div className="flex items-center justify-between mb-1">
+                  <label className="block text-[10px] font-bold text-slate-400 uppercase">
+                    Daftar Nomor / Kata Kunci
+                  </label>
+                  <span className="text-[10px] font-mono text-blue-400 font-bold">
+                    {detectedKeywords.length} kata kunci terdeteksi
+                  </span>
+                </div>
+                <textarea
+                  rows={8}
+                  value={batchRawInput}
+                  onChange={(e) => setBatchRawInput(e.target.value)}
+                  placeholder={`Tempel daftar nomor di sini (dari Excel / Sheets / Notepad)...
+Contoh:
+ORD-20261111-001
+ORD-20261111-002
+1007-05
+(Pemisah baris baru, koma, titik koma, atau tab otomatis dipisahkan)`}
+                  className="w-full px-3 py-2 text-xs font-mono bg-[#161B25] border border-slate-800 text-slate-200 rounded-lg focus:ring-1 focus:ring-blue-500 outline-none placeholder:text-slate-600 leading-relaxed"
+                />
+              </div>
+
+              {detectedKeywords.length > 0 && (
+                <div className="bg-[#131722] p-3 rounded-xl border border-slate-800/60 space-y-1.5">
+                  <span className="text-[10px] font-bold text-slate-400 uppercase block">
+                    Preview Kata Kunci ({detectedKeywords.length > 8 ? `8 dari ${detectedKeywords.length}` : detectedKeywords.length}):
+                  </span>
+                  <div className="flex flex-wrap gap-1.5 max-h-20 overflow-y-auto">
+                    {detectedKeywords.slice(0, 8).map((kw, i) => (
+                      <span key={i} className="px-2 py-0.5 bg-blue-500/10 border border-blue-500/20 text-blue-300 font-mono text-[10px] rounded">
+                        {kw}
+                      </span>
+                    ))}
+                    {detectedKeywords.length > 8 && (
+                      <span className="px-2 py-0.5 text-slate-500 text-[10px]">
+                        +{detectedKeywords.length - 8} lainnya...
+                      </span>
+                    )}
+                  </div>
+                </div>
+              )}
+            </div>
+
+            {/* Modal Footer */}
+            <div className="flex items-center justify-between px-6 py-4 bg-[#121722] border-t border-slate-850">
+              <button
+                type="button"
+                onClick={() => setBatchRawInput('')}
+                className="px-3 py-2 text-slate-400 hover:text-rose-400 font-bold rounded-xl text-xs transition-colors cursor-pointer"
+              >
+                {t('order.batchModalClear')}
+              </button>
+              <div className="flex items-center gap-3">
+                <button
+                  type="button"
+                  onClick={() => setIsBatchModalOpen(false)}
+                  className="px-4 py-2 bg-slate-800 hover:bg-slate-750 text-slate-300 font-bold rounded-xl text-xs transition-colors cursor-pointer"
+                >
+                  {t('action.cancel')}
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    const kws = parseBatchKeywords(batchRawInput);
+                    setActiveBatchKeywords(kws);
+                    setIsBatchModalOpen(false);
+                  }}
+                  className="px-4 py-2 bg-blue-600 hover:bg-blue-500 text-white font-extrabold rounded-xl text-xs transition-all shadow-md cursor-pointer disabled:opacity-50"
+                >
+                  {language === 'en' ? `Apply Query (${detectedKeywords.length})` : `Terapkan Pencarian (${detectedKeywords.length})`}
+                </button>
+              </div>
             </div>
           </div>
         </div>

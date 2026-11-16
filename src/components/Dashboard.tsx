@@ -1,9 +1,11 @@
 import DashboardOverview from './DashboardOverview';
 import {getStockStatus,getCompletedOutbound,getAvailableStockPool,isStockPickable} from '../utils/calculations';
-import React from 'react';
-import { StockItem, DccLog, OutboundItem, BatchRecord } from '../types';
+import React, { useMemo } from 'react';
+import { StockItem, DccLog, OutboundItem, BatchRecord, ReturnItem } from '../types';
 import EnterpriseWmsBanner from './EnterpriseWmsBanner';
 import { formatNumber, formatToWibTimeOnly, getProductCategory, isToday, isNearExpiryStatus, getExpiredStatus } from '../utils/calculations';
+import { useLanguage } from '../i18n/LanguageContext';
+import { inventoryMovementLabel } from '../utils/inventoryView';
 import { 
   TrendingUp, 
   AlertTriangle, 
@@ -29,7 +31,6 @@ import {
   CheckCircle2,
   XCircle
 } from 'lucide-react';
-import { motion } from 'motion/react';
 import { 
   BarChart, 
   Bar, 
@@ -43,6 +44,7 @@ import {
 
 // Custom Tooltip for Lowest Stock SKU Chart
 const SkuTooltip = ({ active, payload }: any) => {
+  const { language } = useLanguage();
   if (active && payload && payload.length) {
     const data = payload[0].payload;
     return (
@@ -52,7 +54,8 @@ const SkuTooltip = ({ active, payload }: any) => {
         <div className="flex items-center gap-1.5">
           <span className="w-2 h-2 rounded-full bg-rose-500 animate-pulse"></span>
           <p className="text-xs font-bold text-white">
-            Sisa Stok: <span className="text-rose-400 text-sm font-black">{formatNumber(payload[0].value)}</span> pcs
+            {language === 'en' ? 'Remaining Stock: ' : 'Sisa Stok: '}
+            <span className="text-rose-400 text-sm font-black">{formatNumber(payload[0].value)}</span> pcs
           </p>
         </div>
       </div>
@@ -63,6 +66,7 @@ const SkuTooltip = ({ active, payload }: any) => {
 
 // Custom Tooltip for Top Sold SKU Chart
 const SoldSkuTooltip = ({ active, payload }: any) => {
+  const { language } = useLanguage();
   if (active && payload && payload.length) {
     const data = payload[0].payload;
     return (
@@ -72,7 +76,8 @@ const SoldSkuTooltip = ({ active, payload }: any) => {
         <div className="flex items-center gap-1.5">
           <span className="w-2 h-2 rounded-full bg-emerald-500 animate-pulse"></span>
           <p className="text-xs font-bold text-white">
-            Outbound selesai (30 hari): <span className="text-emerald-400 text-sm font-black">{formatNumber(payload[0].value)}</span> pcs
+            {language === 'en' ? 'Completed Outbound (30 days): ' : 'Outbound selesai (30 hari): '}
+            <span className="text-emerald-400 text-sm font-black">{formatNumber(payload[0].value)}</span> pcs
           </p>
         </div>
       </div>
@@ -83,15 +88,19 @@ const SoldSkuTooltip = ({ active, payload }: any) => {
 
 // Custom Tooltip for Location Distribution Chart
 const LocationTooltip = ({ active, payload }: any) => {
+  const { language } = useLanguage();
   if (active && payload && payload.length) {
     const data = payload[0].payload;
     return (
       <div className="bg-slate-950 border border-slate-850 p-3 rounded-xl shadow-2xl font-sans">
-        <p className="text-xs font-extrabold text-indigo-400 mb-1 uppercase tracking-wide">Lokasi: {data.location}</p>
+        <p className="text-xs font-extrabold text-indigo-400 mb-1 uppercase tracking-wide">
+          {language === 'en' ? 'Location: ' : 'Lokasi: '}{data.location}
+        </p>
         <div className="flex items-center gap-1.5">
           <span className="w-2 h-2 rounded-full bg-indigo-500"></span>
           <p className="text-xs font-bold text-white">
-            Total Volume: <span className="text-indigo-300 text-sm font-black">{formatNumber(payload[0].value)}</span> pcs
+            {language === 'en' ? 'Total Volume: ' : 'Total Volume: '}
+            <span className="text-indigo-300 text-sm font-black">{formatNumber(payload[0].value)}</span> pcs
           </p>
         </div>
       </div>
@@ -105,6 +114,7 @@ interface DashboardProps {
   logs: DccLog[];
   orderHistory: OutboundItem[];
   batches?: BatchRecord[];
+  returns?: ReturnItem[];
   onNavigate: (tab: string) => void;
   userRole?: string;
   currentTheme?: string;
@@ -112,33 +122,38 @@ interface DashboardProps {
   onOpenWork?: (stage: 'pick' | 'validate') => void;
 }
 
-export default function Dashboard({ stock = [], logs = [], orderHistory = [], batches = [], onNavigate, userRole, currentTheme, onOpenInventory, onOpenWork }: DashboardProps) {
-  const completedOutbound=getCompletedOutbound(orderHistory);
-  // Calculations
-  const totalStockQty = stock.reduce((acc, curr) => acc + curr.qty, 0);
-  
-  const uniqueSkus = Array.from(new Set(stock.map(item => item.skuId))).length;
-  
-  const occupiedLocations = Array.from(new Set(stock.filter(item => item.qty > 0).map(item => JSON.stringify([(item.warehouseId || 'WH-CENTRAL').trim().toUpperCase(), item.location.trim().toUpperCase()])))).length;
-
-  // Category splits
-  const categoryGroups: Record<string, number> = {};
-  stock.forEach(item => {
-    const cat = getProductCategory(item.skuId, item.skuName);
-    categoryGroups[cat] = (categoryGroups[cat] || 0) + item.qty;
-  });
-
-  // Top locations by stock volume
-  const locationGroups: Record<string, number> = {};
-  stock.forEach(item => {
-    locationGroups[item.location] = (locationGroups[item.location] || 0) + item.qty;
-  });
-  const topLocations = Object.entries(locationGroups)
-    .map(([name, qty]) => ({ name, qty }))
-    .sort((a, b) => b.qty - a.qty)
-    .slice(0, 5);
-
-  const maxLocationQty = topLocations[0]?.qty || 1;
+export default function Dashboard({ stock = [], logs = [], orderHistory = [], batches = [], returns = [], onNavigate, userRole, currentTheme, onOpenInventory, onOpenWork }: DashboardProps) {
+  const { t, language } = useLanguage();
+  const dashboardData = useMemo(() => {
+    const completedOutbound = getCompletedOutbound(orderHistory);
+    const totalStockQty = stock.reduce((acc, curr) => acc + curr.qty, 0);
+    const uniqueSkus = new Set(stock.map(item => item.skuId)).size;
+    const occupiedLocations = new Set(stock.filter(item => item.qty > 0).map(item => JSON.stringify([(item.warehouseId || 'WH-CENTRAL').trim().toUpperCase(), item.location.trim().toUpperCase()]))).size;
+    const categoryGroups: Record<string, number> = {};
+    const locationGroups: Record<string, number> = {};
+    const locStockMap: Record<string, number> = {};
+    for (const item of stock) {
+      const cat = getProductCategory(item.skuId, item.skuName);
+      categoryGroups[cat] = (categoryGroups[cat] || 0) + item.qty;
+      locationGroups[item.location] = (locationGroups[item.location] || 0) + item.qty;
+      if (item.qty > 0) locStockMap[item.location] = (locStockMap[item.location] || 0) + item.qty;
+    }
+    const topLocations = Object.entries(locationGroups).map(([name, qty]) => ({ name, qty })).sort((a, b) => b.qty - a.qty).slice(0, 5);
+    const soldSkuMap: Record<string, { skuId: string; skuName: string; qty: number }> = {};
+    for (const item of completedOutbound) {
+      if (item.skuId && item.status === 'Completed') {
+        soldSkuMap[item.skuId] ??= { skuId: item.skuId, skuName: item.skuName, qty: 0 };
+        soldSkuMap[item.skuId].qty += item.qty;
+      }
+    }
+    const topSoldSkus = Object.values(soldSkuMap).sort((a, b) => b.qty - a.qty).slice(0, 10).map(item => ({
+      name: item.skuName.length > 15 ? `${item.skuName.slice(0, 13)}...` : item.skuName,
+      fullName: item.skuName, skuId: item.skuId, qty: item.qty
+    }));
+    const locationDistribution = Object.entries(locStockMap).map(([location, qty]) => ({ location, qty })).sort((a, b) => b.qty - a.qty).slice(0, 8);
+    return { completedOutbound, totalStockQty, uniqueSkus, occupiedLocations, categoryGroups, topLocations, maxLocationQty: topLocations[0]?.qty || 1, topSoldSkus, locationDistribution };
+  }, [stock, orderHistory]);
+  const { completedOutbound, totalStockQty, uniqueSkus, occupiedLocations, categoryGroups, topLocations, maxLocationQty, topSoldSkus, locationDistribution } = dashboardData;
 
   const handleSafeNavigate = (targetTab: string) => {
     if (userRole === 'Packer' || userRole === 'Picker') {
@@ -166,51 +181,15 @@ export default function Dashboard({ stock = [], logs = [], orderHistory = [], ba
         totalUnitsCount={totalStockQty}
       />
 
-      <DashboardOverview stock={stock} orders={orderHistory} logs={logs} role={userRole} onInventory={onOpenInventory} onWork={onOpenWork}/>
+      <DashboardOverview stock={stock} orders={orderHistory} logs={logs} returns={returns} role={userRole} onInventory={onOpenInventory} onWork={onOpenWork}/>
 
+      <details className="mt-3 rounded-xl border border-slate-800/60 bg-[#11141B]">
+        <summary className="cursor-pointer list-none px-4 py-3 text-sm font-bold text-slate-300 hover:text-white">
+          Analitik tambahan <span className="ml-1 text-xs font-normal text-slate-500">(stok, chart, dan aktivitas)</span>
+        </summary>
+        <div className="space-y-6 border-t border-slate-800/60 p-3 sm:p-5">
       {/* Visual Analytics Row using Recharts Bar Charts */}
       {(() => {
-        // Compute 10 SKU Outbound Selesai (30 hari) from orderHistory
-        const soldSkuMap: Record<string, { skuId: string; skuName: string; qty: number }> = {};
-        completedOutbound.forEach(item => {
-          if (item.skuId && item.status === 'Completed') {
-            if (!soldSkuMap[item.skuId]) {
-              soldSkuMap[item.skuId] = {
-                skuId: item.skuId,
-                skuName: item.skuName,
-                qty: 0
-              };
-            }
-            soldSkuMap[item.skuId].qty += item.qty;
-          }
-        });
-
-        const topSoldSkus = Object.values(soldSkuMap)
-          .sort((a, b) => b.qty - a.qty) // Highest sales first (descending)
-          .slice(0, 10)
-          .map(item => ({
-            name: item.skuName.length > 15 ? `${item.skuName.slice(0, 13)}...` : item.skuName,
-            fullName: item.skuName,
-            skuId: item.skuId,
-            qty: item.qty
-          }));
-
-        // Compute Stock Distribution per Location
-        const locStockMap: Record<string, number> = {};
-        stock.forEach(item => {
-          if (item.qty > 0) {
-            locStockMap[item.location] = (locStockMap[item.location] || 0) + item.qty;
-          }
-        });
-
-        const locationDistribution = Object.entries(locStockMap)
-          .map(([location, qty]) => ({
-            location,
-            qty
-          }))
-          .sort((a, b) => b.qty - a.qty) // Sort descending so densest locations are first
-          .slice(0, 8); // Top 8 locations
-
         return (
           <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
             {/* Card 1: 10 SKU Outbound Selesai (30 hari) */}
@@ -218,14 +197,14 @@ export default function Dashboard({ stock = [], logs = [], orderHistory = [], ba
               <div>
                 <h3 className="text-lg font-bold text-white mb-1 flex items-center gap-2">
                   <TrendingUp className="w-5 h-5 text-emerald-400" />
-                  10 SKU Outbound Selesai (30 hari)
+                  {t('dash.topSoldTitle')}
                 </h3>
-                <p className="text-xs text-slate-400 mb-6">Hanya order selesai, tidak termasuk draft, picking, dan pembatalan.</p>
+                <p className="text-xs text-slate-400 mb-6">{t('dash.topSoldSubtitle')}</p>
               </div>
               <div className="h-64 w-full">
                 {topSoldSkus.length === 0 ? (
                   <div className="h-full flex items-center justify-center text-slate-500 text-xs italic">
-                    Belum ada data transaksi Outbound (Penjualan)
+                    {t('dash.topSoldEmpty')}
                   </div>
                 ) : (
                   <ResponsiveContainer width="100%" height="100%">
@@ -265,14 +244,14 @@ export default function Dashboard({ stock = [], logs = [], orderHistory = [], ba
               <div>
                 <h3 className="text-lg font-bold text-white mb-1 flex items-center gap-2">
                   <BarChart4 className="w-5 h-5 text-indigo-400" />
-                  Distribusi Stok per Lokasi
+                  {t('dash.locDistTitle')}
                 </h3>
-                <p className="text-xs text-slate-400 mb-6">Rincian kepadatan barang aktif di setiap lorong rak penyimpanan utama dan zona transit.</p>
+                <p className="text-xs text-slate-400 mb-6">{t('dash.locDistSubtitle')}</p>
               </div>
               <div className="h-64 w-full">
                 {locationDistribution.length === 0 ? (
                   <div className="h-full flex items-center justify-center text-slate-500 text-xs italic">
-                    Tidak ada data lokasi yang terisi barang
+                    {t('dash.locDistEmpty')}
                   </div>
                 ) : (
                   <ResponsiveContainer width="100%" height="100%">
@@ -311,7 +290,7 @@ export default function Dashboard({ stock = [], logs = [], orderHistory = [], ba
       })()}
 
 
-      <p className="text-xs text-slate-500">Kategori pergerakan dari outbound selesai 30 hari: cepat ≥100 pcs, sedang 10–99, lambat 1–9; nol = belum ada outbound. Angka fisik mencakup stok karantina, yang tidak tersedia untuk picking.</p>
+      <p className="text-xs text-slate-500">{t('dash.movementExplanation')}</p>
       {/* 20 SKU Deadstock (Stok Mengendap) */}
       {(() => {
         const skuDetailsMap: Record<string, { 
@@ -370,57 +349,57 @@ export default function Dashboard({ stock = [], logs = [], orderHistory = [], ba
                   <span className="p-1.5 rounded-lg bg-rose-500/10 text-rose-450 border border-rose-500/15">
                     <AlertTriangle className="w-4 h-4 text-rose-400" />
                   </span>
-                  20 SKU Minim Outbound (30 hari)
+                  {t('dash.deadstockTitle')}
                 </h3>
                 <p className="text-xs text-slate-400 mt-1">
-                  Unit outbound selesai selama 30 hari terakhir. Tanpa riwayat outbound belum membuktikan barang tidak laku.
+                  {t('dash.deadstockSubtitle')}
                 </p>
               </div>
               <span className="text-[10px] font-black uppercase text-rose-400 bg-rose-500/10 border border-rose-500/20 px-3 py-1 rounded-full self-start">
-                Perhatian Khusus
+                {t('dash.specialAttention')}
               </span>
             </div>
 
             {deadstockSkus.length === 0 ? (
               <div className="text-center py-12 text-slate-500 text-xs italic">
-                Tidak ada sisa stok aktif yang terdeteksi sebagai deadstock.
+                {t('dash.deadstockEmpty')}
               </div>
             ) : (
               <div className="overflow-x-auto">
                 <table className="w-full text-left text-xs border-collapse">
                   <thead>
                     <tr className="border-b border-slate-800/80 text-slate-400 uppercase tracking-wider font-extrabold text-[10px]">
-                      <th className="py-3 px-4 w-12 text-center">No</th>
-                      <th className="py-3 px-4">SKU ID & Nama Produk</th>
-                      <th className="py-3 px-4">Kategori</th>
-                      <th className="py-3 px-4 text-right">Total Sisa Stok</th>
-                      <th className="py-3 px-4 text-right">Outbound selesai (30 hari)</th>
-                      <th className="py-3 px-4 text-center">Kondisi Risiko</th>
+                      <th className="py-3 px-4 w-12 text-center">{t('dash.colNo')}</th>
+                      <th className="py-3 px-4">{t('dash.colSkuName')}</th>
+                      <th className="py-3 px-4">{t('dash.colCategory')}</th>
+                      <th className="py-3 px-4 text-right">{t('dash.colTotalStock')}</th>
+                      <th className="py-3 px-4 text-right">{t('dash.colOutboundCompleted')}</th>
+                      <th className="py-3 px-4 text-center">{t('dash.colRiskCondition')}</th>
                     </tr>
                   </thead>
                   <tbody className="divide-y divide-slate-800/40">
                     {deadstockSkus.map((sku, index) => {
                       let statusBadge = (
                         <span className="text-[9px] font-black uppercase text-emerald-400 bg-emerald-500/10 border border-emerald-500/15 px-2 py-0.5 rounded-md">
-                          Stok Normal
+                          {t('dash.riskNormal')}
                         </span>
                       );
                       if (sku.hasDamage) {
                         statusBadge = (
                           <span className="text-[9px] font-black uppercase text-rose-400 bg-rose-500/10 border border-rose-500/15 px-2 py-0.5 rounded-md">
-                            Karantina: {formatNumber(sku.damagedQty)} pcs
+                            {t('dash.riskQuarantine', { qty: formatNumber(sku.damagedQty) })}
                           </span>
                         );
                       } else if (sku.hasNearExp) {
                         statusBadge = (
                           <span className="text-[9px] font-black uppercase text-amber-450 bg-amber-500/10 border border-amber-500/15 px-2 py-0.5 rounded-md">
-                            Ada batch dekat ED
+                            {t('dash.riskNearExp')}
                           </span>
                         );
                       } else if (sku.totalSold === 0) {
                         statusBadge = (
                           <span className="text-[9px] font-black uppercase text-rose-300 bg-rose-500/5 border border-rose-500/10 px-2 py-0.5 rounded-md">
-                            Belum ada outbound (30 hari)
+                            {t('dash.riskNoOutbound')}
                           </span>
                         );
                       }
@@ -435,7 +414,7 @@ export default function Dashboard({ stock = [], logs = [], orderHistory = [], ba
                             <div className="text-slate-450 text-[11px] truncate max-w-sm mt-0.5">{sku.skuName}</div>
                           </td>
                           <td className="py-3 px-4 text-slate-400 font-medium">
-                            {sku.category}
+                            {inventoryMovementLabel(sku.category, language)}
                           </td>
                           <td className="py-3 px-4 text-right font-mono font-extrabold text-white">
                             {formatNumber(sku.totalStock)} <span className="text-[10px] text-slate-500 font-normal">pcs</span>
@@ -465,7 +444,7 @@ export default function Dashboard({ stock = [], logs = [], orderHistory = [], ba
           <div className="bg-[#11141B] rounded-xl p-6 border border-slate-800/60 shadow-md">
             <h3 className="text-lg font-bold text-white mb-4 flex items-center gap-2">
               <MapPin className="w-5 h-5 text-emerald-400" />
-              Lokasi dengan Stok Terbanyak
+              {t('dash.topLocationsTitle')}
             </h3>
 
             <div className="space-y-4">
@@ -503,7 +482,7 @@ export default function Dashboard({ stock = [], logs = [], orderHistory = [], ba
           <div className="bg-[#11141B] rounded-xl p-6 border border-slate-800/60 shadow-md">
             <h3 className="text-lg font-bold text-white mb-4 flex items-center gap-2">
               <Package className="w-5 h-5 text-emerald-400" />
-              Kategori Pergerakan (30 hari)
+              {t('dash.movementCategoriesTitle')}
             </h3>
 
             <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
@@ -537,14 +516,14 @@ export default function Dashboard({ stock = [], logs = [], orderHistory = [], ba
                   return (
                     <div key={idx} className={`p-4 rounded-xl border ${bgClass} flex flex-col justify-between`}>
                       <div>
-                        <span className={`text-[10px] font-extrabold uppercase tracking-wider ${textColor}`}>{name}</span>
+                        <span className={`text-[10px] font-extrabold uppercase tracking-wider ${textColor}`}>{inventoryMovementLabel(name, language).toUpperCase()}</span>
                         <p className="text-xl font-black text-white mt-1.5">
                           {formatNumber(qty)} <span className="text-xs text-slate-500 font-normal">pcs</span>
                         </p>
                       </div>
                       <div className="mt-4 space-y-1">
                         <div className="flex justify-between text-[10px] text-slate-500 font-semibold">
-                          <span>Proporsi</span>
+                          <span>{t('dash.proportion')}</span>
                           <span>{totalPct}%</span>
                         </div>
                         <div className="h-1.5 w-full bg-slate-900/60 rounded-full overflow-hidden">
@@ -570,10 +549,10 @@ export default function Dashboard({ stock = [], logs = [], orderHistory = [], ba
                   <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75"></span>
                   <span className="relative inline-flex rounded-full h-3 w-3 bg-emerald-500"></span>
                 </span>
-                <h3 className="font-bold text-white">Aktivitas Real-time Cycle Count</h3>
+                <h3 className="font-bold text-white">{t('dash.realtimeCycleCountTitle')}</h3>
               </div>
               <span className="text-xs font-semibold text-emerald-400 bg-emerald-500/10 border border-emerald-500/20 px-2.5 py-1 rounded-full uppercase tracking-wider">
-                Live Feed
+                {t('dash.liveFeed')}
               </span>
             </div>
 
@@ -582,8 +561,8 @@ export default function Dashboard({ stock = [], logs = [], orderHistory = [], ba
               {logs.length === 0 ? (
                 <div className="flex flex-col items-center justify-center text-center py-12 text-slate-500 h-full">
                   <Clock className="w-10 h-10 stroke-1 mb-2 animate-pulse" />
-                  <p className="text-sm font-medium">Belum ada aktivitas hari ini</p>
-                  <p className="text-xs text-slate-500 mt-1">Gunakan fitur outbound atau Cycle Count untuk memulai</p>
+                  <p className="text-sm font-medium">{t('dash.noActivityToday')}</p>
+                  <p className="text-xs text-slate-500 mt-1">{t('dash.noActivityGuide')}</p>
                 </div>
               ) : (
                 logs.slice(0, 15).map((log, idx) => {
@@ -619,13 +598,15 @@ export default function Dashboard({ stock = [], logs = [], orderHistory = [], ba
                 onClick={() => onNavigate('daily-cycle-count')}
                 className="text-xs font-bold text-emerald-400 hover:text-emerald-300 flex items-center justify-center gap-1 mx-auto cursor-pointer"
               >
-                Lihat Detail Cycle Count
+                {t('dash.viewCycleCountDetails')}
                 <MoveRight className="w-3.5 h-3.5" />
               </button>
             </div>
           </div>
         </div>
       </div>
+        </div>
+      </details>
     </div>
   );
 }

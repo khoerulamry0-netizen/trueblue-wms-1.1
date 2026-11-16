@@ -1,7 +1,17 @@
 import React, { useState, useMemo, useRef } from 'react';
 import { CatalogItem, StockItem } from '../types';
-import { calculatePackQuantities, formatNumber } from '../utils/calculations';
+import { calculatePackQuantities, formatNumber, getProductPackSizes } from '../utils/calculations';
 import { getProductBrand, getBarcodeForSku, BARCODE_MAP } from '../data/barcodeMap';
+import { useLanguage } from '../i18n/LanguageContext';
+import { getActiveBranch } from '../supabase';
+import {
+  extractCatalogRowsFromAoA,
+  isPlaceholderSkuName,
+  normalizeSkuKey,
+  parseCatalogSheetRows,
+  planCrossBranchCatalogMerge,
+  type ParsedCatalogSheetRow
+} from '../utils/catalogSync';
 import * as XLSX from 'xlsx';
 import { 
   Plus, 
@@ -16,6 +26,8 @@ import {
   Database,
   Layers,
   ArrowRight,
+  ArrowLeftRight,
+  Building2,
   Download,
   Upload,
   FileSpreadsheet,
@@ -38,8 +50,18 @@ interface ProductCatalogProps {
   onAddCatalogItem: (item: Omit<CatalogItem, 'id'>) => Promise<boolean>;
   onUpdateCatalogItem: (skuId: string, updatedFields: Partial<CatalogItem>) => Promise<boolean>;
   onDeleteCatalogItem: (skuId: string) => Promise<boolean>;
-  onBatchImportCatalog: (items: Omit<CatalogItem, 'id'>[], mode: 'merge' | 'replace') => Promise<boolean>;
-  onSyncStockToCatalog: () => Promise<{ addedCount: number }>;
+  onBatchImportCatalog: (
+    items: Omit<CatalogItem, 'id'>[],
+    mode: 'merge' | 'replace'
+  ) => Promise<{ success: boolean; catalogSavedCount: number; stockSyncedCount: number; stockSyncError?: string }>;
+  onSyncStockToCatalog: () => Promise<{
+    addedCount: number;
+    updatedCatalogCount: number;
+    syncedStockCount: number;
+    stockSyncError?: string;
+  }>;
+  onFetchAccessibleBranches?: () => Promise<Array<{ id: string; name: string }>>;
+  onFetchBranchCatalog?: (branchId: string) => Promise<CatalogItem[]>;
 }
 
 export default function ProductCatalog({
@@ -50,10 +72,13 @@ export default function ProductCatalog({
   onUpdateCatalogItem,
   onDeleteCatalogItem,
   onBatchImportCatalog,
-  onSyncStockToCatalog
+  onSyncStockToCatalog,
+  onFetchAccessibleBranches,
+  onFetchBranchCatalog
 }: ProductCatalogProps) {
+  const { t, language } = useLanguage();
   const [searchTerm, setSearchTerm] = useState('');
-  const [activeTab, setActiveTab] = useState<'ALL' | 'IN_STOCK' | 'NO_STOCK'>('ALL');
+  const [activeTab, setActiveTab] = useState<'ALL' | 'IN_STOCK' | 'NO_STOCK' | 'PLACEHOLDER'>('ALL');
 
   // Modal states
   const [isModalOpen, setIsModalOpen] = useState(false);
@@ -80,17 +105,19 @@ export default function ProductCatalog({
   const [isSyncingStock, setIsSyncingStock] = useState(false);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
 
+  // Cross-branch sync modal states
+  const [isCrossBranchModalOpen, setIsCrossBranchModalOpen] = useState(false);
+  const [accessibleBranches, setAccessibleBranches] = useState<Array<{ id: string; name: string }>>([]);
+  const [selectedSourceBranch, setSelectedSourceBranch] = useState('');
+  const [sourceBranchCatalog, setSourceBranchCatalog] = useState<CatalogItem[]>([]);
+  const [isLoadingCrossBranch, setIsLoadingCrossBranch] = useState(false);
+  const [crossBranchError, setCrossBranchError] = useState('');
+  const [crossBranchMode, setCrossBranchMode] = useState<'fill_placeholders' | 'overwrite_all'>('fill_placeholders');
+  const [crossBranchIncludeNew, setCrossBranchIncludeNew] = useState(false);
+  const [isApplyingCrossBranch, setIsApplyingCrossBranch] = useState(false);
+
   // File parse error / preview state
-  const [parsedImportRows, setParsedImportRows] = useState<Array<{
-    skuId: string;
-    skuName: string;
-    brand: string;
-    barcode: string;
-    qtyCtnSize: number;
-    qtyInnerSize: number;
-    status: 'NEW' | 'UPDATE' | 'INVALID';
-    errorReason?: string;
-  }>>([]);
+  const [parsedImportRows, setParsedImportRows] = useState<ParsedCatalogSheetRow[]>([]);
 
   const [catalogConfirmModal, setCatalogConfirmModal] = useState<{
     isOpen: boolean;
@@ -200,6 +227,7 @@ export default function ProductCatalog({
 
       if (activeTab === 'IN_STOCK') return hasStock;
       if (activeTab === 'NO_STOCK') return !hasStock;
+      if (activeTab === 'PLACEHOLDER') return isPlaceholderSkuName(item.skuId, item.skuName);
 
       return true;
     });
@@ -211,9 +239,13 @@ export default function ProductCatalog({
   const stats = useMemo(() => {
     let skusWithStock = 0;
     let totalStockVolumePcs = 0;
+    let placeholderCount = 0;
 
     catalog.forEach(item => {
       const normSku = item.skuId.toUpperCase();
+      if (isPlaceholderSkuName(item.skuId, item.skuName)) {
+        placeholderCount += 1;
+      }
       const stockData = stockSummaryMap.get(normSku);
       if (stockData && stockData.totalQtyPcs > 0) {
         skusWithStock += 1;
@@ -225,9 +257,25 @@ export default function ProductCatalog({
       totalCatalogSkus: catalog.length,
       skusWithStock,
       totalStockVolumePcs,
-      unmappedStockCount: unmappedStockSkus.length
+      unmappedStockCount: unmappedStockSkus.length,
+      placeholderCount
     };
   }, [catalog, stockSummaryMap, unmappedStockSkus]);
+
+  const crossBranchPlan = useMemo(() => {
+    if (!selectedSourceBranch || sourceBranchCatalog.length === 0) return null;
+    return planCrossBranchCatalogMerge(
+      catalog,
+      sourceBranchCatalog,
+      {
+        mode: crossBranchMode,
+        includeNewSkus: crossBranchIncludeNew
+      },
+      getProductPackSizes,
+      getProductBrand,
+      getBarcodeForSku
+    );
+  }, [catalog, sourceBranchCatalog, selectedSourceBranch, crossBranchMode, crossBranchIncludeNew]);
 
   // Modal Open Handlers
   const handleOpenAddModal = () => {
@@ -341,16 +389,102 @@ export default function ProductCatalog({
     }
   };
 
-  // Sync Missing Stock SKUs to Catalog
+  // Bidirectional Sync between Stock & Catalog
   const handleSyncStock = async () => {
     setIsSyncingStock(true);
     setSuccessMsg('');
     const res = await onSyncStockToCatalog();
     setIsSyncingStock(false);
-    if (res.addedCount > 0) {
-      setSuccessMsg(`Berhasil menyinkronkan ${res.addedCount} SKU stok ke katalog master barang beserta Brand & Barcode sistem!`);
+    const changes: string[] = [];
+    if (res.addedCount > 0) changes.push(`${res.addedCount} SKU baru ditambahkan ke katalog`);
+    if (res.updatedCatalogCount > 0) changes.push(`${res.updatedCatalogCount} nama default katalog diperbarui dari stok`);
+    if (res.syncedStockCount > 0) changes.push(`${res.syncedStockCount} baris stok disinkronkan ke nama & ukuran katalog`);
+    if (res.stockSyncError) {
+      setCatalogConfirmModal({
+        isOpen: true,
+        title: 'Sinkronisasi Stok Sebagian Gagal',
+        message: `${changes.length ? `${changes.join(', ')}.\n\n` : ''}${res.stockSyncError}`,
+        warningType: 'warning',
+        confirmText: 'OK',
+        showCancel: false,
+        onConfirm: () => setCatalogConfirmModal(null)
+      });
+      return;
+    }
+    if (changes.length > 0) {
+      setSuccessMsg(`Sinkronisasi selesai: ${changes.join(', ')}.`);
     } else {
-      setSuccessMsg('Semua data stok sistem sudah terdaftar di katalog master barang.');
+      setSuccessMsg('Katalog dan stok gudang sudah selaras.');
+    }
+  };
+
+  const loadSourceBranchCatalog = async (branchId: string) => {
+    if (!branchId || !onFetchBranchCatalog) return;
+    setSelectedSourceBranch(branchId);
+    setCrossBranchError('');
+    setIsLoadingCrossBranch(true);
+    try {
+      const remoteCatalog = await onFetchBranchCatalog(branchId);
+      setSourceBranchCatalog(remoteCatalog);
+      if (remoteCatalog.length === 0) {
+        setCrossBranchError(`Cabang "${branchId}" belum memiliki data di Katalog Produk.`);
+      }
+    } catch (err: any) {
+      setSourceBranchCatalog([]);
+      setCrossBranchError(err?.message || `Gagal membaca katalog cabang ${branchId}.`);
+    } finally {
+      setIsLoadingCrossBranch(false);
+    }
+  };
+
+  const handleOpenCrossBranchModal = async () => {
+    if (!isAdmin || !onFetchAccessibleBranches || !onFetchBranchCatalog) return;
+    setIsCrossBranchModalOpen(true);
+    setCrossBranchError('');
+    setSourceBranchCatalog([]);
+    setSelectedSourceBranch('');
+    setCrossBranchMode('fill_placeholders');
+    setCrossBranchIncludeNew(false);
+    setIsLoadingCrossBranch(true);
+    try {
+      const activeBranch = getActiveBranch();
+      const branches = await onFetchAccessibleBranches();
+      const otherBranches = branches.filter(b => b.id !== activeBranch);
+      setAccessibleBranches(otherBranches);
+      if (otherBranches.length > 0) {
+        await loadSourceBranchCatalog(otherBranches[0].id);
+      } else {
+        setIsLoadingCrossBranch(false);
+      }
+    } catch (err: any) {
+      setCrossBranchError(err?.message || 'Gagal memuat daftar cabang.');
+      setIsLoadingCrossBranch(false);
+    }
+  };
+
+  const handleApplyCrossBranchSync = async () => {
+    if (!crossBranchPlan || crossBranchPlan.itemsToImport.length === 0) return;
+    setIsApplyingCrossBranch(true);
+    const result = await onBatchImportCatalog(crossBranchPlan.itemsToImport, 'merge');
+    setIsApplyingCrossBranch(false);
+    if (result.success) {
+      setIsCrossBranchModalOpen(false);
+      setSuccessMsg(
+        `Berhasil menyalin ${crossBranchPlan.itemsToImport.length} nama barang dari cabang ${selectedSourceBranch} (${result.stockSyncedCount} baris stok ikut tersinkron).`
+      );
+      if (result.stockSyncError) {
+        setCatalogConfirmModal({
+          isOpen: true,
+          title: 'Katalog Tersinkron, Stok Perlu Sync Ulang',
+          message: `Katalog berhasil diperbarui dari cabang ${selectedSourceBranch}, tetapi sinkronisasi ke stok gagal:\n${result.stockSyncError}`,
+          warningType: 'warning',
+          confirmText: 'OK',
+          showCancel: false,
+          onConfirm: () => setCatalogConfirmModal(null)
+        });
+      }
+    } else {
+      setCrossBranchError('Gagal menyimpan hasil sinkronisasi lintas cabang. Coba lagi.');
     }
   };
 
@@ -465,83 +599,14 @@ export default function ProductCatalog({
   };
 
   // FILE IMPORT / PARSE HANDLERS
-  const parseRawSheetData = (rawJson: any[]) => {
-    const catalogMap = new Map<string, CatalogItem>();
-    catalog.forEach(c => catalogMap.set(c.skuId.toUpperCase(), c));
-
-    const parsed: Array<{
-      skuId: string;
-      skuName: string;
-      brand: string;
-      barcode: string;
-      qtyCtnSize: number;
-      qtyInnerSize: number;
-      status: 'NEW' | 'UPDATE' | 'INVALID';
-      errorReason?: string;
-    }> = [];
-
-    rawJson.forEach((row: any) => {
-      // Find keys flexibly
-      const keys = Object.keys(row);
-      const getVal = (possibleNames: string[]) => {
-        const foundKey = keys.find(k => {
-          const cleanK = k.trim().toLowerCase().replace(/[\_\-\/\s]/g, '');
-          return possibleNames.some(p => p.toLowerCase().replace(/[\_\-\/\s]/g, '') === cleanK);
-        });
-        return foundKey ? row[foundKey] : undefined;
-      };
-
-      const rawSkuId = String(getVal(['sku id', 'kodesku', 'sku', 'kode barang', 'id sku', 'skuid']) || '').trim().toUpperCase();
-      const rawSkuName = String(getVal(['nama barang', 'namasku', 'nama product', 'nama', 'description', 'product name', 'skuname']) || '').trim();
-      const rawBrandInput = String(getVal(['brand', 'merk', 'merek', 'pabrik', 'produsen', 'vendor']) || '').trim();
-      const rawBarcodeInput = String(getVal(['barcode', 'upc', 'ean', 'kode barcode', 'qr', 'scancode']) || '').trim();
-
-      const rawQtyCtn = parseInt(getVal(['qty ctn', 'qty ctn size', 'qtyctn', 'ctn size', 'ctn', 'karton', 'qty karton']) || '144', 10);
-      const rawQtyInner = parseInt(getVal(['qty inner', 'qty inner size', 'qtyinner', 'inner size', 'inner', 'box', 'qty box']) || '12', 10);
-
-      if (!rawSkuId) {
-        parsed.push({
-          skuId: '-',
-          skuName: rawSkuName || '-',
-          brand: rawBrandInput || '-',
-          barcode: rawBarcodeInput || '-',
-          qtyCtnSize: rawQtyCtn || 144,
-          qtyInnerSize: rawQtyInner || 12,
-          status: 'INVALID',
-          errorReason: 'SKU ID Kosong'
-        });
-        return;
-      }
-
-      if (!rawSkuName) {
-        parsed.push({
-          skuId: rawSkuId,
-          skuName: '-',
-          brand: rawBrandInput || getProductBrand(rawSkuId, rawSkuName),
-          barcode: rawBarcodeInput || getBarcodeForSku(rawSkuId),
-          qtyCtnSize: rawQtyCtn || 144,
-          qtyInnerSize: rawQtyInner || 12,
-          status: 'INVALID',
-          errorReason: 'Nama Barang Kosong'
-        });
-        return;
-      }
-
-      const isUpdate = catalogMap.has(rawSkuId);
-      const resolvedBrand = getProductBrand(rawSkuId, rawSkuName, rawBrandInput);
-      const resolvedBarcode = getBarcodeForSku(rawSkuId, rawBarcodeInput);
-
-      parsed.push({
-        skuId: rawSkuId,
-        skuName: rawSkuName,
-        brand: resolvedBrand,
-        barcode: resolvedBarcode,
-        qtyCtnSize: isNaN(rawQtyCtn) || rawQtyCtn <= 0 ? 144 : rawQtyCtn,
-        qtyInnerSize: isNaN(rawQtyInner) || rawQtyInner <= 0 ? 12 : rawQtyInner,
-        status: isUpdate ? 'UPDATE' : 'NEW'
-      });
-    });
-
+  const parseRawSheetData = (rawRows: Record<string, unknown>[]) => {
+    const parsed = parseCatalogSheetRows(
+      rawRows,
+      catalog,
+      getProductPackSizes,
+      getProductBrand,
+      getBarcodeForSku
+    );
     setParsedImportRows(parsed);
   };
 
@@ -553,8 +618,9 @@ export default function ProductCatalog({
         const workbook = XLSX.read(data, { type: 'array' });
         const firstSheetName = workbook.SheetNames[0];
         const worksheet = workbook.Sheets[firstSheetName];
-        const rawJson = XLSX.utils.sheet_to_json(worksheet);
-        parseRawSheetData(rawJson);
+        const rawAoA = XLSX.utils.sheet_to_json<unknown[]>(worksheet, { header: 1, defval: '' });
+        const normalizedRows = extractCatalogRowsFromAoA(rawAoA);
+        parseRawSheetData(normalizedRows);
       } catch (err) {
         console.error('Error parsing excel:', err);
         alert('Gagal membaca file Excel/CSV. Pastikan format file valid.');
@@ -577,37 +643,23 @@ export default function ProductCatalog({
       return;
     }
 
-    const lines = importText.split('\n');
-    const rawJson: any[] = [];
+    const lines = importText.split(/\r?\n/);
+    const rawAoA: string[][] = [];
 
     lines.forEach((line) => {
       const trimmed = line.trim();
       if (!trimmed) return;
-      
-      // Split by tab or comma
-      const parts = trimmed.includes('\t') ? trimmed.split('\t') : trimmed.split(',');
-      if (parts.length >= 2) {
-        const skuId = parts[0].trim();
-        const skuName = parts[1].trim();
-        const brand = parts[2] ? parts[2].trim() : '';
-        const barcode = parts[3] ? parts[3].trim() : '';
-        const qtyCtn = parts[4] ? parseInt(parts[4].trim(), 10) : 144;
-        const qtyInner = parts[5] ? parseInt(parts[5].trim(), 10) : 12;
 
-        if (skuId.toLowerCase() === 'sku id' || skuId.toLowerCase() === 'sku') return; // skip header line
-
-        rawJson.push({
-          'SKU ID': skuId,
-          'Nama Barang': skuName,
-          'Brand': brand,
-          'Barcode': barcode,
-          'Qty CTN': qtyCtn,
-          'Qty Inner': qtyInner
-        });
-      }
+      const parts = trimmed.includes('\t')
+        ? trimmed.split('\t')
+        : trimmed.includes(';')
+          ? trimmed.split(';')
+          : trimmed.split(',');
+      rawAoA.push(parts.map(cell => cell.trim()));
     });
 
-    parseRawSheetData(rawJson);
+    const normalizedRows = extractCatalogRowsFromAoA(rawAoA);
+    parseRawSheetData(normalizedRows);
   };
 
   const executeCatalogImport = async (validItems: typeof parsedImportRows) => {
@@ -622,24 +674,41 @@ export default function ProductCatalog({
       qtyInnerSize: item.qtyInnerSize
     }));
 
-    const success = await onBatchImportCatalog(itemsToImport, importMode);
+    const result = await onBatchImportCatalog(itemsToImport, importMode);
     setIsProcessingImport(false);
 
-    if (success) {
-      setSuccessMsg(`Berhasil meng-import ${itemsToImport.length} SKU ke katalog master barang! Brand, Barcode & stok terhubung otomatis.`);
+    if (result.success) {
+      const stockSummary = result.stockSyncedCount > 0
+        ? ` ${result.stockSyncedCount} baris stok ikut tersinkron.`
+        : ' Brand, Barcode & stok terhubung otomatis.';
+      setSuccessMsg(
+        `Berhasil meng-import ${result.catalogSavedCount} SKU ke katalog master barang!${stockSummary}`
+      );
       setIsImportModalOpen(false);
       setParsedImportRows([]);
       setImportText('');
 
-      setCatalogConfirmModal({
-        isOpen: true,
-        title: 'Import Katalog Berhasil!',
-        message: `✓ Berhasil meng-import ${itemsToImport.length} SKU ke katalog master barang! Brand, Barcode & stok terhubung otomatis.`,
-        warningType: 'success',
-        confirmText: 'OK, SELESAI',
-        showCancel: false,
-        onConfirm: () => setCatalogConfirmModal(null)
-      });
+      if (result.stockSyncError) {
+        setCatalogConfirmModal({
+          isOpen: true,
+          title: 'Import Katalog Tersimpan, Sinkron Stok Perlu Dicek',
+          message: `✓ ${result.catalogSavedCount} SKU tersimpan ke katalog master barang, namun sinkronisasi ke tabel stok mengalami kendala:\n${result.stockSyncError}`,
+          warningType: 'warning',
+          confirmText: 'OK',
+          showCancel: false,
+          onConfirm: () => setCatalogConfirmModal(null)
+        });
+      } else {
+        setCatalogConfirmModal({
+          isOpen: true,
+          title: 'Import Katalog Berhasil!',
+          message: `✓ Berhasil meng-import ${result.catalogSavedCount} SKU ke katalog master barang!\n${stockSummary.trim()}`,
+          warningType: 'success',
+          confirmText: 'OK, SELESAI',
+          showCancel: false,
+          onConfirm: () => setCatalogConfirmModal(null)
+        });
+      }
     } else {
       setCatalogConfirmModal({
         isOpen: true,
@@ -699,19 +768,42 @@ export default function ProductCatalog({
             <div className="flex items-center gap-2">
               <h1 className="text-xl sm:text-2xl font-black text-slate-100 tracking-tight flex items-center gap-2">
                 <Database className="w-6 h-6 text-indigo-400" />
-                Katalog Master Barang & Sinkronisasi Stok
+                {t('catalog.title')}
               </h1>
               <span className="text-[10px] font-mono bg-emerald-500/15 border border-emerald-500/30 text-emerald-400 font-bold px-2.5 py-0.5 rounded-full flex items-center gap-1">
                 <Link className="w-3 h-3" /> System Connected
               </span>
             </div>
             <p className="text-xs text-slate-400 max-w-2xl">
-              Pusat data master produk yang mendefinisikan SKU, nama barang, merek, barcode, dan ukuran kemasan. Data terhubung dengan scanner barcode dan stok fisik di seluruh rak gudang.
+              {t('catalog.subtitle')}
             </p>
           </div>
 
           {/* Top Action Buttons */}
           <div className="flex items-center flex-wrap gap-2.5 shrink-0 self-start lg:self-center">
+            {isAdmin && (
+              <button
+                onClick={handleSyncStock}
+                disabled={isSyncingStock}
+                className="flex items-center justify-center gap-1.5 px-3.5 py-2 bg-amber-600/20 hover:bg-amber-600/30 border border-amber-500/40 text-amber-300 disabled:opacity-50 active:scale-95 text-xs font-bold rounded-xl transition-all cursor-pointer shadow-md"
+                title="Sinkronkan 2 arah antara Katalog Produk dan Stok Gudang (lengkapi SKU & samakan nama asli)"
+              >
+                <ArrowLeftRight className={`w-4 h-4 text-amber-400 ${isSyncingStock ? 'animate-pulse' : ''}`} />
+                <span>{isSyncingStock ? 'Menyinkronkan...' : 'Sync Katalog ↔ Stok'}</span>
+              </button>
+            )}
+
+            {isAdmin && onFetchAccessibleBranches && onFetchBranchCatalog && (
+              <button
+                onClick={handleOpenCrossBranchModal}
+                className="flex items-center justify-center gap-1.5 px-3.5 py-2 bg-sky-600/20 hover:bg-sky-600/30 border border-sky-500/40 text-sky-300 active:scale-95 text-xs font-bold rounded-xl transition-all cursor-pointer shadow-md"
+                title="Salin nama barang asli dari katalog cabang lain (misal dari CENTER ke JKT)"
+              >
+                <Building2 className="w-4 h-4 text-sky-400" />
+                <span>Sync Cabang Lain</span>
+              </button>
+            )}
+
             {/* Export Excel Button */}
             <button
               onClick={handleExportCatalog}
@@ -719,7 +811,7 @@ export default function ProductCatalog({
               title="Export Katalog ke file Excel (.xlsx) beserta Brand & Barcode"
             >
               <Download className="w-4 h-4 text-emerald-400" />
-              <span>Export Excel</span>
+              <span>{t('catalog.exportExcel')}</span>
             </button>
 
             {/* Import Excel Button */}
@@ -731,10 +823,10 @@ export default function ProductCatalog({
                   setIsImportModalOpen(true);
                 }}
                 className="flex items-center justify-center gap-1.5 px-3.5 py-2 bg-indigo-600/20 hover:bg-indigo-600/30 border border-indigo-500/40 text-indigo-300 active:scale-95 text-xs font-bold rounded-xl transition-all cursor-pointer shadow-md"
-                title="Import data katalog dari file Excel / teks"
+                title="Import data katalog dari file Excel / teks (termasuk export Mabang ERP)"
               >
                 <Upload className="w-4 h-4 text-indigo-400" />
-                <span>Import Excel</span>
+                <span>{t('catalog.importExcel')}</span>
               </button>
             )}
 
@@ -746,7 +838,7 @@ export default function ProductCatalog({
                 className="flex items-center justify-center gap-1.5 px-4 py-2 bg-indigo-500 hover:bg-indigo-600 active:scale-95 text-xs font-bold text-white rounded-xl transition-all cursor-pointer shadow-lg shadow-indigo-500/10"
               >
                 <Plus className="w-4 h-4" />
-                <span>Tambah SKU Baru</span>
+                <span>{t('catalog.addSku')}</span>
               </button>
             )}
           </div>
@@ -757,42 +849,42 @@ export default function ProductCatalog({
       <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
         <div className="bg-[#11141B] border border-slate-800/80 rounded-xl p-3.5 flex flex-col justify-between space-y-2 shadow-sm">
           <div className="flex items-center justify-between">
-            <span className="text-[10px] font-extrabold text-slate-400 uppercase tracking-wider font-mono">Total SKU Katalog</span>
+            <span className="text-[10px] font-extrabold text-slate-400 uppercase tracking-wider font-mono">{t('catalog.totalSkus')}</span>
             <Database className="w-4 h-4 text-indigo-400" />
           </div>
           <div>
             <div className="text-xl font-black text-white font-mono">{formatNumber(stats.totalCatalogSkus)}</div>
-            <div className="text-[10px] text-slate-500 mt-0.5">Master SKU terdaftar</div>
+            <div className="text-[10px] text-slate-500 mt-0.5">{t('catalog.registeredMaster')}</div>
           </div>
         </div>
 
         <div className="bg-[#11141B] border border-slate-800/80 rounded-xl p-3.5 flex flex-col justify-between space-y-2 shadow-sm">
           <div className="flex items-center justify-between">
-            <span className="text-[10px] font-extrabold text-slate-400 uppercase tracking-wider font-mono">Terhubung Stok</span>
+            <span className="text-[10px] font-extrabold text-slate-400 uppercase tracking-wider font-mono">{language === 'en' ? 'Linked to Stock' : 'Terhubung Stok'}</span>
             <Link className="w-4 h-4 text-emerald-400" />
           </div>
           <div>
             <div className="text-xl font-black text-emerald-400 font-mono">
               {formatNumber(stats.skusWithStock)} <span className="text-xs text-slate-500 font-normal">/ {stats.totalCatalogSkus} SKU</span>
             </div>
-            <div className="text-[10px] text-slate-500 mt-0.5">Aktif di stok gudang</div>
+            <div className="text-[10px] text-slate-500 mt-0.5">{language === 'en' ? 'Active in warehouse stock' : 'Aktif di stok gudang'}</div>
           </div>
         </div>
 
         <div className="bg-[#11141B] border border-slate-800/80 rounded-xl p-3.5 flex flex-col justify-between space-y-2 shadow-sm">
           <div className="flex items-center justify-between">
-            <span className="text-[10px] font-extrabold text-slate-400 uppercase tracking-wider font-mono">Total Volume Stok</span>
+            <span className="text-[10px] font-extrabold text-slate-400 uppercase tracking-wider font-mono">{language === 'en' ? 'Total Stock Volume' : 'Total Volume Stok'}</span>
             <Boxes className="w-4 h-4 text-cyan-400" />
           </div>
           <div>
             <div className="text-xl font-black text-cyan-400 font-mono">{formatNumber(stats.totalStockVolumePcs)} <span className="text-xs text-slate-500 font-normal">Pcs</span></div>
-            <div className="text-[10px] text-slate-500 mt-0.5">Total pcs terhubung</div>
+            <div className="text-[10px] text-slate-500 mt-0.5">{language === 'en' ? 'Total linked pcs' : 'Total pcs terhubung'}</div>
           </div>
         </div>
 
         <div className="bg-[#11141B] border border-slate-800/80 rounded-xl p-3.5 flex flex-col justify-between space-y-2 shadow-sm">
           <div className="flex items-center justify-between">
-            <span className="text-[10px] font-extrabold text-slate-400 uppercase tracking-wider font-mono">Stok Belum Di Katalog</span>
+            <span className="text-[10px] font-extrabold text-slate-400 uppercase tracking-wider font-mono">{language === 'en' ? 'Uncatalogued Stock' : 'Stok Belum Di Katalog'}</span>
             <AlertTriangle className={`w-4 h-4 ${stats.unmappedStockCount > 0 ? 'text-amber-400' : 'text-slate-600'}`} />
           </div>
           <div>
@@ -806,10 +898,10 @@ export default function ProductCatalog({
                 className="mt-1 text-[10px] text-amber-300 underline hover:text-amber-200 font-bold flex items-center gap-1 cursor-pointer"
               >
                 <RefreshCw className={`w-3 h-3 ${isSyncingStock ? 'animate-spin' : ''}`} />
-                <span>Daftarkan otomatis</span>
+                <span>{language === 'en' ? 'Register automatically' : 'Daftarkan otomatis'}</span>
               </button>
             ) : (
-              <div className="text-[10px] text-slate-500 mt-0.5">Semua stok terdaftar</div>
+              <div className="text-[10px] text-slate-500 mt-0.5">{language === 'en' ? 'All stock registered' : 'Semua stok terdaftar'}</div>
             )}
           </div>
         </div>
@@ -823,6 +915,51 @@ export default function ProductCatalog({
         </div>
       )}
 
+      {/* Placeholder Name Alert Banner */}
+      {stats.placeholderCount > 0 && (
+        <div className="flex flex-col md:flex-row md:items-center justify-between gap-3 bg-amber-500/10 border border-amber-500/30 rounded-xl p-3.5 text-xs text-amber-200">
+          <div className="flex items-start gap-2.5">
+            <AlertTriangle className="w-4 h-4 shrink-0 text-amber-400 mt-0.5" />
+            <div>
+              <div className="font-bold text-amber-300">
+                {formatNumber(stats.placeholderCount)} SKU masih menggunakan nama default sistem (contoh: &quot;&lt;SKU&gt; Product&quot;)
+              </div>
+              <div className="text-[11px] text-amber-200/80 mt-0.5">
+                Lengkapi nama asli lewat <span className="font-bold">Sync Cabang Lain</span> (salin dari cabang pusat), <span className="font-bold">Import Excel</span> (file Mabang ERP / template tanpa mengubah Qty CTN &amp; Inner), atau <span className="font-bold">Sync Katalog ↔ Stok</span>.
+              </div>
+            </div>
+          </div>
+          <div className="flex items-center flex-wrap gap-2 shrink-0">
+            <button
+              onClick={() => setActiveTab('PLACEHOLDER')}
+              className="px-2.5 py-1.5 bg-amber-500/20 hover:bg-amber-500/30 border border-amber-400/40 text-amber-200 font-bold rounded-lg text-[11px] transition-all cursor-pointer"
+            >
+              Lihat {formatNumber(stats.placeholderCount)} SKU
+            </button>
+            {isAdmin && onFetchAccessibleBranches && onFetchBranchCatalog && (
+              <button
+                onClick={handleOpenCrossBranchModal}
+                className="px-2.5 py-1.5 bg-sky-500/20 hover:bg-sky-500/30 border border-sky-400/40 text-sky-200 font-bold rounded-lg text-[11px] transition-all cursor-pointer"
+              >
+                Sync Cabang Lain
+              </button>
+            )}
+            {isAdmin && (
+              <button
+                onClick={() => {
+                  setParsedImportRows([]);
+                  setImportText('');
+                  setIsImportModalOpen(true);
+                }}
+                className="px-2.5 py-1.5 bg-indigo-500/20 hover:bg-indigo-500/30 border border-indigo-400/40 text-indigo-200 font-bold rounded-lg text-[11px] transition-all cursor-pointer"
+              >
+                Import Excel
+              </button>
+            )}
+          </div>
+        </div>
+      )}
+
       {/* Main Filter & Table Area */}
       <div className="bg-[#11141B] rounded-2xl border border-slate-800/80 shadow-md overflow-hidden">
         {/* Search Bar & Tabs */}
@@ -831,7 +968,7 @@ export default function ProductCatalog({
             <Search className="absolute left-3 top-2.5 w-4 h-4 text-slate-500" />
             <input
               type="text"
-              placeholder="Cari SKU ID, Nama Barang, Brand, atau Barcode..."
+              placeholder={t('catalog.searchPlaceholder')}
               value={searchTerm}
               onChange={(e) => setSearchTerm(e.target.value)}
               className="w-full pl-9 pr-4 py-2 text-xs bg-[#161B25] border border-slate-850 rounded-xl text-slate-200 placeholder-slate-500 focus:outline-none focus:ring-1 focus:ring-indigo-500 focus:border-indigo-500"
@@ -847,7 +984,7 @@ export default function ProductCatalog({
                   : 'bg-[#161B25] text-slate-400 hover:text-slate-200'
               }`}
             >
-              Semua SKU ({catalog.length})
+              {t('catalog.tabAll')} ({catalog.length})
             </button>
             <button
               onClick={() => setActiveTab('IN_STOCK')}
@@ -857,7 +994,7 @@ export default function ProductCatalog({
                   : 'bg-[#161B25] text-slate-400 hover:text-slate-200'
               }`}
             >
-              Ada di Stok ({stats.skusWithStock})
+              {t('catalog.tabInStock')} ({stats.skusWithStock})
             </button>
             <button
               onClick={() => setActiveTab('NO_STOCK')}
@@ -867,8 +1004,20 @@ export default function ProductCatalog({
                   : 'bg-[#161B25] text-slate-400 hover:text-slate-200'
               }`}
             >
-              Belum Ada Stok ({catalog.length - stats.skusWithStock})
+              {t('catalog.tabNoStock')} ({catalog.length - stats.skusWithStock})
             </button>
+            {(stats.placeholderCount > 0 || activeTab === 'PLACEHOLDER') && (
+              <button
+                onClick={() => setActiveTab('PLACEHOLDER')}
+                className={`px-3 py-1.5 text-xs font-bold rounded-xl transition-all cursor-pointer whitespace-nowrap ${
+                  activeTab === 'PLACEHOLDER'
+                    ? 'bg-amber-500 text-slate-950 font-black shadow-md shadow-amber-500/20'
+                    : 'bg-[#161B25] text-amber-400 hover:text-amber-300 border border-amber-500/25'
+                }`}
+              >
+                Nama Default ({stats.placeholderCount})
+              </button>
+            )}
           </div>
         </div>
 
@@ -915,7 +1064,17 @@ export default function ProductCatalog({
                         {item.skuId}
                       </td>
                       <td className="py-3.5 px-4 font-semibold text-slate-200">
-                        {item.skuName}
+                        <div className="flex items-center flex-wrap gap-2">
+                          <span>{item.skuName}</span>
+                          {isPlaceholderSkuName(item.skuId, item.skuName) && (
+                            <span
+                              className="inline-flex items-center px-1.5 py-0.5 rounded bg-amber-500/15 border border-amber-500/30 text-[9px] font-bold text-amber-300"
+                              title="Nama barang masih default sistem, belum diisi nama produk asli"
+                            >
+                              Nama Default
+                            </span>
+                          )}
+                        </div>
                       </td>
                       {/* Brand Column beside Item Name */}
                       <td className="py-3.5 px-4">
@@ -1180,7 +1339,7 @@ export default function ProductCatalog({
                 </h2>
               </div>
               <p className="text-xs text-slate-400 mt-1">
-                Upload file Excel (.xlsx, .xls) atau salin data dari spreadsheet. Sistem akan memetakan kolom SKU ID, Nama Barang, Qty CTN, dan Qty Inner secara otomatis.
+                Upload file Excel (.xlsx, .xls, .csv) termasuk export Mabang ERP (<span className="font-mono text-indigo-300">Inventory SKU Number</span> / <span className="font-mono text-indigo-300">English Name</span>) atau salin data dari spreadsheet. Jika kolom Qty CTN / Inner dikosongkan saat update, ukuran CTN &amp; Inner yang sudah ada di katalog tetap dipertahankan otomatis.
               </p>
             </div>
 
@@ -1425,6 +1584,214 @@ export default function ProductCatalog({
                   <>
                     <Check className="w-4 h-4" />
                     <span>Konfirmasi Import ({parsedImportRows.filter(r => r.status !== 'INVALID').length} SKU)</span>
+                  </>
+                )}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* CROSS-BRANCH CATALOG SYNC MODAL */}
+      {isCrossBranchModalOpen && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/75 backdrop-blur-sm p-4 overflow-y-auto">
+          <div className="w-full max-w-3xl bg-[#11141B] rounded-2xl border border-slate-800 shadow-2xl overflow-hidden my-8 relative">
+            <button
+              onClick={() => setIsCrossBranchModalOpen(false)}
+              className="absolute top-4 right-4 p-1.5 text-slate-400 hover:text-white hover:bg-slate-800 rounded-xl transition-colors cursor-pointer z-10"
+            >
+              <X className="w-4.5 h-4.5" />
+            </button>
+
+            <div className="p-5 border-b border-slate-850 bg-slate-900/40">
+              <div className="flex items-center gap-2.5">
+                <Building2 className="w-5 h-5 text-sky-400" />
+                <h2 className="text-base font-black text-slate-100 tracking-tight">
+                  Sinkronisasi Nama Barang Lintas Cabang
+                </h2>
+              </div>
+              <p className="text-xs text-slate-400 mt-1">
+                Salin nama produk asli dari katalog cabang lain ke cabang <span className="font-mono font-bold text-sky-300">{getActiveBranch()}</span>. Ukuran Qty CTN &amp; Inner yang sudah ada di cabang ini tetap dipertahankan.
+              </p>
+            </div>
+
+            <div className="p-5 space-y-4 max-h-[70vh] overflow-y-auto">
+              {accessibleBranches.length === 0 && !isLoadingCrossBranch ? (
+                <div className="bg-amber-500/10 border border-amber-500/30 rounded-xl p-4 text-xs text-amber-200 space-y-1.5">
+                  <div className="font-bold text-amber-300">Akun ini belum memiliki akses baca ke cabang lain</div>
+                  <p className="text-amber-200/80">
+                    Anda tetap dapat melengkapi nama barang menggunakan tombol <span className="font-bold">Import Excel</span> (mendukung file export Mabang ERP) atau <span className="font-bold">Sync Katalog ↔ Stok</span>.
+                  </p>
+                </div>
+              ) : (
+                <>
+                  {/* Source branch selector & options */}
+                  <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                    <div className="bg-[#161B25] border border-slate-800 rounded-xl p-3 space-y-1.5">
+                      <label className="block text-[10px] font-bold text-slate-400 uppercase font-mono">
+                        Cabang Sumber Nama Barang
+                      </label>
+                      <select
+                        value={selectedSourceBranch}
+                        onChange={(e) => loadSourceBranchCatalog(e.target.value)}
+                        disabled={isLoadingCrossBranch || isApplyingCrossBranch}
+                        className="w-full px-3 py-2 text-xs bg-[#0A0C10] border border-slate-700 rounded-lg text-slate-200 focus:outline-none focus:ring-1 focus:ring-sky-500"
+                      >
+                        {accessibleBranches.map(b => (
+                          <option key={b.id} value={b.id}>
+                            {b.id} — {b.name}
+                          </option>
+                        ))}
+                      </select>
+                    </div>
+
+                    <div className="bg-[#161B25] border border-slate-800 rounded-xl p-3 space-y-2">
+                      <label className="block text-[10px] font-bold text-slate-400 uppercase font-mono">
+                        Mode Penyalinan Nama
+                      </label>
+                      <div className="space-y-1.5 text-xs">
+                        <label className="flex items-center gap-2 cursor-pointer text-slate-200">
+                          <input
+                            type="radio"
+                            name="crossBranchSyncMode"
+                            checked={crossBranchMode === 'fill_placeholders'}
+                            onChange={() => setCrossBranchMode('fill_placeholders')}
+                            className="accent-sky-500"
+                          />
+                          <span>Isi hanya nama default (&lt;SKU&gt; Product) — Aman</span>
+                        </label>
+                        <label className="flex items-center gap-2 cursor-pointer text-slate-300">
+                          <input
+                            type="radio"
+                            name="crossBranchSyncMode"
+                            checked={crossBranchMode === 'overwrite_all'}
+                            onChange={() => setCrossBranchMode('overwrite_all')}
+                            className="accent-amber-500"
+                          />
+                          <span>Timpa semua nama SKU yang berbeda</span>
+                        </label>
+                      </div>
+                    </div>
+                  </div>
+
+                  <label className="flex items-center gap-2 text-xs text-slate-300 bg-[#161B25] border border-slate-800 rounded-xl px-3.5 py-2.5 cursor-pointer">
+                    <input
+                      type="checkbox"
+                      checked={crossBranchIncludeNew}
+                      onChange={(e) => setCrossBranchIncludeNew(e.target.checked)}
+                      className="accent-sky-500 rounded"
+                    />
+                    <span>Sertakan juga SKU baru dari cabang <span className="font-mono font-bold text-sky-300">{selectedSourceBranch || '-'}</span> yang belum terdaftar di cabang ini</span>
+                  </label>
+
+                  {isLoadingCrossBranch && (
+                    <div className="flex items-center justify-center gap-2 py-8 text-xs text-slate-400">
+                      <RefreshCw className="w-4 h-4 animate-spin text-sky-400" />
+                      <span>Memuat katalog cabang {selectedSourceBranch}...</span>
+                    </div>
+                  )}
+
+                  {!isLoadingCrossBranch && crossBranchError && (
+                    <div className="bg-rose-500/10 border border-rose-500/30 rounded-xl p-3.5 text-xs text-rose-300">
+                      {crossBranchError}
+                    </div>
+                  )}
+
+                  {!isLoadingCrossBranch && !crossBranchError && crossBranchPlan && (
+                    <div className="space-y-3">
+                      <div className="flex flex-wrap items-center justify-between gap-2 text-xs">
+                        <div className="flex items-center gap-3 font-mono">
+                          <span className="text-sky-400 font-bold">
+                            {crossBranchPlan.itemsToImport.length} SKU akan diperbarui
+                          </span>
+                          <span className="text-slate-400">
+                            {crossBranchPlan.unchangedCount} sudah selaras/dilewati
+                          </span>
+                        </div>
+                        {crossBranchPlan.skippedPlaceholderSourceCount > 0 && (
+                          <span className="text-[11px] text-amber-300">
+                            {crossBranchPlan.skippedPlaceholderSourceCount} SKU sumber bernama default dilewati
+                          </span>
+                        )}
+                      </div>
+
+                      {crossBranchPlan.previewRows.length === 0 ? (
+                        <div className="bg-[#161B25] border border-slate-800 rounded-xl p-4 text-xs text-slate-400 text-center">
+                          Tidak ada perbedaan nama yang perlu disalin dari cabang {selectedSourceBranch}.
+                        </div>
+                      ) : (
+                        <div className="max-h-60 overflow-y-auto border border-slate-800 rounded-xl bg-[#161B25]">
+                          <table className="w-full text-left text-xs">
+                            <thead className="bg-slate-900/90 text-[10px] font-bold text-slate-400 uppercase sticky top-0">
+                              <tr>
+                                <th className="p-2.5">SKU ID</th>
+                                <th className="p-2.5">Nama Saat Ini ({getActiveBranch()})</th>
+                                <th className="p-2.5">Nama Baru ({selectedSourceBranch})</th>
+                                <th className="p-2.5 text-center">Aksi</th>
+                              </tr>
+                            </thead>
+                            <tbody className="divide-y divide-slate-800/60">
+                              {crossBranchPlan.previewRows.slice(0, 60).map((row) => (
+                                <tr key={row.skuId} className="hover:bg-slate-800/30">
+                                  <td className="p-2 font-mono font-bold text-indigo-400">{row.skuId}</td>
+                                  <td className="p-2 text-slate-400">{row.currentName}</td>
+                                  <td className="p-2 text-emerald-300 font-semibold">{row.nextName}</td>
+                                  <td className="p-2 text-center">
+                                    <span className={`text-[9px] font-extrabold px-2 py-0.5 rounded-full border ${
+                                      row.action === 'UPDATE_PLACEHOLDER'
+                                        ? 'bg-sky-500/15 text-sky-300 border-sky-500/30'
+                                        : row.action === 'NEW'
+                                          ? 'bg-emerald-500/15 text-emerald-300 border-emerald-500/30'
+                                          : 'bg-amber-500/15 text-amber-300 border-amber-500/30'
+                                    }`}>
+                                      {row.action === 'UPDATE_PLACEHOLDER' ? 'ISI DEFAULT' : row.action === 'NEW' ? '+ BARU' : 'TIMPA'}
+                                    </span>
+                                  </td>
+                                </tr>
+                              ))}
+                            </tbody>
+                          </table>
+                          {crossBranchPlan.previewRows.length > 60 && (
+                            <div className="p-2 text-center text-[11px] text-slate-400 border-t border-slate-800">
+                              Menampilkan 60 dari {crossBranchPlan.previewRows.length} perubahan...
+                            </div>
+                          )}
+                        </div>
+                      )}
+                    </div>
+                  )}
+                </>
+              )}
+            </div>
+
+            <div className="p-4 border-t border-slate-850 bg-slate-900/40 flex items-center justify-end gap-2.5">
+              <button
+                type="button"
+                onClick={() => setIsCrossBranchModalOpen(false)}
+                className="px-4 py-2 text-xs font-bold text-slate-300 hover:text-white bg-slate-800 hover:bg-slate-700 rounded-xl transition-colors cursor-pointer"
+              >
+                Tutup
+              </button>
+              <button
+                type="button"
+                disabled={
+                  isLoadingCrossBranch ||
+                  isApplyingCrossBranch ||
+                  !crossBranchPlan ||
+                  crossBranchPlan.itemsToImport.length === 0
+                }
+                onClick={handleApplyCrossBranchSync}
+                className="px-5 py-2 bg-sky-500 hover:bg-sky-600 disabled:opacity-50 disabled:cursor-not-allowed active:scale-95 text-xs font-bold text-white rounded-xl transition-all cursor-pointer shadow-lg shadow-sky-500/15 flex items-center gap-2"
+              >
+                {isApplyingCrossBranch ? (
+                  <>
+                    <RefreshCw className="w-3.5 h-3.5 animate-spin" />
+                    <span>Menyimpan &amp; Sinkron Stok...</span>
+                  </>
+                ) : (
+                  <>
+                    <Check className="w-3.5 h-3.5" />
+                    <span>Terapkan Sinkronisasi ({crossBranchPlan?.itemsToImport.length || 0} SKU)</span>
                   </>
                 )}
               </button>

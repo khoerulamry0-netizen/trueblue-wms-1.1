@@ -1,6 +1,7 @@
-import React, { Component, ReactNode, StrictMode } from 'react';
+import React, { Component, ReactNode, StrictMode, Suspense } from 'react';
 import { createRoot } from 'react-dom/client';
 import App from './App.tsx';
+import { LanguageProvider } from './i18n/LanguageContext';
 import './index.css';
 
 interface ErrorBoundaryProps {
@@ -32,7 +33,13 @@ class ErrorBoundary extends Component<ErrorBoundaryProps, ErrorBoundaryState> {
 
   handleResetAndReload = () => {
     try {
-      localStorage.clear();
+      // Only remove transient UI/auth cache keys; preserve active sorting/packing/DCC recovery tasks
+      const transientKeys = [
+        'blues_google_access_token',
+        'blues_google_user_email',
+        'wms_last_packed_receipt'
+      ];
+      transientKeys.forEach(key => localStorage.removeItem(key));
       sessionStorage.clear();
     } catch (e) {
       // ignore
@@ -78,7 +85,11 @@ class ErrorBoundary extends Component<ErrorBoundaryProps, ErrorBoundaryState> {
 createRoot(document.getElementById('root')!).render(
   <StrictMode>
     <ErrorBoundary>
-      <App />
+      <LanguageProvider>
+        <Suspense fallback={<div className="min-h-screen bg-[#0A0C10] text-emerald-400 flex items-center justify-center text-sm font-semibold">Memuat modul WMS...</div>}>
+          <App />
+        </Suspense>
+      </LanguageProvider>
     </ErrorBoundary>
   </StrictMode>,
 );

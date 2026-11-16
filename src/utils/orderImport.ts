@@ -2,7 +2,27 @@
 import type { StockItem, OutboundItem } from '../types';
 import { getAvailableStockPool, getExpiredStatus, isZoneOrUrbanLocation, normalizeDateToDmy, isNoExpiryDate } from './calculations';
 export type ImportLine = { row:number; orderNumber:string; skuId:string; qty:number; customerName:string; customerAddress:string; customerPhone:string; noPo:string; batchNumber:string; errors:string[] };
-const aliases:Record<string,string> = { noorder:'orderNumber', nomororder:'orderNumber', ordernumber:'orderNumber', orderid:'orderNumber', sku:'skuId', skuid:'skuId', kodebarang:'skuId', qty:'qty', jumlah:'qty', qtypcs:'qty', customer:'customerName', pelanggan:'customerName', namapelanggan:'customerName', customername:'customerName', alamat:'customerAddress', alamatpelanggan:'customerAddress', alamatpenerima:'customerAddress', customeraddress:'customerAddress', address:'customerAddress', teleponpelanggan:'customerPhone', telepon:'customerPhone', nomortelepon:'customerPhone', nohp:'customerPhone', hp:'customerPhone', customerphone:'customerPhone', phone:'customerPhone', nopo:'noPo', nomorpo:'noPo', po:'noPo', batch:'batchNumber', nomorbatch:'batchNumber', batchnumber:'batchNumber' };
+export const ORDER_IMPORT_TEMPLATE_HEADERS = [
+  'No Order',
+  'SKU',
+  'Qty (pcs)',
+  'Pelanggan',
+  'Alamat Pelanggan',
+  'Telepon Pelanggan',
+  'Batch Number',
+  'No PO',
+] as const;
+export const ORDER_IMPORT_TEMPLATE_COL_WIDTHS = [
+  { wch: 25 },
+  { wch: 22 },
+  { wch: 14 },
+  { wch: 28 },
+  { wch: 60 },
+  { wch: 24 },
+  { wch: 22 },
+  { wch: 22 },
+] as const;
+const aliases:Record<string,string> = { noorder:'orderNumber', nomororder:'orderNumber', ordernumber:'orderNumber', orderid:'orderNumber', sku:'skuId', skuid:'skuId', kodebarang:'skuId', qty:'qty', jumlah:'qty', qtypcs:'qty', customer:'customerName', pelanggan:'customerName', namapelanggan:'customerName', customername:'customerName', alamat:'customerAddress', alamatpelanggan:'customerAddress', alamatpenerima:'customerAddress', customeraddress:'customerAddress', address:'customerAddress', teleponpelanggan:'customerPhone', telepon:'customerPhone', nomortelepon:'customerPhone', nohp:'customerPhone', hp:'customerPhone', customerphone:'customerPhone', phone:'customerPhone', nopo:'noPo', nomorpo:'noPo', po:'noPo', ponumber:'noPo', pono:'noPo', purchaseorder:'noPo', batch:'batchNumber', nomorbatch:'batchNumber', batchnumber:'batchNumber' };
 export function parseOrderTable(table:unknown[][]):ImportLine[] {
  if(table.length<2) throw new Error('File harus memiliki header dan minimal satu baris order.');
  const headers=table[0].map(v=>aliases[String(v??'').toLowerCase().replace(/[^a-z0-9]/g,'')]||'');

@@ -1,5 +1,5 @@
 import { localScopeKey } from '../utils/localScope';
-import React, { useState, useMemo, useEffect } from 'react';
+import React, { useState, useMemo, useEffect, useRef } from 'react';
 import * as XLSX from 'xlsx';
 import { StockItem, UserAccount } from '../types';
 import { formatNumber } from '../utils/calculations';
@@ -19,6 +19,7 @@ import {
   Building2,
   ArrowUpDown,
   Layers,
+  ChevronLeft,
   ChevronRight,
   Info,
   SlidersHorizontal,
@@ -63,6 +64,9 @@ export default function StockOpnamePerLocation({
   const [selectedZone, setSelectedZone] = useState<string>('ALL');
   const [selectedLocation, setSelectedLocation] = useState<string>('ALL');
   const [searchQuery, setSearchQuery] = useState<string>('');
+  const [currentPage, setCurrentPage] = useState<number>(1);
+  const [pageSize, setPageSize] = useState<number>(25);
+  const didMountRef = useRef<boolean>(false);
   const [statusFilter, setStatusFilter] = useState<'ALL' | 'UNCOUNTED' | 'MATCH' | 'DISCREPANCY'>('ALL');
   const [quickScanLocation, setQuickScanLocation] = useState<string>('');
 
@@ -166,22 +170,28 @@ export default function StockOpnamePerLocation({
 
   // Sync / update opnameRows whenever stock changes while preserving in-progress physical counts
   useEffect(() => {
+    if (!didMountRef.current) {
+      didMountRef.current = true;
+      return;
+    }
     if (stock.length > 0) {
       setOpnameRows(prev => buildOpnameRowsFromStock(stock, prev));
     }
   }, [stock]);
 
-  // Persist opnameRows to local storage (hanya simpan data yang valid dengan stok sistem > 0)
+  // Persist opnameRows to local storage (debounced 300ms to avoid blocking input typing)
   useEffect(() => {
-    try {
-      if (opnameRows.length > 0) {
+    if (opnameRows.length === 0) return;
+    const timer = setTimeout(() => {
+      try {
         const toSave = opnameRows.filter(r => r.systemQty > 0);
         localStorage.setItem(localScopeKey('wms_opname_per_location_rows_v2',currentUser,false), JSON.stringify(toSave));
+      } catch (e) {
+        console.warn('Failed to save opname rows to localStorage:', e);
       }
-    } catch (e) {
-      console.warn('Failed to save opname rows to localStorage:', e);
-    }
-  }, [opnameRows]);
+    }, 300);
+    return () => clearTimeout(timer);
+  }, [opnameRows, currentUser]);
 
   // 3. Extract unique Zones & Locations (Hanya dari item dengan stok sistem > 0)
   const { allZones, allLocations, locationStatsMap } = useMemo(() => {
@@ -344,6 +354,20 @@ export default function StockOpnamePerLocation({
       return true;
     });
   }, [opnameRows, selectedWarehouse, selectedZone, selectedLocation, statusFilter, searchQuery]);
+
+  // Reset pagination when filters or pageSize change
+  useEffect(() => {
+    setCurrentPage(1);
+  }, [selectedWarehouse, selectedZone, selectedLocation, statusFilter, searchQuery, pageSize]);
+
+  const effectivePageSize = pageSize <= 0 ? Math.max(1, filteredRows.length) : pageSize;
+  const totalPages = Math.max(1, Math.ceil(filteredRows.length / effectivePageSize));
+  const safePage = Math.min(currentPage, totalPages);
+  const paginatedRows = useMemo(() => {
+    if (pageSize <= 0) return filteredRows;
+    const start = (safePage - 1) * effectivePageSize;
+    return filteredRows.slice(start, start + effectivePageSize);
+  }, [filteredRows, safePage, effectivePageSize, pageSize]);
 
   // 6. Summary KPI Metrics (Hanya menghitung item dengan stok sistem > 0)
   const metrics = useMemo(() => {
@@ -963,8 +987,9 @@ export default function StockOpnamePerLocation({
                   </td>
                 </tr>
               ) : (
-                filteredRows.map((row, idx) => {
+                paginatedRows.map((row, idx) => {
                   const diff = row.physicalQty - row.systemQty;
+                  const rowNumber = (safePage - 1) * effectivePageSize + idx + 1;
                   return (
                     <tr
                       key={row.id}
@@ -976,7 +1001,7 @@ export default function StockOpnamePerLocation({
                           : ''
                       }`}
                     >
-                      <td className="py-3 px-3 text-center text-slate-500 font-mono">{idx + 1}</td>
+                      <td className="py-3 px-3 text-center text-slate-500 font-mono">{rowNumber}</td>
 
                       <td className="py-3 px-3 font-mono font-bold text-indigo-300">
                         <span className="px-2 py-0.5 bg-indigo-500/10 border border-indigo-500/20 rounded-md">
@@ -1128,6 +1153,61 @@ export default function StockOpnamePerLocation({
             </tbody>
           </table>
         </div>
+
+        {/* Pagination Footer */}
+        {filteredRows.length > 0 && (
+          <div className="px-4 py-3 border-t border-slate-800/80 bg-[#161B25]/70 flex flex-wrap items-center justify-between gap-3 text-xs text-slate-400">
+            <div className="flex items-center gap-3">
+              <span className="font-mono">
+                Menampilkan{' '}
+                <strong className="text-white">
+                  {(safePage - 1) * effectivePageSize + 1}–{Math.min(safePage * effectivePageSize, filteredRows.length)}
+                </strong>{' '}
+                dari <strong className="text-white">{filteredRows.length}</strong> baris
+              </span>
+              <div className="flex items-center gap-1.5">
+                <label htmlFor="opname-page-size" className="text-slate-500">Baris:</label>
+                <select
+                  id="opname-page-size"
+                  value={pageSize}
+                  onChange={e => setPageSize(Number(e.target.value))}
+                  className="bg-[#11141B] border border-slate-700/80 rounded-md px-2 py-1 text-xs text-slate-200 focus:outline-none focus:border-indigo-400"
+                >
+                  <option value={25}>25</option>
+                  <option value={50}>50</option>
+                  <option value={100}>100</option>
+                  <option value={0}>Semua</option>
+                </select>
+              </div>
+            </div>
+
+            {pageSize > 0 && totalPages > 1 && (
+              <div className="flex items-center gap-1.5">
+                <button
+                  type="button"
+                  onClick={() => setCurrentPage(p => Math.max(1, p - 1))}
+                  disabled={safePage <= 1}
+                  className="inline-flex items-center gap-1 px-2.5 py-1 rounded-md border border-slate-700/80 bg-[#11141B] text-slate-300 hover:bg-slate-800 disabled:opacity-40 disabled:cursor-not-allowed cursor-pointer transition-colors"
+                >
+                  <ChevronLeft className="w-3.5 h-3.5" />
+                  <span>Prev</span>
+                </button>
+                <span className="px-2 font-mono text-slate-300">
+                  Hal <strong className="text-white">{safePage}</strong> / {totalPages}
+                </span>
+                <button
+                  type="button"
+                  onClick={() => setCurrentPage(p => Math.min(totalPages, p + 1))}
+                  disabled={safePage >= totalPages}
+                  className="inline-flex items-center gap-1 px-2.5 py-1 rounded-md border border-slate-700/80 bg-[#11141B] text-slate-300 hover:bg-slate-800 disabled:opacity-40 disabled:cursor-not-allowed cursor-pointer transition-colors"
+                >
+                  <span>Next</span>
+                  <ChevronRight className="w-3.5 h-3.5" />
+                </button>
+              </div>
+            )}
+          </div>
+        )}
       </div>
     </div>
   );

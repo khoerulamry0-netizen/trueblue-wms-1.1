@@ -1,0 +1,33 @@
+name: WMS quality gate
+
+on:
+  push:
+    branches: [main, dev-wms]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: quality-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm run test:packing-server-static
+      - run: npm run test:isolated-pg-static
+      - run: npm run test:branch-deletion-safety
+      - run: npm run test:database-optimization
+      - run: node --test scripts/server-routing.test.mjs
+      - run: npm run build
+      - run: npm audit --omit=dev --audit-level=high

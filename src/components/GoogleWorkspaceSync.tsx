@@ -1,9 +1,9 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { db } from '../supabase';
-import { doc, writeBatch, setDoc } from '../supabase';
+import { db, doc, writeBatch, setDoc, getActiveBranch } from '../supabase';
 import { StockItem, CatalogItem, DccLog } from '../types';
 type GoogleProfile = { email?: string; displayName?: string };
 import { calculatePackQuantities, getExpiredStatus, getCanonicalStockId, normalizeDateToDmy } from '../utils/calculations';
+import { buildCatalogLookupMap, getCatalogItemName, normalizeSkuKey, resolvePreferredSkuName } from '../utils/catalogSync';
 import { 
   Cloud, 
   FileSpreadsheet, 
@@ -54,10 +54,15 @@ export default function GoogleWorkspaceSync({
   const [isLoadingFiles, setIsLoadingFiles] = useState(false);
   const [searchQuery, setSearchQuery] = useState('');
   
-  // Selection state
+  // Selection state scoped by branch and account
+  const spreadsheetStorageKey = `dcc_selected_spreadsheet_${getActiveBranch()}_${(currentUser?.username || 'default').toLowerCase()}`;
   const [selectedSpreadsheet, setSelectedSpreadsheet] = useState<{ id: string; name: string } | null>(() => {
-    const cached = localStorage.getItem('dcc_selected_spreadsheet');
-    return cached ? JSON.parse(cached) : null;
+    try {
+      const cached = localStorage.getItem(spreadsheetStorageKey);
+      return cached ? JSON.parse(cached) : null;
+    } catch {
+      return null;
+    }
   });
   const [manualSheetId, setManualSheetId] = useState('');
 
@@ -86,14 +91,16 @@ export default function GoogleWorkspaceSync({
     }
   }, [accessToken]);
 
-  // Save selected spreadsheet
+  // Save selected spreadsheet scoped to branch and user
   useEffect(() => {
-    if (selectedSpreadsheet) {
-      localStorage.setItem('dcc_selected_spreadsheet', JSON.stringify(selectedSpreadsheet));
-    } else {
-      localStorage.removeItem('dcc_selected_spreadsheet');
-    }
-  }, [selectedSpreadsheet]);
+    try {
+      if (selectedSpreadsheet) {
+        localStorage.setItem(spreadsheetStorageKey, JSON.stringify(selectedSpreadsheet));
+      } else {
+        localStorage.removeItem(spreadsheetStorageKey);
+      }
+    } catch {}
+  }, [selectedSpreadsheet, spreadsheetStorageKey]);
 
   // Google Drive access is kept separate from WMS sign-in. Configure Google OAuth or paste a short-lived access token below.
   const handleConnectGoogle = async (_preferRedirect = false) => {
@@ -556,13 +563,19 @@ export default function GoogleWorkspaceSync({
 
       const importedItems: StockItem[] = [];
       const errorRows: string[] = [];
+      const catalogLookup = buildCatalogLookupMap(catalog);
 
       for (let i = 1; i < rows.length; i++) {
         const row = rows[i];
         if (!row || row.length === 0 || !row[idxSkuId]) continue; // skip blank rows
 
         const skuId = row[idxSkuId]?.trim();
-        const skuName = row[idxSkuName]?.trim() || 'Produk Baru';
+        const catMatch = catalogLookup.get(normalizeSkuKey(skuId));
+        const rawSheetName = row[idxSkuName]?.trim();
+        const catalogName = getCatalogItemName(catMatch);
+        const skuName = (rawSheetName || catalogName)
+          ? resolvePreferredSkuName(skuId, rawSheetName, catalogName)
+          : 'Produk Baru';
         const expiredDate = row[idxExp]?.trim() || '-';
         const location = row[idxLoc]?.trim() || 'N/A';
         const qtyRaw = parseInt(row[idxQty], 10);
@@ -578,12 +591,9 @@ export default function GoogleWorkspaceSync({
         }
 
         // Try to autofill packaging size from current catalog if zero
-        if (qtyCtnSize === 0 || qtyInnerSize === 0) {
-          const catMatch = catalog.find(c => c.skuId.toLowerCase() === skuId.toLowerCase());
-          if (catMatch) {
-            if (qtyCtnSize === 0) qtyCtnSize = catMatch.qtyCtnSize;
-            if (qtyInnerSize === 0) qtyInnerSize = catMatch.qtyInnerSize;
-          }
+        if ((qtyCtnSize === 0 || qtyInnerSize === 0) && catMatch) {
+          if (qtyCtnSize === 0) qtyCtnSize = catMatch.qtyCtnSize;
+          if (qtyInnerSize === 0) qtyInnerSize = catMatch.qtyInnerSize;
         }
 
         if (isNaN(qtyRaw) || qtyRaw < 0) {

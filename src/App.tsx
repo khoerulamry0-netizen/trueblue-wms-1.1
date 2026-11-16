@@ -3,7 +3,6 @@ import {prepareSortingUpdates,type SortingTask} from './utils/orderSorting';
 import { scanServerUnavailable, serverScanValidationAvailable } from './utils/packingValidation';
 import {prepareOrderSessionUpdates,type OrderSessionData,type OrderSessionResult} from './utils/orderSession';
 import {getStockStatus,updateMovementSales} from './utils/calculations';
-import WarehouseOverview from './components/WarehouseOverview';
 import AppShell from './components/AppShell';
 import {prepareOutboundCreation,prepareOrderEdits} from './utils/outboundTransactions';
 import {prepareOrderCompletion,type OrderCompletion} from './utils/orderCompletion';
@@ -13,35 +12,17 @@ import { setActiveBranch, getActiveBranch, DEV_BASELINE_SORTING } from './supaba
 import { loginEmail, displayAccountId } from './accountId';
 import { applyUiTheme, nextUiTheme, readUiTheme, UI_THEME_KEY, type UiTheme } from './utils/uiTheme';
 import React, { useState, useEffect, useLayoutEffect, useMemo, useRef } from 'react';
-import { StockItem, OutboundItem, DccLog, UserAccount, PhysicalAuditItem, CatalogItem, ReturnItem, BatchRecord, Warehouse, InterWarehouseTransfer } from './types';
-import SubWarehouseManager from './components/SubWarehouseManager';
-import { collection, onSnapshot, doc, setDoc, deleteDoc, writeBatch, getDocs, handleSupabaseError, OperationType, type QuerySnapshot } from './supabase';
+import { StockItem, OutboundItem, DccLog, UserAccount, PhysicalAuditItem, CatalogItem, ReturnItem, BatchRecord, Warehouse, InterWarehouseTransfer, BranchOperationType, ChannelOperationType } from './types';
+import { collection, onSnapshot, doc, setDoc, deleteDoc, writeBatch, getDocs, handleSupabaseError, OperationType, processReturnQc, fetchAccessibleBranches, fetchBranchCatalog, fetchBranchOperationType, type QuerySnapshot } from './supabase';
 import { supabase, isSupabaseConfigured } from './supabase';
+import { branchSupportsOperation } from './utils/orderType';
+import { UnassignedOrdersBanner } from './components/UnassignedOrdersBanner';
+import type { ShippingManifest } from './components/CourierManifestManager';
+import type { MabangScreen } from './components/MabangWmsOutbound';
 import { calculatePackQuantities, getExpiredStatus, formatNumber, getProductPackSizes, deduplicateAndMergeStock, updateDynamicCatalogRegistry, normalizeDateToDmy, getCanonicalStockId, findStockIndex, isZoneOrUrbanLocation, getLockedStockSummary, isNoExpiryDate } from './utils/calculations';
-import { BARCODE_MAP, getBarcodeForSku, updateDynamicBarcodeRegistry, getProductBrand } from './data/barcodeMap';
+import { buildCatalogLookupMap, getCatalogItemName, isPlaceholderSkuName, normalizeSkuKey, planCatalogStockBidirectionalSync, resolvePreferredSkuName } from './utils/catalogSync';
+import { BARCODE_MAP, findSkuId, getBarcodeForSku, updateDynamicBarcodeRegistry, getProductBrand } from './data/barcodeMap';
 import { ensureCentralWarehouse, DEFAULT_CENTRAL_WAREHOUSE } from './utils/warehouseRouting';
-import Dashboard from './components/Dashboard';
-import InventoryList from './components/InventoryList';
-import BulkOutbound from './components/BulkOutbound';
-import BatchDashboard from './components/BatchDashboard';
-import AnalyticsDashboard from './components/AnalyticsDashboard';
-import BasketLabelGeneratorModal from './components/BasketLabelGeneratorModal';
-import MabangWmsOutbound from './components/MabangWmsOutbound';
-import OutboundManager from './components/OutboundManager';
-import CekFisik from './components/CekFisik';
-import LocationTransferManager from './components/LocationTransferManager';
-import UserManagement from './components/UserManagement';
-import ProductCatalog from './components/ProductCatalog';
-import GoogleWorkspaceSync from './components/GoogleWorkspaceSync';
-import ReturnManager from './components/ReturnManager';
-import InboundManager from './components/InboundManager';
-import CrossDevice from './components/CrossDevice';
-import WarehouseMap from './components/WarehouseMap';
-import StockOpnamePerLocation from './components/StockOpnamePerLocation';
-import ThermalLabelPrinter from './components/ThermalLabelPrinter';
-import MarketplaceWebhook from './components/MarketplaceWebhook';
-
-import AuditTrail from './components/AuditTrail';
 import { 
   LayoutDashboard, 
   Package, 
@@ -84,19 +65,80 @@ import {
   Boxes,
   ShoppingCart,
   Store,
-  ShoppingBag
+  ShoppingBag,
+  Globe
 } from 'lucide-react';
+import { useLanguage } from './i18n/LanguageContext';
 import { motion, AnimatePresence } from 'motion/react';
 import { db } from './supabase';
 import { normalizeStockBatch } from './utils/stockNormalization';
 import { initialStockSyncState, stockSyncFailed, stockSyncStarted, stockSyncSucceeded, type StockSyncState } from './utils/stockSyncSafety';
 import { StaleReadError } from './utils/readRequestSafety';
 
+// Operational screens are loaded only when opened. This keeps the login and
+// dashboard shell small without changing transaction or permission logic.
+const WarehouseOverview = React.lazy(() => import('./components/WarehouseOverview'));
+const SubWarehouseManager = React.lazy(() => import('./components/SubWarehouseManager'));
+const Dashboard = React.lazy(() => import('./components/Dashboard'));
+const InventoryList = React.lazy(() => import('./components/InventoryList'));
+const BulkOutbound = React.lazy(() => import('./components/BulkOutbound'));
+const BatchDashboard = React.lazy(() => import('./components/BatchDashboard'));
+const AnalyticsDashboard = React.lazy(() => import('./components/AnalyticsDashboard'));
+const BasketLabelGeneratorModal = React.lazy(() => import('./components/BasketLabelGeneratorModal'));
+const MabangWmsOutbound = React.lazy(() => import('./components/MabangWmsOutbound'));
+const OutboundManager = React.lazy(() => import('./components/OutboundManager'));
+const CekFisik = React.lazy(() => import('./components/CekFisik'));
+const LocationTransferManager = React.lazy(() => import('./components/LocationTransferManager'));
+const UserManagement = React.lazy(() => import('./components/UserManagement'));
+const ProductCatalog = React.lazy(() => import('./components/ProductCatalog'));
+const GoogleWorkspaceSync = React.lazy(() => import('./components/GoogleWorkspaceSync'));
+const ReturnManager = React.lazy(() => import('./components/ReturnManager'));
+const InboundManager = React.lazy(() => import('./components/InboundManager'));
+const CrossDevice = React.lazy(() => import('./components/CrossDevice'));
+const WarehouseMap = React.lazy(() => import('./components/WarehouseMap'));
+const StockOpnamePerLocation = React.lazy(() => import('./components/StockOpnamePerLocation'));
+const ThermalLabelPrinter = React.lazy(() => import('./components/ThermalLabelPrinter'));
+const AuditTrail = React.lazy(() => import('./components/AuditTrail'));
+const InventoryReconciliation = React.lazy(() => import('./components/InventoryReconciliation'));
+const PickerHub = React.lazy(() => import('./components/PickerHub'));
+const CourierManifestManager = React.lazy(() => import('./components/CourierManifestManager'));
+const MarketplaceWebhook = React.lazy(() => import('./components/MarketplaceWebhook'));
+
 export default function App() {
+  const { t, language, setLanguage } = useLanguage();
   const [loading, setLoading] = useState(true);
   const [theme, setTheme] = useState<UiTheme>(readUiTheme);
   const [dbStatus, setDbStatus] = useState<'connected' | 'offline'>('offline');
   const [stockSyncState, setStockSyncState] = useState<StockSyncState>(initialStockSyncState);
+  const [updateAvailable, setUpdateAvailable] = useState(false);
+
+  // Render publishes hashed JS bundles, but an already-open tab can keep the
+  // old application in memory. Check index.html periodically and offer a
+  // normal reload when a newer bundle is deployed; no hard refresh is needed.
+  useEffect(() => {
+    if (import.meta.env.DEV) return;
+    let active = true;
+    const checkForUpdate = async () => {
+      try {
+        const response = await fetch(`/index.html?wms-version=${Date.now()}`, {
+          cache: 'no-store',
+          headers: { 'Cache-Control': 'no-cache' }
+        });
+        if (!response.ok) return;
+        const html = await response.text();
+        const match = html.match(/<script[^>]+type=["']module["'][^>]+src=["']([^"']+)["']/i);
+        const current = document.querySelector<HTMLScriptElement>('script[type="module"]')?.getAttribute('src');
+        if (active && match?.[1] && current && new URL(match[1], location.href).pathname !== new URL(current, location.href).pathname) {
+          setUpdateAvailable(true);
+        }
+      } catch {
+        // A temporary network failure must not interrupt warehouse work.
+      }
+    };
+    void checkForUpdate();
+    const timer = window.setInterval(checkForUpdate, 5 * 60 * 1000);
+    return () => { active = false; window.clearInterval(timer); };
+  }, []);
   
   // A visual preference belongs to this device, independently of branch and account.
   useLayoutEffect(() => { applyUiTheme(theme); }, [theme]);
@@ -131,10 +173,11 @@ export default function App() {
   );
 
   const saveWarehousesState = async (updated: Warehouse[]) => {
+    const oldWarehouses = [...warehousesRef.current];
     setWarehouses(updated);
     broadcastUpdate('SYNC_WAREHOUSES', updated);
-        try {
-      const oldMap = new Map<string, Warehouse>(warehousesRef.current.map(w => [w.id, w]));
+    try {
+      const oldMap = new Map<string, Warehouse>(oldWarehouses.map(w => [w.id, w]));
       const newMap = new Map<string, Warehouse>(updated.map(w => [w.id, w]));
       const batchOp = writeBatch(db);
 
@@ -154,15 +197,17 @@ export default function App() {
       await batchOp.commit();
     } catch (e) {
       console.warn('Gagal sync warehouses ke cloud: ', e);
+      setSyncTrigger(value => value + 1);
       handleSupabaseError(e, OperationType.WRITE, 'warehouses');
     }
   };
 
   const saveTransfersState = async (updated: InterWarehouseTransfer[]) => {
+    const oldTransfers = [...transfersRef.current];
     setTransfers(updated);
     broadcastUpdate('SYNC_TRANSFERS', updated);
-        try {
-      const oldMap = new Map<string, InterWarehouseTransfer>(transfersRef.current.map(t => [t.id, t]));
+    try {
+      const oldMap = new Map<string, InterWarehouseTransfer>(oldTransfers.map(t => [t.id, t]));
       const newMap = new Map<string, InterWarehouseTransfer>(updated.map(t => [t.id, t]));
       const batchOp = writeBatch(db);
 
@@ -182,16 +227,18 @@ export default function App() {
       await batchOp.commit();
     } catch (e) {
       console.warn('Gagal sync warehouse_transfers ke cloud: ', e);
+      setSyncTrigger(value => value + 1);
       handleSupabaseError(e, OperationType.WRITE, 'warehouse_transfers');
     }
   };
 
   // Sync Batches to Supabase (Shipping Status & Central WMS Stock Deduction)
   const saveBatchesState = async (updatedBatches: BatchRecord[]) => {
+    const oldBatches = [...batchesRef.current];
     setBatches(updatedBatches);
     broadcastUpdate('SYNC_BATCHES', updatedBatches);
-        try {
-      const oldMap = new Map<string, BatchRecord>(batchesRef.current.map(b => [b.id, b]));
+    try {
+      const oldMap = new Map<string, BatchRecord>(oldBatches.map(b => [b.id, b]));
       const newMap = new Map<string, BatchRecord>(updatedBatches.map(b => [b.id, b]));
       const batchOp = writeBatch(db);
 
@@ -211,15 +258,17 @@ export default function App() {
       await batchOp.commit();
     } catch (e) {
       console.warn('Gagal sync batches ke cloud: ', e);
+      setSyncTrigger(value => value + 1);
       handleSupabaseError(e, OperationType.WRITE, 'batches');
     }
   };
 
   // Sync Return History to Supabase
   const saveReturnHistoryState = async (updatedReturnHistory: ReturnItem[]) => {
+    const oldReturns = [...returnHistoryRef.current];
     setReturnHistory(updatedReturnHistory);
-        try {
-      const oldMap = new Map<string, ReturnItem>(returnHistoryRef.current.map(item => [item.id, item]));
+    try {
+      const oldMap = new Map<string, ReturnItem>(oldReturns.map(item => [item.id, item]));
       const newMap = new Map<string, ReturnItem>(updatedReturnHistory.map(item => [item.id, item]));
       const batch = writeBatch(db);
 
@@ -239,7 +288,19 @@ export default function App() {
       await batch.commit();
     } catch (e) {
       console.warn('Gagal sync return history ke cloud: ', e);
+      setSyncTrigger(value => value + 1);
       handleSupabaseError(e, OperationType.WRITE, 'returns');
+    }
+  };
+
+  const handleProcessReturnQc = async (caseId:string,decision:'ACCEPT'|'QUARANTINE'|'REJECT',notes:string):Promise<boolean> => {
+    try {
+      await processReturnQc(getActiveBranch(),caseId,decision,notes);
+      setSyncTrigger(value=>value+1);
+      return true;
+    } catch (error:any) {
+      alert(error?.message || 'Keputusan QC return gagal disimpan. Muat ulang data lalu coba lagi.');
+      return false;
     }
   };
 
@@ -358,15 +419,20 @@ export default function App() {
   }, [orderHistory]);
 
   // Subscribe to the shared Supabase database after authentication.
+  const [isLoggedIn, setIsLoggedIn] = useState(false);
+  const [currentUser, setCurrentUser] = useState<UserAccount | null>(null);
   useEffect(() => {
     stockForcePushSnapshotRef.current = null;
     let active = true;
     let readyCount = 0;
+    const lightweightOperator = currentUser?.role === 'Packer' || currentUser?.role === 'Picker';
+    const isShippingOnly = currentUser?.role === 'Shipping';
+    const expectedSubscriptions = isShippingOnly ? 2 : lightweightOperator ? 5 : 10;
     let loadingTimer: ReturnType<typeof setTimeout> | undefined;
     const unsubscribers: Array<() => void> = [];
     const markReady = () => {
       readyCount += 1;
-      if (readyCount >= 10) setLoading(false);
+      if (readyCount >= expectedSubscriptions) setLoading(false);
     };
 
     if (!isSupabaseConfigured || !supabase) {
@@ -389,6 +455,9 @@ export default function App() {
 
       let stockForcePushSnapshotCandidate: StockForcePushSnapshot<StockItem> | null = null;
       const subscribedBranchId = getActiveBranch();
+      void fetchBranchOperationType(subscribedBranchId).then((op) => {
+        if (active) setBranchOperationType(op);
+      });
       const subscribe = <T,>(
         name: string,
         setter: (items: T[]) => void,
@@ -457,51 +526,62 @@ export default function App() {
         unsubscribers.push(unsubscribe);
       };
 
-      subscribe<UserAccount>('users', setUsers, (rows) => rows.map((row) => {
-        const profile = row as UserAccount;
-        return { ...profile, username: displayAccountId(profile.email || profile.username), fullName: profile.fullName || profile.email || '' };
-      }));
-      subscribe<StockItem>('stock', setStock, (rows) => normalizeStockBatch(rows.filter((row) => !(
-        typeof row === 'object'
-        && row !== null
-        && 'id' in row
-        && typeof row.id === 'string'
-        && row.id.startsWith('SYSTEM_')
-      ))), undefined, (items, snapshot) => {
-        const revisions = new Map<string, number>();
-        for (const entry of snapshot.docs) {
-          const revision = entry.data().__wms_revision;
-          if (!Number.isSafeInteger(revision) || typeof revision !== 'number' || revision < 0) {
-            throw new Error(`Revision snapshot stok tidak valid untuk dokumen ${entry.id}.`);
+      if (!isShippingOnly) {
+        subscribe<UserAccount>('users', setUsers, (rows) => rows.map((row) => {
+          const profile = row as UserAccount;
+          const cleanFullName = (profile.fullName || profile.email || '').replace(/\s*\[SHIPPING\]/gi, '').trim();
+          return { 
+            ...profile, 
+            username: displayAccountId(profile.email || profile.username), 
+            fullName: cleanFullName || profile.email || '' 
+          };
+        }));
+        subscribe<StockItem>('stock', setStock, (rows) => normalizeStockBatch(rows.filter((row) => !(
+          typeof row === 'object'
+          && row !== null
+          && 'id' in row
+          && typeof row.id === 'string'
+          && row.id.startsWith('SYSTEM_')
+        ))), undefined, (items, snapshot) => {
+          const revisions = new Map<string, number>();
+          for (const entry of snapshot.docs) {
+            const revision = entry.data().__wms_revision;
+            if (!Number.isSafeInteger(revision) || typeof revision !== 'number' || revision < 0) {
+              throw new Error(`Revision snapshot stok tidak valid untuk dokumen ${entry.id}.`);
+            }
+            revisions.set(entry.id, revision);
           }
-          revisions.set(entry.id, revision);
-        }
-        stockForcePushSnapshotCandidate = {
-          branchId: subscribedBranchId,
-          items,
-          revisions,
-          complete: true,
-          valid: true,
-          branchWide: true,
-          loadedAt: Date.now()
-        };
-      }, () => {
-        stockForcePushSnapshotRef.current = stockForcePushSnapshotCandidate;
-      });
-      subscribe<DccLog>('logs', setLogs, undefined, (items) => items.sort((a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime()));
+          stockForcePushSnapshotCandidate = {
+            branchId: subscribedBranchId,
+            items,
+            revisions,
+            complete: true,
+            valid: true,
+            branchWide: true,
+            loadedAt: Date.now()
+          };
+        }, () => {
+          stockForcePushSnapshotRef.current = stockForcePushSnapshotCandidate;
+        });
+      }
       subscribe<OutboundItem>('orders', rows=>{updateMovementSales(rows);setOrderHistory(rows)}, undefined, (items) => items.sort((a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime()));
-      subscribe<PhysicalAuditItem>('audits', setAudits, undefined, (items) => items.sort((a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime()));
-      subscribe<CatalogItem>('catalog', setCatalog);
-      subscribe<ReturnItem>('returns', setReturnHistory, undefined, (items) => items.sort((a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime()));
-      subscribe<BatchRecord>('batches', setBatches, undefined, (items) => items.sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime()));
+      if (!isShippingOnly) {
+        subscribe<CatalogItem>('catalog', setCatalog);
+      }
       subscribe<Warehouse>('warehouses', (items) => {
         const normalized = ensureCentralWarehouse(items);
         setWarehouses(normalized);
-        if (!items.some(w => w.isCentral || (w.id || '').toUpperCase() === 'WH-CENTRAL')) {
+        if (!isShippingOnly && !items.some(w => w.isCentral || (w.id || '').toUpperCase() === 'WH-CENTRAL')) {
           saveWarehousesState(normalized);
         }
       });
-      subscribe<InterWarehouseTransfer>('warehouse_transfers', setTransfers, undefined, (items) => items.sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime()));
+      if (!lightweightOperator && !isShippingOnly) {
+        subscribe<DccLog>('logs', setLogs, undefined, (items) => items.sort((a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime()));
+        subscribe<PhysicalAuditItem>('audits', setAudits, undefined, (items) => items.sort((a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime()));
+        subscribe<ReturnItem>('returns', setReturnHistory, undefined, (items) => items.sort((a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime()));
+        subscribe<BatchRecord>('batches', setBatches, undefined, (items) => items.sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime()));
+        subscribe<InterWarehouseTransfer>('warehouse_transfers', setTransfers, undefined, (items) => items.sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime()));
+      }
     }).catch((error) => {
       if (!active) return;
       console.warn('Supabase session lookup failed:', error);
@@ -515,7 +595,7 @@ export default function App() {
       if (loadingTimer) clearTimeout(loadingTimer);
       unsubscribers.forEach((unsubscribe) => unsubscribe());
     };
-  }, [syncTrigger]);
+  }, [syncTrigger, currentUser?.role]);
 
   // Sync helpers to Supabase
   const sanitizeStockDocForSupabase = (item: StockItem): StockItem => {
@@ -531,12 +611,16 @@ export default function App() {
     const ctnSize = catalogCtn || Math.max(1, Math.floor(Number(item.qtyCtnSize) || 720));
     const innerSize = catalogInner || Math.max(1, Math.floor(Number(item.qtyInnerSize) || 12));
     const splits = calculatePackQuantities(qty, ctnSize, innerSize);
+    const catalogMatch = catalogRef.current.find(c => normalizeSkuKey(c.skuId || c.sku) === cleanSku);
+    const resolvedSkuName = cleanSku === 'SYSTEM_EMPTY'
+      ? (item.skuName || 'System Empty')
+      : resolvePreferredSkuName(cleanSku, item.skuName, getCatalogItemName(catalogMatch));
 
     return {
       __wms_revision: item.__wms_revision,
       id: canonicalId,
       skuId: cleanSku,
-      skuName: (item.skuName || cleanSku).trim() || `${cleanSku} Product`,
+      skuName: resolvedSkuName,
       expiredDate: normEd,
       location: cleanLoc,
       warehouseId: item.warehouseId || 'WH-CENTRAL',
@@ -689,8 +773,9 @@ export default function App() {
           batch.delete(doc(db, 'logs', id));
         }
       }
-      batch.commit().catch(() => {});
+      await batch.commit();
     } catch (err) {
+      setSyncTrigger(value => value + 1);
       handleSupabaseError(err, OperationType.WRITE, 'logs');
     }
   };
@@ -713,14 +798,15 @@ export default function App() {
           batch.delete(doc(db, 'orders', id));
         }
       }
-      batch.commit().catch(() => {});
+      await batch.commit();
     } catch (err) {
+      setSyncTrigger(value => value + 1);
       handleSupabaseError(err, OperationType.WRITE, 'orders');
     }
   };
 
   const syncAuditsToSupabase = async (newAudits: PhysicalAuditItem[], oldAudits: PhysicalAuditItem[]) => {
-        try {
+    try {
       const oldMap = new Map(oldAudits.map(item => [item.id, item]));
       const newMap = new Map(newAudits.map(item => [item.id, item]));
 
@@ -737,26 +823,27 @@ export default function App() {
           batch.delete(doc(db, 'audits', id));
         }
       }
-      batch.commit().catch(() => {});
+      await batch.commit();
     } catch (err) {
+      setSyncTrigger(value => value + 1);
       handleSupabaseError(err, OperationType.WRITE, 'audits');
     }
   };
 
   const saveAuditsState = (updatedAudits: PhysicalAuditItem[]) => {
+    const oldAudits = [...auditsRef.current];
     setAudits(updatedAudits);
     broadcastUpdate('SYNC_AUDITS', updatedAudits);
-    syncAuditsToSupabase(updatedAudits, auditsRef.current);
+    void syncAuditsToSupabase(updatedAudits, oldAudits);
   };
 
   const saveCatalogState = (updatedCatalog: CatalogItem[]) => {
+    const oldCatalog = [...catalogRef.current];
     setCatalog(updatedCatalog);
     broadcastUpdate('SYNC_CATALOG', updatedCatalog);
-    syncCatalogToSupabase(updatedCatalog, catalogRef.current);
+    void syncCatalogToSupabase(updatedCatalog, oldCatalog);
   };
 
-  const [isLoggedIn, setIsLoggedIn] = useState(false);
-  const [currentUser, setCurrentUser] = useState<UserAccount | null>(null);
   const [emailInput, setEmailInput] = useState('');
   const [passwordInput, setPasswordInput] = useState('');
   const [loginError, setLoginError] = useState('');
@@ -789,11 +876,12 @@ export default function App() {
         setLoading(false);
         return;
       }
+      const cleanFullName = (data.full_name || data.email || '').replace(/\s*\[SHIPPING\]/gi, '').trim();
       const profile: UserAccount = {
         id: data.id,
         email: data.email,
         username: displayAccountId(data.email),
-        fullName: data.full_name || data.email,
+        fullName: cleanFullName || data.email,
         role: data.role,
         is_active: data.is_active,
         branch_id: data.branch_id
@@ -801,6 +889,8 @@ export default function App() {
       if (!["Administrator", "Viewer"].includes(data.role)) setActiveBranch(data.branch_id);
       const { data: allowed } = await supabase.from("branches").select("id").eq("id",getActiveBranch()).maybeSingle();
       if (!allowed) setActiveBranch(data.branch_id || "CENTER");
+      const branchOp = await fetchBranchOperationType(getActiveBranch());
+      setBranchOperationType(branchOp);
       setCurrentUser(profile);
       setIsLoggedIn(true);
       setLoginError('');
@@ -841,6 +931,11 @@ export default function App() {
 
   const handleLogout = async () => {
     if (supabase) await supabase.auth.signOut();
+    try {
+      (window as any).__googleAccessToken = null;
+      localStorage.removeItem('blues_google_access_token');
+      localStorage.removeItem('blues_google_user_email');
+    } catch {}
     setIsLoggedIn(false);
     setCurrentUser(null);
     setUsers([]);
@@ -859,26 +954,58 @@ export default function App() {
 
   const runAdminAction = async (body: Record<string, unknown>) => {
     if (!supabase) throw new Error('Supabase belum dikonfigurasi.');
-    const { data: rpcData, error: rpcError } = await supabase.rpc('admin_manage_user', { body });
-    if (!rpcError) {
-      if (rpcData && typeof rpcData === 'object' && 'error' in rpcData) {
-        throw new Error(String((rpcData as Record<string, unknown>).error));
-      }
-      return rpcData;
-    }
     const { data, error } = await supabase.functions.invoke('admin-users', { body });
-    if (error) throw new Error(error.message);
-    if (data?.error) throw new Error(String(data.error));
-    return data;
+    if (!error && !data?.error) return;
+
+    const { data: rpcData, error: rpcError } = await supabase.rpc('admin_manage_user', { body });
+    if (!rpcError && !(rpcData && typeof rpcData === 'object' && 'error' in rpcData && (rpcData as any).error)) {
+      return;
+    }
+
+    if (error) {
+      let detail = error.message;
+      try {
+        if ('context' in error && (error as any).context) {
+          const res = (error as any).context as Response;
+          const cloned = res.clone ? res.clone() : res;
+          const json = await cloned.json();
+          if (json?.error) detail = json.error;
+          else if (json?.message) detail = json.message;
+          else if (typeof json === 'string') detail = json;
+        }
+      } catch {
+        try {
+          const res = (error as any).context as Response;
+          const text = await res.text();
+          if (text) detail = text;
+        } catch {}
+      }
+      const rpcDetail = rpcData && typeof rpcData === 'object' && 'error' in rpcData ? String((rpcData as any).error) : rpcError?.message;
+      throw new Error(rpcDetail || detail);
+    }
+    if (data?.error) {
+      const rpcDetail = rpcData && typeof rpcData === 'object' && 'error' in rpcData ? String((rpcData as any).error) : rpcError?.message;
+      throw new Error(rpcDetail || String(data.error));
+    }
   };
 
   const handleAddUser = async (newUser: UserAccount) => {
+    const branchToUse = newUser.branch_id || getActiveBranch() || 'CENTER';
+    if (supabase) {
+      try {
+        await supabase.from('branches').upsert({ id: branchToUse, name: branchToUse }, { onConflict: 'id' });
+      } catch (err) {
+        console.warn('Pre-ensuring branch in branches table failed:', err);
+      }
+    }
+    const finalFullName = (newUser.fullName || newUser.username).trim();
+
     await runAdminAction({
       action: 'create',
       username: newUser.username,
       password: newUser.password,
-      branchId: newUser.branch_id || getActiveBranch(),
-      fullName: newUser.fullName,
+      branchId: branchToUse,
+      fullName: finalFullName,
       role: newUser.role
     });
   };
@@ -886,7 +1013,16 @@ export default function App() {
   const handleUpdateUser = async (email: string, fields: Partial<UserAccount>) => {
     const target = users.find((user) => (user.email || user.username).toLowerCase() === email.toLowerCase());
     if (!target?.id) throw new Error('Profil operator tidak ditemukan.');
-    await runAdminAction({ action: 'update', userId: target.id, fullName: fields.fullName, role: fields.role, branchId: fields.branch_id });
+    const finalFullName = fields.fullName !== undefined
+      ? fields.fullName.replace(/\s*\[SHIPPING\]/gi, '').trim()
+      : undefined;
+    await runAdminAction({ 
+      action: 'update', 
+      userId: target.id, 
+      fullName: finalFullName, 
+      role: fields.role, 
+      branchId: fields.branch_id 
+    });
   };
 
   const handleDeleteUser = async (email: string) => {
@@ -895,21 +1031,109 @@ export default function App() {
     await runAdminAction({ action: 'delete', userId: target.id });
   };
 
+  const applyCatalogLocalState = (nextCatalog: CatalogItem[]) => {
+    updateDynamicCatalogRegistry(nextCatalog);
+    updateDynamicBarcodeRegistry(nextCatalog);
+    catalogRef.current = nextCatalog;
+    setCatalog(nextCatalog);
+    broadcastUpdate('SYNC_CATALOG', nextCatalog);
+  };
+
+  const loadLatestStockForCatalogSync = async (): Promise<StockItem[]> => {
+    if (!isSupabaseConfigured || !supabase) return stockRef.current;
+    const stockSnapshot = await getDocs(collection(db, 'stock'));
+    const rawRecords = stockSnapshot.docs
+      .filter(entry => !entry.id.startsWith('SYSTEM_'))
+      .map(entry => entry.data());
+    return normalizeStockBatch(rawRecords);
+  };
+
+  const syncCatalogItemsToStock = async (
+    updatedCatalogItems: CatalogItem[],
+    fullNextCatalog: CatalogItem[]
+  ): Promise<{ syncedCount: number; errorMessage?: string }> => {
+    try {
+      updateDynamicCatalogRegistry(fullNextCatalog);
+      updateDynamicBarcodeRegistry(fullNextCatalog);
+
+      const latestStock = await loadLatestStockForCatalogSync();
+      const updatedMap = buildCatalogLookupMap(updatedCatalogItems);
+      const stockToUpdate: StockItem[] = [];
+
+      latestStock.forEach(s => {
+        const normSku = normalizeSkuKey(s.skuId);
+        const cat = updatedMap.get(normSku);
+        if (!cat) return;
+
+        const catName = getCatalogItemName(cat);
+        const nextSkuName = resolvePreferredSkuName(normSku, catName, s.skuName);
+        const nextCtnSize = cat.qtyCtnSize > 0 ? cat.qtyCtnSize : s.qtyCtnSize;
+        const nextInnerSize = cat.qtyInnerSize > 0 ? cat.qtyInnerSize : s.qtyInnerSize;
+        const nextBrand = getProductBrand(normSku, nextSkuName, cat.brand || s.brand);
+        const nextBarcode = getBarcodeForSku(
+          normSku,
+          cat.barcode && cat.barcode !== '-' ? cat.barcode : s.barcode
+        );
+
+        const nameChanged = nextSkuName.trim() !== String(s.skuName ?? '').trim();
+        const sizeChanged = nextCtnSize !== s.qtyCtnSize || nextInnerSize !== s.qtyInnerSize;
+        const brandChanged = nextBrand !== (s.brand ?? '');
+        const barcodeChanged = nextBarcode !== '-' && nextBarcode !== (s.barcode ?? '-');
+
+        if (!nameChanged && !sizeChanged && !brandChanged && !barcodeChanged) return;
+
+        const splits = calculatePackQuantities(s.qty, nextCtnSize, nextInnerSize);
+        stockToUpdate.push({
+          ...s,
+          skuName: nextSkuName,
+          brand: nextBrand,
+          barcode: nextBarcode,
+          qtyCtnSize: nextCtnSize,
+          qtyInnerSize: nextInnerSize,
+          qtyCtn: splits.qtyCtn,
+          qtyInner: splits.qtyInner,
+          qtyLoose: splits.qtyLoose,
+        });
+      });
+
+      const chunkSize = 400;
+      for (let i = 0; i < stockToUpdate.length; i += chunkSize) {
+        const chunk = stockToUpdate.slice(i, i + chunkSize);
+        const batch = writeBatch(db);
+        chunk.forEach(updatedStockItem => {
+          batch.set(doc(db, 'stock', updatedStockItem.id), updatedStockItem);
+        });
+        await batch.commit();
+      }
+
+      return { syncedCount: stockToUpdate.length };
+    } catch (err: any) {
+      console.warn('Batch stock catalog sync failed:', err);
+      return {
+        syncedCount: 0,
+        errorMessage: err?.message || 'Sinkronisasi ke stok gagal. Muat ulang halaman lalu jalankan Sync Katalog ↔ Stok.'
+      };
+    }
+  };
+
   const handleAddCatalogItem = async (newItem: Omit<CatalogItem, 'id'>) => {
     try {
-      const docId = newItem.skuId.toUpperCase();
-      const resolvedBrand = getProductBrand(newItem.skuId, newItem.skuName, newItem.brand);
-      const resolvedBarcode = getBarcodeForSku(newItem.skuId, newItem.barcode);
+      const docId = normalizeSkuKey(newItem.skuId);
+      const resolvedBrand = getProductBrand(docId, newItem.skuName, newItem.brand);
+      const resolvedBarcode = getBarcodeForSku(docId, newItem.barcode);
       const itemToSave: CatalogItem = {
         id: docId,
-        skuId: newItem.skuId,
-        skuName: newItem.skuName,
+        skuId: docId,
+        skuName: newItem.skuName.trim(),
         brand: resolvedBrand,
         barcode: resolvedBarcode,
         qtyCtnSize: newItem.qtyCtnSize,
         qtyInnerSize: newItem.qtyInnerSize
       };
       await setDoc(doc(db, 'catalog', docId), itemToSave);
+      const nextCatalog = [...catalogRef.current.filter(c => normalizeSkuKey(c.skuId) !== docId), itemToSave];
+      applyCatalogLocalState(nextCatalog);
+      await syncCatalogItemsToStock([itemToSave], nextCatalog);
       return true;
     } catch (error) {
       console.error('Error adding catalog item: ', error);
@@ -919,49 +1143,60 @@ export default function App() {
 
   const handleUpdateCatalogItem = async (skuId: string, updatedFields: Partial<CatalogItem>) => {
     try {
-      const docId = skuId.toUpperCase();
-      const existing = catalog.find(c => c.skuId.toUpperCase() === docId);
+      const docId = normalizeSkuKey(skuId);
+      const existing = catalogRef.current.find(c => normalizeSkuKey(c.skuId) === docId);
       if (!existing) return false;
 
-      const newBrand = getProductBrand(skuId, updatedFields.skuName || existing.skuName, updatedFields.brand || existing.brand);
-      const newBarcode = getBarcodeForSku(skuId, updatedFields.barcode || existing.barcode);
+      const nextName = (updatedFields.skuName ?? existing.skuName).trim();
+      const newBrand = getProductBrand(docId, nextName, updatedFields.brand ?? existing.brand);
+      const newBarcode = getBarcodeForSku(docId, updatedFields.barcode ?? existing.barcode);
 
       const merged: CatalogItem = {
         ...existing,
         ...updatedFields,
+        skuName: nextName,
         brand: newBrand,
         barcode: newBarcode,
         id: docId,
-        skuId: skuId
+        skuId: docId
       };
+
+      const latestStock = await loadLatestStockForCatalogSync();
       const batch = writeBatch(db);
       batch.set(doc(db, 'catalog', docId), merged);
 
-      // Also sync matching stock items in system with updated name, brand, barcode and pack sizes
-      const matchingStock = stock.filter(s => s.skuId.toUpperCase() === docId);
-      if (matchingStock.length > 0) {
-        matchingStock.forEach(s => {
-          const newCtnSize = updatedFields.qtyCtnSize ?? s.qtyCtnSize;
-          const newInnerSize = updatedFields.qtyInnerSize ?? s.qtyInnerSize;
-          const newName = updatedFields.skuName ?? s.skuName;
-          const splits = calculatePackQuantities(s.qty, newCtnSize, newInnerSize);
-          const updatedStockItem: StockItem = {
-            ...s,
-            skuName: newName,
-            brand: newBrand,
-            barcode: newBarcode,
-            qtyCtnSize: newCtnSize,
-            qtyInnerSize: newInnerSize,
-            qtyCtn: splits.qtyCtn,
-            qtyInner: splits.qtyInner,
-            qtyLoose: splits.qtyLoose
-          };
-          batch.set(doc(db, 'stock', s.id), updatedStockItem);
-        });
+      // Sync only stock rows whose name, brand, barcode, or pack sizes actually changed
+      const matchingStock = latestStock.filter(s => normalizeSkuKey(s.skuId) === docId);
+      matchingStock.forEach(s => {
+        const newCtnSize = updatedFields.qtyCtnSize ?? s.qtyCtnSize;
+        const newInnerSize = updatedFields.qtyInnerSize ?? s.qtyInnerSize;
+        const newName = updatedFields.skuName !== undefined ? updatedFields.skuName.trim() : s.skuName;
+        const nameChanged = newName !== String(s.skuName ?? '').trim();
+        const sizeChanged = newCtnSize !== s.qtyCtnSize || newInnerSize !== s.qtyInnerSize;
+        const brandChanged = newBrand !== (s.brand ?? '');
+        const barcodeChanged = newBarcode !== '-' && newBarcode !== (s.barcode ?? '-');
+        if (!nameChanged && !sizeChanged && !brandChanged && !barcodeChanged) return;
 
-      }
+        const splits = calculatePackQuantities(s.qty, newCtnSize, newInnerSize);
+        const updatedStockItem: StockItem = {
+          ...s,
+          skuName: newName,
+          brand: newBrand,
+          barcode: newBarcode,
+          qtyCtnSize: newCtnSize,
+          qtyInnerSize: newInnerSize,
+          qtyCtn: splits.qtyCtn,
+          qtyInner: splits.qtyInner,
+          qtyLoose: splits.qtyLoose
+        };
+        batch.set(doc(db, 'stock', s.id), updatedStockItem);
+      });
 
       await batch.commit();
+      const nextCatalog = catalogRef.current.map(c =>
+        normalizeSkuKey(c.skuId) === docId ? merged : c
+      );
+      applyCatalogLocalState(nextCatalog);
       return true;
     } catch (error) {
       console.error('Error updating catalog item: ', error);
@@ -971,8 +1206,9 @@ export default function App() {
 
   const handleDeleteCatalogItem = async (skuId: string) => {
     try {
-      const docId = skuId.toUpperCase();
+      const docId = normalizeSkuKey(skuId);
       await deleteDoc(doc(db, 'catalog', docId));
+      applyCatalogLocalState(catalogRef.current.filter(c => normalizeSkuKey(c.skuId) !== docId));
       return true;
     } catch (error) {
       console.error('Error deleting catalog item: ', error);
@@ -983,170 +1219,345 @@ export default function App() {
   const handleBatchImportCatalog = async (
     items: Omit<CatalogItem, 'id'>[],
     mode: 'merge' | 'replace'
-  ) => {
+  ): Promise<{ success: boolean; catalogSavedCount: number; stockSyncedCount: number; stockSyncError?: string }> => {
     try {
       setIsSyncingNow(true);
-      if (mode === 'replace') {
-        // Delete existing catalog items from Supabase
-        const batchDelete = writeBatch(db);
-        catalog.forEach(c => {
-          batchDelete.delete(doc(db, 'catalog', c.id));
-        });
-        await batchDelete.commit().catch(e => console.warn('Batch delete catalog error:', e));
+      if (isSupabaseConfigured && supabase) {
+        await getDocs(collection(db, 'catalog'));
       }
 
-      // Add or update catalog docs in chunks of 400
-      const chunkSize = 400;
-      for (let i = 0; i < items.length; i += chunkSize) {
-        const chunk = items.slice(i, i + chunkSize);
-        const batch = writeBatch(db);
-        chunk.forEach(item => {
-          const docId = item.skuId.toUpperCase();
-          const resolvedBrand = getProductBrand(item.skuId, item.skuName, item.brand);
-          const resolvedBarcode = getBarcodeForSku(item.skuId, item.barcode);
-          const itemToSave: CatalogItem = {
-            id: docId,
-            skuId: item.skuId,
-            skuName: item.skuName,
-            brand: resolvedBrand,
-            barcode: resolvedBarcode,
-            qtyCtnSize: item.qtyCtnSize,
-            qtyInnerSize: item.qtyInnerSize
-          };
-          batch.set(doc(db, 'catalog', docId), itemToSave);
-        });
-        await batch.commit();
-      }
-
-      // Sync imported sizes with existing stock items in system
-      const updatedCatalogMap = new Map<string, Omit<CatalogItem, 'id'>>();
+      const dedupedNewMap = new Map<string, CatalogItem>();
       items.forEach(item => {
-        updatedCatalogMap.set(item.skuId.toUpperCase(), item);
-      });
-
-      const stockToUpdate = stock.filter(s => updatedCatalogMap.has(s.skuId.toUpperCase()));
-      if (stockToUpdate.length > 0) {
-        for (let i = 0; i < stockToUpdate.length; i += chunkSize) {
-          const chunk = stockToUpdate.slice(i, i + chunkSize);
-          const batch = writeBatch(db);
-          chunk.forEach(s => {
-            const cat = updatedCatalogMap.get(s.skuId.toUpperCase())!;
-            const splits = calculatePackQuantities(s.qty, cat.qtyCtnSize, cat.qtyInnerSize);
-            const resolvedBrand = getProductBrand(cat.skuId, cat.skuName, cat.brand);
-            const resolvedBarcode = getBarcodeForSku(cat.skuId, cat.barcode);
-            const updatedStockItem: StockItem = {
-              ...s,
-              skuName: cat.skuName || s.skuName,
-              brand: resolvedBrand,
-              barcode: resolvedBarcode,
-              qtyCtnSize: cat.qtyCtnSize,
-              qtyInnerSize: cat.qtyInnerSize,
-              qtyCtn: splits.qtyCtn,
-              qtyInner: splits.qtyInner,
-              qtyLoose: splits.qtyLoose
-            };
-            batch.set(doc(db, 'stock', s.id), updatedStockItem);
-          });
-          await batch.commit().catch(e => console.warn('Batch stock catalog sync failed:', e));
-        }
-      }
-
-      // Update local state and trigger sync/broadcast
-      const importedCatalogList: CatalogItem[] = items.map(item => ({
-        id: item.skuId.toUpperCase(),
-        skuId: item.skuId,
-        skuName: item.skuName,
-        brand: getProductBrand(item.skuId, item.skuName, item.brand),
-        barcode: getBarcodeForSku(item.skuId, item.barcode),
-        qtyCtnSize: item.qtyCtnSize,
-        qtyInnerSize: item.qtyInnerSize
-      }));
-
-      if (mode === 'replace') {
-        saveCatalogState(importedCatalogList);
-      } else {
-        const mergedMap = new Map<string, CatalogItem>(catalog.map(c => [c.skuId.toUpperCase(), c]));
-        importedCatalogList.forEach(c => mergedMap.set(c.skuId.toUpperCase(), c));
-        saveCatalogState(Array.from(mergedMap.values()));
-      }
-
-      setIsSyncingNow(false);
-      return true;
-    } catch (error) {
-      console.error('Error batch importing catalog: ', error);
-      setIsSyncingNow(false);
-      return false;
-    }
-  };
-
-  const handleSyncStockToCatalog = async () => {
-    try {
-      const catalogSkuSet = new Set(catalog.map(c => c.skuId.toUpperCase()));
-      const missingStockSkus = new Map<string, { skuId: string; skuName: string; qtyCtnSize: number; qtyInnerSize: number }>();
-
-      stock.forEach(s => {
-        const normSku = s.skuId.toUpperCase();
-        if (!catalogSkuSet.has(normSku) && !missingStockSkus.has(normSku)) {
-          const sizes = getProductPackSizes(s.skuId);
-          missingStockSkus.set(normSku, {
-            skuId: s.skuId,
-            skuName: s.skuName,
-            qtyCtnSize: sizes.qtyCtnSize,
-            qtyInnerSize: sizes.qtyInnerSize
-          });
-        }
-      });
-
-      if (missingStockSkus.size === 0) return { addedCount: 0 };
-
-      const batch = writeBatch(db);
-      missingStockSkus.forEach((item, normSku) => {
-        const resolvedBrand = getProductBrand(item.skuId, item.skuName);
-        const resolvedBarcode = getBarcodeForSku(item.skuId);
-        batch.set(doc(db, 'catalog', normSku), {
-          id: normSku,
-          skuId: item.skuId,
-          skuName: item.skuName,
+        const docId = normalizeSkuKey(item.skuId);
+        if (!docId) return;
+        const cleanName = String(item.skuName || '').trim();
+        const resolvedBrand = getProductBrand(docId, cleanName, item.brand);
+        const resolvedBarcode = getBarcodeForSku(docId, item.barcode);
+        dedupedNewMap.set(docId, {
+          id: docId,
+          skuId: docId,
+          skuName: cleanName,
           brand: resolvedBrand,
           barcode: resolvedBarcode,
           qtyCtnSize: item.qtyCtnSize,
           qtyInnerSize: item.qtyInnerSize
         });
       });
-      await batch.commit();
-      return { addedCount: missingStockSkus.size };
-    } catch (e) {
-      console.error('Error syncing stock to catalog:', e);
-      return { addedCount: 0 };
+
+      const importedCatalogList = Array.from(dedupedNewMap.values());
+      const currentMap = buildCatalogLookupMap(catalogRef.current);
+      const chunkSize = 400;
+
+      if (mode === 'replace') {
+        const obsoleteIds = Array.from(currentMap.keys()).filter(id => !dedupedNewMap.has(id));
+        for (let i = 0; i < obsoleteIds.length; i += chunkSize) {
+          const chunk = obsoleteIds.slice(i, i + chunkSize);
+          const batchDelete = writeBatch(db);
+          chunk.forEach(id => {
+            batchDelete.delete(doc(db, 'catalog', id));
+          });
+          await batchDelete.commit();
+        }
+      }
+
+      const itemsToWrite = importedCatalogList.filter(nextItem => {
+        if (mode === 'replace') {
+          const prev = currentMap.get(nextItem.id);
+          return !prev || JSON.stringify(prev) !== JSON.stringify(nextItem);
+        }
+        const prev = currentMap.get(nextItem.id);
+        return (
+          !prev ||
+          prev.skuName !== nextItem.skuName ||
+          (prev.brand || '') !== (nextItem.brand || '') ||
+          (prev.barcode || '-') !== (nextItem.barcode || '-') ||
+          prev.qtyCtnSize !== nextItem.qtyCtnSize ||
+          prev.qtyInnerSize !== nextItem.qtyInnerSize
+        );
+      });
+
+      for (let i = 0; i < itemsToWrite.length; i += chunkSize) {
+        const chunk = itemsToWrite.slice(i, i + chunkSize);
+        const batch = writeBatch(db);
+        chunk.forEach(itemToSave => {
+          batch.set(doc(db, 'catalog', itemToSave.id), itemToSave);
+        });
+        await batch.commit();
+      }
+
+      let nextCatalogList: CatalogItem[];
+      if (mode === 'replace') {
+        nextCatalogList = importedCatalogList;
+      } else {
+        const mergedMap = new Map<string, CatalogItem>(currentMap);
+        importedCatalogList.forEach(c => mergedMap.set(c.id, c));
+        nextCatalogList = Array.from(mergedMap.values());
+      }
+
+      applyCatalogLocalState(nextCatalogList);
+
+      // Push updated names/sizes to matching stock records with fresh revisions
+      const stockSync = await syncCatalogItemsToStock(importedCatalogList, nextCatalogList);
+
+      setIsSyncingNow(false);
+      return {
+        success: true,
+        catalogSavedCount: importedCatalogList.length,
+        stockSyncedCount: stockSync.syncedCount,
+        stockSyncError: stockSync.errorMessage
+      };
+    } catch (error) {
+      console.error('Error batch importing catalog: ', error);
+      setIsSyncingNow(false);
+      return {
+        success: false,
+        catalogSavedCount: 0,
+        stockSyncedCount: 0,
+      };
     }
   };
 
+  const handleSyncStockToCatalog = async (): Promise<{
+    addedCount: number;
+    updatedCatalogCount: number;
+    syncedStockCount: number;
+    stockSyncError?: string;
+  }> => {
+    try {
+      if (isSupabaseConfigured && supabase) {
+        await getDocs(collection(db, 'catalog'));
+      }
+      const latestStock = await loadLatestStockForCatalogSync();
+      const plan = planCatalogStockBidirectionalSync(
+        catalogRef.current,
+        latestStock,
+        getProductPackSizes,
+        getProductBrand,
+        getBarcodeForSku
+      );
+
+      const chunkSize = 400;
+      for (let i = 0; i < plan.catalogUpserts.length; i += chunkSize) {
+        const chunk = plan.catalogUpserts.slice(i, i + chunkSize);
+        const batch = writeBatch(db);
+        chunk.forEach(item => {
+          batch.set(doc(db, 'catalog', item.id), item);
+        });
+        await batch.commit();
+      }
+
+      if (plan.catalogUpserts.length > 0) {
+        applyCatalogLocalState(plan.mergedCatalog);
+      }
+
+      let stockSyncError: string | undefined;
+      let syncedStockCount = 0;
+      if (plan.stockUpdates.length > 0) {
+        try {
+          for (let i = 0; i < plan.stockUpdates.length; i += chunkSize) {
+            const chunk = plan.stockUpdates.slice(i, i + chunkSize);
+            const batch = writeBatch(db);
+            chunk.forEach(s => {
+              batch.set(doc(db, 'stock', s.id), s);
+            });
+            await batch.commit();
+          }
+          syncedStockCount = plan.stockUpdates.length;
+        } catch (stockErr: any) {
+          console.warn('Stock sync inside bidirectional catalog sync failed:', stockErr);
+          stockSyncError = stockErr?.message || 'Sebagian baris stok gagal diperbarui.';
+        }
+      }
+
+      return {
+        addedCount: plan.addedCatalogCount,
+        updatedCatalogCount: plan.updatedCatalogCount,
+        syncedStockCount,
+        stockSyncError
+      };
+    } catch (e: any) {
+      console.error('Error syncing stock to catalog:', e);
+      return {
+        addedCount: 0,
+        updatedCatalogCount: 0,
+        syncedStockCount: 0,
+        stockSyncError: e?.message || 'Sinkronisasi gagal.'
+      };
+    }
+  };
+
+  const handleSyncImportedNamesToCatalog = async (
+    importedRows: Array<{ skuId: string; skuName: string; qtyCtnSize: number; qtyInnerSize: number }>
+  ): Promise<void> => {
+    try {
+      const currentMap = buildCatalogLookupMap(catalogRef.current);
+      const upserts = new Map<string, CatalogItem>();
+
+      importedRows.forEach(row => {
+        const docId = normalizeSkuKey(row.skuId);
+        const cleanName = String(row.skuName || '').trim();
+        if (!docId || isPlaceholderSkuName(docId, cleanName)) return;
+
+        const existing = currentMap.get(docId);
+        if (!existing) {
+          const sizes = getProductPackSizes(docId);
+          upserts.set(docId, {
+            id: docId,
+            skuId: docId,
+            skuName: cleanName,
+            brand: getProductBrand(docId, cleanName),
+            barcode: getBarcodeForSku(docId),
+            qtyCtnSize: row.qtyCtnSize || sizes.qtyCtnSize || 720,
+            qtyInnerSize: row.qtyInnerSize || sizes.qtyInnerSize || 12,
+          });
+        } else if (isPlaceholderSkuName(docId, existing.skuName)) {
+          upserts.set(docId, {
+            ...existing,
+            id: docId,
+            skuId: existing.skuId || docId,
+            skuName: cleanName,
+          });
+        }
+      });
+
+      if (upserts.size === 0) return;
+      if (isSupabaseConfigured && supabase) {
+        await getDocs(collection(db, 'catalog'));
+      }
+      const list = Array.from(upserts.values());
+      const chunkSize = 400;
+      for (let i = 0; i < list.length; i += chunkSize) {
+        const batch = writeBatch(db);
+        list.slice(i, i + chunkSize).forEach(catItem => {
+          batch.set(doc(db, 'catalog', catItem.id), catItem);
+        });
+        await batch.commit();
+      }
+
+      const nextMap = new Map(currentMap);
+      list.forEach(catItem => nextMap.set(catItem.id, catItem));
+      applyCatalogLocalState(Array.from(nextMap.values()));
+    } catch (err) {
+      console.warn('Auto sync imported stock names to catalog warning:', err);
+    }
+  };
+
+  const [branchOperationType, setBranchOperationType] = useState<BranchOperationType>('HYBRID');
+  const [mabangScreen, setMabangScreen] = useState<MabangScreen>('distribution');
   const [activeTab, setActiveTab] = useState('dashboard');
   const [inventoryEntryFocus,setInventoryEntryFocus] = useState('ALL');
   const [outboundEntryMode,setOutboundEntryMode] = useState<OutboundMode|undefined>(undefined);
-  const navigateFromMenu = (tab:string) => {setInventoryEntryFocus('ALL');setOutboundEntryMode(undefined);setActiveTab(tab);};
 
-  // Enforce role-based tab containment:
-  // - Packer/Picker: dashboard, outbound, Mabang picking/packing, and assistant
-  // - Viewer: dashboard & inventory (stok barang hanya lihat) & ai-chat
-  // - Admin: dashboard, inventory, bulk (outbound), inbound, bulk-transfer, warehouse-map, daily-cycle-count, stock-opname-location, catalog, ai-chat (Hanya tidak bisa mengakses 'users' / Kelola Akun)
-  // - Administrator: full access termasuk 'users' (Kelola Akun)
+  useEffect(() => {
+    const handleBranchConfigUpdated = (event: Event) => {
+      const detail = (event as CustomEvent<{ branchId?: string; operationType?: BranchOperationType }>).detail;
+      if (detail?.operationType && (!detail.branchId || detail.branchId === getActiveBranch())) {
+        setBranchOperationType(detail.operationType);
+        return;
+      }
+      void fetchBranchOperationType(getActiveBranch()).then(setBranchOperationType);
+    };
+    window.addEventListener('wms-branch-config-updated', handleBranchConfigUpdated);
+    return () => window.removeEventListener('wms-branch-config-updated', handleBranchConfigUpdated);
+  }, []);
+
+  const navigateFromMenu = (tab: string) => {
+    const showB2b = branchSupportsOperation(branchOperationType, 'B2B');
+    const showOnline = branchSupportsOperation(branchOperationType, 'ONLINE');
+    let nextTab = tab;
+    if (tab === 'bulk') {
+      nextTab = showB2b ? 'b2b-picking' : 'online-picking';
+    } else if (tab === 'mabang') {
+      nextTab = showOnline ? 'online-picking' : 'b2b-picking';
+    } else if (tab === 'orders') {
+      nextTab = showB2b ? 'b2b-input' : 'online-input';
+    }
+
+    if (nextTab === 'online-picking') {
+      setMabangScreen('distribution');
+      setOutboundEntryMode(undefined);
+    } else if (nextTab === 'online-sorting') {
+      setMabangScreen('sorting');
+      setOutboundEntryMode(undefined);
+    } else if (nextTab === 'online-packing') {
+      setMabangScreen('delivery');
+      setOutboundEntryMode(undefined);
+    } else if (nextTab === 'b2b-input' || nextTab === 'online-input') {
+      setOutboundEntryMode('create');
+    } else if (nextTab === 'b2b-picking') {
+      setOutboundEntryMode('pick');
+    } else if (nextTab === 'b2b-packing') {
+      setOutboundEntryMode('validate');
+    } else if (nextTab === 'b2b-history' || nextTab === 'online-history') {
+      setOutboundEntryMode('history');
+    } else {
+      setOutboundEntryMode(undefined);
+    }
+
+    setInventoryEntryFocus('ALL');
+    setActiveTab(nextTab);
+  };
+
+  // Enforce role-based and branch-operation-type tab containment:
+  // - Shipping: hanya 'shipping-manifest'
+  // - Picker: 'picker-hub', 'b2b-picking' (B2B/HYBRID), 'online-picking' (ONLINE/HYBRID)
+  // - Packer: 'b2b-packing' (B2B/HYBRID), 'online-sorting' & 'online-packing' (ONLINE/HYBRID)
+  // - Viewer: 'dashboard', 'inventory', 'bulk-transfer'
+  // - Admin / Administrator: full menu sesuai jenis operasional cabang
   useEffect(() => {
     if (!isLoggedIn) return;
-    if (activeTab === 'ai-chat') {
-      setActiveTab('dashboard');
+    const showB2b = branchSupportsOperation(branchOperationType, 'B2B');
+    const showOnline = branchSupportsOperation(branchOperationType, 'ONLINE');
+    const role = currentUser?.role;
+
+    if (role === 'Shipping') {
+      if (activeTab !== 'shipping-manifest') {
+        setActiveTab('shipping-manifest');
+      }
       return;
     }
-    if (currentUser?.role === 'Packer' || currentUser?.role === 'Picker' || currentUser?.role === 'Shipping') {
-      if (!['dashboard', 'bulk', 'mabang'].includes(activeTab)) {
-        setActiveTab('bulk');
+
+    if (role === 'Picker') {
+      const allowedPickerTabs = [
+        'picker-hub',
+        ...(showB2b ? ['b2b-picking'] : []),
+        ...(showOnline ? ['online-picking'] : []),
+      ];
+      if (!allowedPickerTabs.includes(activeTab)) {
+        setActiveTab('picker-hub');
+      } else if (activeTab === 'online-picking' && mabangScreen !== 'distribution') {
+        setMabangScreen('distribution');
       }
-    } else if (currentUser?.role === 'Viewer') {
+      return;
+    }
+
+    if (role === 'Packer') {
+      const allowedPackerTabs = [
+        ...(showB2b ? ['b2b-packing'] : []),
+        ...(showOnline ? ['online-sorting', 'online-packing'] : []),
+      ];
+      const fallbackPackerTab = allowedPackerTabs[0] || 'b2b-packing';
+      if (!allowedPackerTabs.includes(activeTab)) {
+        if (fallbackPackerTab === 'online-sorting') setMabangScreen('sorting');
+        else if (fallbackPackerTab === 'online-packing') setMabangScreen('delivery');
+        setActiveTab(fallbackPackerTab);
+      }
+      return;
+    }
+
+    if (role === 'Viewer') {
       if (!['dashboard', 'inventory', 'bulk-transfer'].includes(activeTab)) {
         setActiveTab('dashboard');
       }
+      return;
     }
-  }, [isLoggedIn, currentUser, activeTab]);
+
+    const b2bTabs = ['b2b-input', 'b2b-picking', 'b2b-packing', 'b2b-history'];
+    const onlineTabs = ['online-input', 'online-picking', 'online-sorting', 'online-packing', 'online-history'];
+    if ((!showB2b && b2bTabs.includes(activeTab)) || (!showOnline && onlineTabs.includes(activeTab))) {
+      setActiveTab('dashboard');
+    }
+  }, [isLoggedIn, currentUser, activeTab, branchOperationType, mabangScreen]);
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
 
   // Keep DCC alive across tab navigation once opened to prevent state loss
@@ -1199,32 +1610,64 @@ export default function App() {
 
   const executeTransferAtomic = async (newTransfer: InterWarehouseTransfer, updatedStock: StockItem[], newLogs: DccLog[]) => {
     try {
-      console.log('executeTransferAtomic: executing transfer', newTransfer.id, 'with stock items:', updatedStock.length);
+      const deduplicatedStock = deduplicateAndMergeStock(updatedStock);
+      const skuTotals: Record<string, number> = {};
+      deduplicatedStock.forEach(item => {
+        skuTotals[item.skuId] = (skuTotals[item.skuId] || 0) + item.qty;
+      });
+      const finalizedStock = deduplicatedStock.map(item => ({
+        ...item,
+        totalQtySku: skuTotals[item.skuId] || 0
+      }));
 
-      // 1. Save stock state through the proven canonical stock pipeline.
-      // CRITICAL: DO NOT mutate stockRef.current beforehand, because saveStockState
-      // compares finalized vs stockRef.current (oldStock) to calculate database diffs.
-      // If stockRef.current is mutated beforehand, buildStockWritePlan assumes old == new
-      // and silently drops the deduction on source stock items!
-      const stockSaved = await saveStockState(updatedStock);
-      if (!stockSaved) {
-        throw new Error('Penyimpanan stok gagal disinkronkan ke database server.');
+      const oldStock = [...stockRef.current];
+      const emptyFlag: StockItem = {
+        id: 'SYSTEM_EMPTY_FLAG',
+        skuId: 'SYSTEM_EMPTY',
+        skuName: 'System Empty',
+        expiredDate: '1970-01-01',
+        location: 'SYSTEM',
+        qty: 0,
+        totalQtySku: 0,
+        qtyCtnSize: 1,
+        qtyCtn: 0,
+        qtyInnerSize: 1,
+        qtyInner: 0,
+        qtyLoose: 0,
+        status: 'SYSTEM'
+      };
+      const oldDocuments = oldStock.map(sanitizeStockDocForSupabase);
+      const newDocuments = finalizedStock.map(sanitizeStockDocForSupabase);
+      const stockOperations = buildStockWritePlan(newDocuments, oldDocuments, emptyFlag, {
+        forceUpserts: false
+      });
+
+      // Single atomic batch across stock, warehouse_transfers, and logs
+      const batch = writeBatch(db);
+      queueStockWritePlan(
+        batch,
+        stockOperations,
+        id => doc(db, 'stock', id),
+        (reference, revision) => ({ ...reference, expectedRevision: revision }),
+        false
+      );
+      batch.set(doc(db, 'warehouse_transfers', newTransfer.id), newTransfer);
+      for (const log of newLogs) {
+        batch.set(doc(db, 'logs', log.id), log);
       }
+      await batch.commit();
 
-      // Update local state after saving stock
-      setStock(updatedStock);
-
-      // 2. Save transfer record to warehouse_transfers
-      await saveTransfersState([newTransfer, ...transfersRef.current]);
-
-      // 3. Save audit trail logs
-      saveLogsState([...newLogs, ...logsRef.current]);
-
-      // Broadcast and trigger sync
-      broadcastUpdate('SYNC_TRANSFERS', [newTransfer, ...transfersRef.current]);
+      const nextTransfers = [newTransfer, ...transfersRef.current];
+      const nextLogs = [...newLogs, ...logsRef.current];
+      setStock(finalizedStock);
+      setTransfers(nextTransfers);
+      setLogs(nextLogs);
+      broadcastUpdate('SYNC_TRANSFERS', nextTransfers);
+      broadcastUpdate('SYNC_LOGS', nextLogs);
       setSyncTrigger(value => value + 1);
     } catch (e) {
-      console.error('Failed atomic transfer:', e);
+      setSyncTrigger(value => value + 1);
+      handleSupabaseError(e, OperationType.WRITE, 'warehouse_transfers');
       throw e;
     }
   };
@@ -1330,9 +1773,10 @@ export default function App() {
   };
 
   const saveLogsState = (updatedLogs: DccLog[]) => {
+    const oldLogs = [...logsRef.current];
     setLogs(updatedLogs);
     broadcastUpdate('SYNC_LOGS', updatedLogs);
-    syncLogsToSupabase(updatedLogs, logsRef.current);
+    void syncLogsToSupabase(updatedLogs, oldLogs);
   };
 
   const handleAddLog = (newLog: Omit<DccLog, 'id' | 'timestamp'>) => {
@@ -1357,16 +1801,17 @@ export default function App() {
   };
 
   const saveOrderHistoryState = (updatedOrderHistory: OutboundItem[]) => {
+    const oldOrders = [...orderHistoryRef.current];
     setOrderHistory(updatedOrderHistory);
     broadcastUpdate('SYNC_ORDERS', updatedOrderHistory);
-    syncOrdersToSupabase(updatedOrderHistory, orderHistoryRef.current);
+    void syncOrdersToSupabase(updatedOrderHistory, oldOrders);
   };
 
   // STOCK OPERATIONS
 
   // 1. Update/Edit existing stock list manually
   const handleUpdateStock = (updatedStock: StockItem[]) => {
-    saveStockState(updatedStock);
+    const savePromise = saveStockState(updatedStock);
 
     // Register a log of adjustment
     const logItem: DccLog = {
@@ -1384,6 +1829,7 @@ export default function App() {
       user: currentUser?.fullName || 'Admin Operator'
     };
     saveLogsState([logItem, ...logs]);
+    return savePromise;
   };
 
   const stockEditLock = useRef(false);
@@ -1423,6 +1869,13 @@ export default function App() {
         }
       }
       const target = stock.find(s => s.id !== source.id && getCanonicalStockId(s.skuId,s.expiredDate,s.location,s.warehouseId || 'WH-CENTRAL') === id);
+      const catalogMatch = catalogRef.current.find(c => normalizeSkuKey(c.skuId) === skuId);
+      const userEditedName = String(newItem.skuName || '').trim();
+      const userExplicitlyChangedName = userEditedName !== String(oldItem.skuName || '').trim();
+      const resolvedSkuName = userExplicitlyChangedName && !isPlaceholderSkuName(skuId, userEditedName)
+        ? userEditedName
+        : resolvePreferredSkuName(skuId, userEditedName, getCatalogItemName(catalogMatch));
+
       const qty = newItem.qty + (target?.qty || 0);
       const sourceIds = [...new Set([
         ...(source.__wms_source_ids?.length ? source.__wms_source_ids : [source.id]),
@@ -1432,13 +1885,56 @@ export default function App() {
         ...(source.__wms_source_revisions || {}),
         ...(target?.__wms_source_revisions || {})
       };
-      const updated = {...newItem, __wms_revision: id===source.id ? source.__wms_revision : target?.__wms_revision, __wms_revision_document_id: id===source.id ? source.__wms_revision_document_id : target?.__wms_revision_document_id, __wms_source_ids: sourceIds, __wms_source_revisions: sourceRevisions, id, skuId, location, expiredDate, warehouseId:wh, qty, ...calculatePackQuantities(qty,newItem.qtyCtnSize,newItem.qtyInnerSize),status:getExpiredStatus(expiredDate)};
+      const updated = {...newItem, skuName: resolvedSkuName, __wms_revision: id===source.id ? source.__wms_revision : target?.__wms_revision, __wms_revision_document_id: id===source.id ? source.__wms_revision_document_id : target?.__wms_revision_document_id, __wms_source_ids: sourceIds, __wms_source_revisions: sourceRevisions, id, skuId, location, expiredDate, warehouseId:wh, qty, ...calculatePackQuantities(qty,newItem.qtyCtnSize,newItem.qtyInnerSize),status:getExpiredStatus(expiredDate)};
       const batch = writeBatch(db);
       if (source.id !== id) batch.delete(doc(db,'stock',source.id));
       if (target && target.id !== id) batch.delete(doc(db,'stock',target.id));
       batch.set(doc(db,'stock',id),sanitizeStockDocForSupabase(updated));
-      batch.set(doc(db,'logs','log_edit_'+crypto.randomUUID()),{timestamp:new Date().toISOString(),type:'ADJUSTMENT',skuId,skuName:updated.skuName,qty:Math.abs(newItem.qty-source.qty),locationFrom:source.location,locationTo:location,warehouseId:wh,description:'Edit stok: '+source.qty+' -> '+newItem.qty,user:currentUser?.fullName || 'Admin'});
+      batch.set(doc(db,'logs','log_edit_'+crypto.randomUUID()),{timestamp:new Date().toISOString(),type:'ADJUSTMENT',skuId,skuName:resolvedSkuName,qty:Math.abs(newItem.qty-source.qty),locationFrom:source.location,locationTo:location,warehouseId:wh,description:'Edit stok: '+source.qty+' -> '+newItem.qty,user:currentUser?.fullName || 'Admin'});
+
+      let nextCatalogAfterEdit: CatalogItem[] | null = null;
+      if (!isPlaceholderSkuName(skuId, resolvedSkuName)) {
+        if (
+          !catalogMatch ||
+          isPlaceholderSkuName(skuId, catalogMatch.skuName) ||
+          (userExplicitlyChangedName && resolvedSkuName !== catalogMatch.skuName.trim())
+        ) {
+          const updatedCatItem: CatalogItem = catalogMatch
+            ? { ...catalogMatch, id: skuId, skuId, skuName: resolvedSkuName }
+            : {
+                id: skuId,
+                skuId,
+                skuName: resolvedSkuName,
+                brand: getProductBrand(skuId, resolvedSkuName, newItem.brand),
+                barcode: getBarcodeForSku(skuId, newItem.barcode),
+                qtyCtnSize: newItem.qtyCtnSize || getProductPackSizes(skuId).qtyCtnSize,
+                qtyInnerSize: newItem.qtyInnerSize || getProductPackSizes(skuId).qtyInnerSize,
+              };
+          batch.set(doc(db, 'catalog', skuId), updatedCatItem);
+          nextCatalogAfterEdit = [
+            ...catalogRef.current.filter(c => normalizeSkuKey(c.skuId) !== skuId),
+            updatedCatItem
+          ];
+        }
+
+        const reservedDocIds = new Set<string>([id, source.id, ...(target ? [target.id] : []), ...sourceIds]);
+        stock.forEach(sibling => {
+          if (normalizeSkuKey(sibling.skuId) !== skuId) return;
+          if (String(sibling.skuName || '').trim() === resolvedSkuName) return;
+          const siblingDocIds = [
+            sibling.id,
+            ...(sibling.__wms_source_ids?.length ? sibling.__wms_source_ids : [])
+          ];
+          if (siblingDocIds.some(docKey => reservedDocIds.has(docKey))) return;
+          siblingDocIds.forEach(docKey => reservedDocIds.add(docKey));
+          batch.set(doc(db, 'stock', sibling.id), sanitizeStockDocForSupabase({ ...sibling, skuName: resolvedSkuName }));
+        });
+      }
+
       await batch.commit();
+      if (nextCatalogAfterEdit) {
+        applyCatalogLocalState(nextCatalogAfterEdit);
+      }
       return true;
     } catch(e:any) { alert(e.message || 'Edit stok gagal. Muat ulang data sebelum mencoba lagi.'); return false; }
     finally { stockEditLock.current=false; }
@@ -1449,9 +1945,14 @@ export default function App() {
     if (!Number.isSafeInteger(newItem.qty) || newItem.qty <= 0) throw new Error('Jumlah stok harus berupa bilangan bulat positif.');
     // Sanitize qty input to be positive integer
     const sanitizedQty = Math.floor(Math.max(0, newItem.qty));
+    const cleanSku = normalizeSkuKey(newItem.skuId);
+    const catalogMatch = catalogRef.current.find(c => normalizeSkuKey(c.skuId) === cleanSku);
+    const resolvedSkuName = resolvePreferredSkuName(cleanSku, newItem.skuName, getCatalogItemName(catalogMatch));
     const normalizedEd = normalizeDateToDmy(newItem.expiredDate);
     const sanitizedItem = {
       ...newItem,
+      skuId: cleanSku || newItem.skuId,
+      skuName: resolvedSkuName,
       expiredDate: normalizedEd,
       qty: sanitizedQty
     };
@@ -1470,6 +1971,7 @@ export default function App() {
       updatedList[existingIdx] = {
         ...existing,
         id,
+        skuName: resolvePreferredSkuName(cleanSku, existing.skuName, resolvedSkuName),
         qty: mergedQty,
         qtyCtn: splits.qtyCtn,
         qtyInner: splits.qtyInner,
@@ -1484,15 +1986,13 @@ export default function App() {
       });
     }
 
-
-
     // Append log
     const logItem: DccLog = {
       id: `log_in_${crypto.randomUUID()}`,
       timestamp: new Date().toISOString(),
       type: 'INBOUND',
-      skuId: newItem.skuId,
-      skuName: newItem.skuName,
+      skuId: cleanSku || newItem.skuId,
+      skuName: resolvedSkuName,
       locationFrom: 'Staging Inbound',
       locationTo: newItem.location,
       qty: newItem.qty,
@@ -1505,7 +2005,35 @@ export default function App() {
     const changed = updatedList.find(item => item.id === id)!;
     batch.set(doc(db, 'stock', id), sanitizeStockDocForSupabase(changed));
     batch.set(doc(db, 'logs', logItem.id), logItem);
+
+    let nextCatalogAfterAdd: CatalogItem[] | null = null;
+    if (
+      cleanSku &&
+      !isPlaceholderSkuName(cleanSku, resolvedSkuName) &&
+      (!catalogMatch || isPlaceholderSkuName(cleanSku, catalogMatch.skuName))
+    ) {
+      const catItem: CatalogItem = catalogMatch
+        ? { ...catalogMatch, id: cleanSku, skuId: cleanSku, skuName: resolvedSkuName }
+        : {
+            id: cleanSku,
+            skuId: cleanSku,
+            skuName: resolvedSkuName,
+            brand: getProductBrand(cleanSku, resolvedSkuName, newItem.brand),
+            barcode: getBarcodeForSku(cleanSku, newItem.barcode),
+            qtyCtnSize: newItem.qtyCtnSize || getProductPackSizes(cleanSku).qtyCtnSize,
+            qtyInnerSize: newItem.qtyInnerSize || getProductPackSizes(cleanSku).qtyInnerSize,
+          };
+      batch.set(doc(db, 'catalog', cleanSku), catItem);
+      nextCatalogAfterAdd = [
+        ...catalogRef.current.filter(c => normalizeSkuKey(c.skuId) !== cleanSku),
+        catItem
+      ];
+    }
+
     await batch.commit();
+    if (nextCatalogAfterAdd) {
+      applyCatalogLocalState(nextCatalogAfterAdd);
+    }
     setSyncTrigger(value => value + 1);
     return true;
   };
@@ -1650,6 +2178,30 @@ export default function App() {
         const id=prior?.id||'BATCH-'+crypto.randomUUID(),allItems=[...(prior?.items||[]),...items];
         const record={...prior,id,batchNumber:name,createdAt:prior?.createdAt||timestamp,updatedAt:timestamp,shippingStatus:prior?.shippingStatus||'BELUM_TERKIRIM',centralWmsStatus:prior?.centralWmsStatus||'BELUM_TERPOTONG',customerName:prior?.customerName||items[0].customerName||'Customer Outbound',createdBy:prior?.createdBy||currentUser?.fullName||'Operator',sourceReference:name,totalPcs:allItems.reduce((a,i)=>a+i.qty,0),totalSkus:new Set(allItems.map(i=>i.skuId)).size,items:allItems};
         batch.set({...doc(db,'batches',id),expectedRevision:(prior as any)?.__wms_revision??null},record);
+      }
+      if(!planned.draft && supabase){
+        const upserts:any[]=[];
+        for(const s of planned.stock)upserts.push({collection_name:'stock',document_id:s.id,expected_revision:(s as any).__wms_revision??null,merge:false,payload:s});
+        for(const o of planned.orders){
+          upserts.push({collection_name:'orders',document_id:o.id,expected_revision:null,merge:false,payload:o});
+          const id='log_out_'+crypto.randomUUID();
+          upserts.push({collection_name:'logs',document_id:id,expected_revision:null,merge:false,payload:{id,timestamp,type:'OUTBOUND',skuId:o.skuId,skuName:o.skuName,qty:o.qty,locationFrom:o.location,locationTo:'DISPATCH / DOCK',warehouseId:o.warehouseId,expiredDate:o.expiredDate,user:currentUser?.fullName||'Operator',description:'Outbound langsung: '+o.referenceNumber}});
+        }
+        for(const [name,items] of groups){
+          const prior=batchesRef.current.find(b=>b.batchNumber===name);
+          const id=prior?.id||'BATCH-'+crypto.randomUUID(),allItems=[...(prior?.items||[]),...items];
+          const record={...prior,id,batchNumber:name,createdAt:prior?.createdAt||timestamp,updatedAt:timestamp,shippingStatus:prior?.shippingStatus||'BELUM_TERKIRIM',centralWmsStatus:prior?.centralWmsStatus||'BELUM_TERPOTONG',customerName:prior?.customerName||items[0].customerName||'Customer Outbound',createdBy:prior?.createdBy||currentUser?.fullName||'Operator',sourceReference:name,totalPcs:allItems.reduce((a,i)=>a+i.qty,0),totalSkus:new Set(allItems.map(i=>i.skuId)).size,items:allItems};
+          upserts.push({collection_name:'batches',document_id:id,expected_revision:(prior as any)?.__wms_revision??null,merge:false,payload:record});
+        }
+        const directRes=await supabase.rpc('direct_outbound_scanned_admin',{
+          p_request:crypto.randomUUID(),
+          p_branch:getActiveBranch(),
+          p_upserts:upserts,
+          p_reason:'Outbound langsung terverifikasi melalui menu Quick Outbound'
+        });
+        if(!directRes.error)return true;
+        const errCode=String(directRes.error.code||''),errMsg=String(directRes.error.message||'');
+        if(errCode!=='PGRST202'&&!/could not find the function/i.test(errMsg))throw new Error(errMsg||'Penyimpanan outbound langsung ditolak server.');
       }
       await batch.commit();
       return true;
@@ -2398,6 +2950,126 @@ export default function App() {
   const handleBatchEditExpiredDateOrderHistory=(items:OutboundItem[],newRawExpDate:string):Promise<boolean>=>
     commitOrderEdits(items.map(original=>({original,updated:{...original,expiredDate:normalizeDateToDmy(newRawExpDate)}})));
 
+  const completeServerScanPhase = async (
+    branch: string,
+    reference: string,
+    basket: string,
+    phase: 'sorting' | 'packing',
+    fallbackItems?: Pick<OutboundItem, 'skuId' | 'qty'>[]
+  ): Promise<'completed' | 'unavailable'> => {
+    if (!supabase) return 'unavailable';
+    const cleanBasket = (basket || reference).trim().toUpperCase();
+    let sessionData: any = null;
+    const statusRes = await supabase.rpc('get_order_scan_status', {
+      p_branch: branch,
+      p_reference: reference,
+      p_phase: phase
+    });
+    if (statusRes.error) {
+      const code = String(statusRes.error.code || '');
+      const msg = String(statusRes.error.message || '');
+      if (code === 'PGRST202' || /could not find the function/i.test(msg)) {
+        return 'unavailable';
+      }
+      if (!/tidak ditemukan/i.test(msg)) {
+        throw new Error(msg || 'Gagal memeriksa status scan server.');
+      }
+    } else {
+      sessionData = statusRes.data;
+    }
+
+    if (
+      sessionData &&
+      sessionData.state === 'finished' &&
+      sessionData.current === true &&
+      (phase === 'packing' || String(sessionData.basket || '').trim().toUpperCase() === cleanBasket)
+    ) {
+      return 'completed';
+    }
+
+    if (
+      sessionData &&
+      sessionData.state === 'open' &&
+      (sessionData.current !== true || String(sessionData.basket || '').trim().toUpperCase() !== cleanBasket)
+    ) {
+      const cancelRes = await supabase.rpc('cancel_order_scan', { p_session: sessionData.session });
+      if (cancelRes.error) {
+        throw new Error(cancelRes.error.message || 'Gagal mereset sesi scan sebelumnya.');
+      }
+      sessionData = null;
+    }
+
+    if (!sessionData || sessionData.state !== 'open') {
+      const newSessionId = crypto.randomUUID();
+      const startRes = await supabase.rpc('start_order_scan', {
+        p_session: newSessionId,
+        p_branch: branch,
+        p_reference: reference,
+        p_phase: phase,
+        p_basket: cleanBasket
+      });
+      if (startRes.error) {
+        const code = String(startRes.error.code || '');
+        const msg = String(startRes.error.message || '');
+        if (code === 'PGRST202' || /could not find the function/i.test(msg)) {
+          return 'unavailable';
+        }
+        throw new Error(`${reference} (${cleanBasket}): ${msg || 'Gagal memulai sesi scan server.'}`);
+      }
+      sessionData = { session: newSessionId, state: 'open', counts: [] };
+    }
+
+    const sessionId = String(sessionData.session);
+    const counts = Array.isArray(sessionData.counts) ? sessionData.counts : [];
+    const scanCodes: string[] = [];
+    if (counts.length > 0) {
+      for (const line of counts) {
+        const sku = String(line.sku || '').trim();
+        const required = Number(line.required || 0);
+        const scanned = Number(line.scanned || 0);
+        const remaining = Math.max(0, required - scanned);
+        for (let i = 0; i < remaining; i++) {
+          scanCodes.push(sku);
+        }
+      }
+    } else if (fallbackItems?.length) {
+      for (const item of fallbackItems) {
+        const sku = String(item.skuId || '').trim();
+        const qty = Math.max(0, Number(item.qty || 0));
+        for (let i = 0; i < qty; i++) {
+          scanCodes.push(sku);
+        }
+      }
+    }
+
+    const scanWorkerCount = Math.min(4, scanCodes.length);
+    let scanCursor = 0;
+    await Promise.all(
+      Array.from({ length: scanWorkerCount }, async () => {
+        while (scanCursor < scanCodes.length) {
+          const sku = scanCodes[scanCursor++];
+          const recRes = await supabase.rpc('record_order_scan', {
+            p_session: sessionId,
+            p_request: crypto.randomUUID(),
+            p_code: sku
+          });
+          if (recRes.error) {
+            throw new Error(`${reference} (${sku}): ${recRes.error.message || 'Gagal mencatat scan ke server.'}`);
+          }
+        }
+      })
+    );
+
+    const finRes = await supabase.rpc('finish_order_scan', {
+      p_session: sessionId,
+      p_request: crypto.randomUUID()
+    });
+    if (finRes.error) {
+      throw new Error(`${reference} (${cleanBasket}): ${finRes.error.message || 'Gagal menyelesaikan sesi scan server.'}`);
+    }
+    return 'completed';
+  };
+
   const orderCompletionBusy = useRef(false);
   const handleEditMultipleOrdersBatch = async (updates: OrderCompletion[]): Promise<boolean> => {
     if (updates.some(update => !update.isPicking && update.updatedItems.some(item => item.status === 'Completed')) && !serverScanValidationAvailable()) {
@@ -2442,11 +3114,60 @@ export default function App() {
       }
 
       const planned=prepareOrderCompletion(stockRef.current,orderHistoryRef.current,updates);
+      const packingUpdates=updates.filter(u=>!u.isPicking&&u.updatedItems.some(o=>o.status==='Completed'));
+      const serverPackedRefs=new Set<string>();
+      let stockAlreadyCommitted=false;
+
+      if(packingUpdates.length>0){
+        const packingRefSet=new Set(packingUpdates.map(u=>u.refNum));
+        const unpickedOriginals=planned.originals.filter(o=>packingRefSet.has(o.referenceNumber)&&(!o.picked||!o.stockDeducted));
+        if(unpickedOriginals.length>0||planned.changedStock.length>0){
+          const prepBatch=writeBatch(db);
+          for(const s of planned.changedStock)prepBatch.set(doc(db,'stock',s.id),s);
+          for(const orig of unpickedOriginals){
+            const plannedRow=planned.orders.find(o=>o.id===orig.id);
+            prepBatch.set({...doc(db,'orders',orig.id),expectedRevision:(orig as any).__wms_revision??null},{
+              ...(plannedRow||orig),
+              status:'Pending',
+              picked:true,
+              stockDeducted:true
+            });
+          }
+          await prepBatch.commit();
+          stockAlreadyCommitted=true;
+        }
+
+        for(const u of packingUpdates){
+          const origRows=orderHistoryRef.current.filter(o=>o.referenceNumber===u.refNum);
+          const basket=(origRows[0]?.basketNumber||u.updatedItems[0]?.basketNumber||u.refNum).trim().toUpperCase();
+          const alreadySorted=origRows.length>0&&origRows.every(o=>Boolean(o.sortedAt?.trim())&&Boolean(o.sortedBy?.trim())&&(o.basketNumber||'').trim().toUpperCase()===basket);
+          if(!alreadySorted){
+            await completeServerScanPhase(branchAtStart,u.refNum,basket,'sorting',u.updatedItems);
+          }
+          let packMode:'completed'|'unavailable';
+          try{
+            packMode=await completeServerScanPhase(branchAtStart,u.refNum,basket,'packing',u.updatedItems);
+          }catch(packErr:any){
+            if(/Sortir/i.test(String(packErr?.message||''))){
+              await completeServerScanPhase(branchAtStart,u.refNum,basket,'sorting',u.updatedItems);
+              packMode=await completeServerScanPhase(branchAtStart,u.refNum,basket,'packing',u.updatedItems);
+            }else{
+              throw packErr;
+            }
+          }
+          if(packMode==='completed'){
+            serverPackedRefs.add(u.refNum);
+          }
+        }
+      }
+
       const batch=writeBatch(db);
       const newIds=new Set(planned.orders.map(o=>o.id));
-      for(const s of planned.changedStock)batch.set(doc(db,'stock',s.id),s);
-      for(const o of planned.originals)if(!newIds.has(o.id))batch.delete({...doc(db,'orders',o.id),expectedRevision:(o as any).__wms_revision??null});
-      for(const o of planned.orders)batch.set({...doc(db,'orders',o.id),expectedRevision:(o as any).__wms_revision??null},o);
+      if(!stockAlreadyCommitted){
+        for(const s of planned.changedStock)batch.set(doc(db,'stock',s.id),s);
+      }
+      for(const o of planned.originals)if(!newIds.has(o.id)&&!serverPackedRefs.has(o.referenceNumber))batch.delete({...doc(db,'orders',o.id),expectedRevision:(o as any).__wms_revision??null});
+      for(const o of planned.orders)if(!serverPackedRefs.has(o.referenceNumber))batch.set({...doc(db,'orders',o.id),expectedRevision:(o as any).__wms_revision??null},o);
       const timestamp=new Date().toISOString();
       for(const u of updates){
         const id='log_order_commit_'+crypto.randomUUID();
@@ -2460,6 +3181,14 @@ export default function App() {
       }
       if(branchAtStart!==getActiveBranch())throw new Error('Cabang berubah. Buka ulang order di cabang asal.');
       await batch.commit();
+      if(serverPackedRefs.size>0){
+        const refreshed=await getDocs(collection(db,'orders'));
+        if(branchAtStart===getActiveBranch()){
+          const rows=refreshed.docs.map(d=>d.data() as unknown as OutboundItem);
+          orderHistoryRef.current=rows;
+          setOrderHistory(rows);
+        }
+      }
       return true;
     }catch(error:any){alert('Order belum diselesaikan: '+(error.message||'Penyimpanan gagal. Muat data terbaru.'));return false;}
     finally{orderCompletionBusy.current=false;}
@@ -2467,7 +3196,16 @@ export default function App() {
   const handleEditOrderHistoryBatch = async (refNum:string,updatedItems:OutboundItem[],isPicking=false):Promise<boolean> =>
     handleEditMultipleOrdersBatch([{refNum,updatedItems,isPicking}]);
 
-  const handleUpdateOrdersShipped = async (orderRefs: string[], manifestInfo: { manifestId?: string; courierName?: string; handedOverAt?: string; handedOverBy?: string } = {}, isCancelled = false): Promise<boolean> => {
+  const generateRpcRequestId = () => (
+    typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function'
+      ? crypto.randomUUID()
+      : 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, (c) => {
+          const r = (Math.random() * 16) | 0;
+          return (c === 'x' ? r : (r & 0x3) | 0x8).toString(16);
+        })
+  );
+
+  const handleUpdateOrdersShipped = async (orderRefs: string[], manifestInfo: Partial<ShippingManifest> = {}, isCancelled = false): Promise<boolean> => {
     try {
       if (!orderRefs || orderRefs.length === 0) return true;
       const refSet = new Set(orderRefs.map(r => r.trim().toUpperCase()));
@@ -2487,10 +3225,92 @@ export default function App() {
         }
         return item;
       });
+
+      if (supabase) {
+        const { error } = await supabase.rpc('commit_shipping_manifest', {
+          p_request_id: generateRpcRequestId(),
+          p_branch_id: getActiveBranch(),
+          p_order_refs: orderRefs,
+          p_manifest: manifestInfo as Record<string, unknown>,
+          p_action: isCancelled ? 'cancel' : 'create',
+        });
+        if (!error) {
+          setOrderHistory(updated);
+          return true;
+        }
+        if (error.code === 'PGRST202' && currentUser?.role !== 'Shipping') {
+          saveOrderHistoryState(updated);
+          return true;
+        }
+        throw new Error(error.message || 'Gagal memperbarui status manifest pengiriman.');
+      }
+
       saveOrderHistoryState(updated);
       return true;
     } catch (e) {
       console.error('Failed to update orders shipped status:', e);
+      alert(e instanceof Error ? e.message : 'Gagal memperbarui status manifest pengiriman.');
+      return false;
+    }
+  };
+
+  const handleAssignOrderType = async (
+    assignments: Array<{ id?: string; referenceNumber?: string; orderType: ChannelOperationType }>
+  ): Promise<boolean> => {
+    try {
+      if (!assignments || assignments.length === 0) return true;
+      const byId = new Map<string, ChannelOperationType>();
+      const byRef = new Map<string, ChannelOperationType>();
+      for (const a of assignments) {
+        if (a.id) byId.set(a.id.trim(), a.orderType);
+        if (a.referenceNumber) byRef.set(a.referenceNumber.trim().toUpperCase(), a.orderType);
+      }
+
+      const nowIso = new Date().toISOString();
+      const actorName = currentUser?.fullName || currentUser?.username || 'Admin WMS';
+      const updated = orderHistoryRef.current.map((item) => {
+        const ref = (item.referenceNumber || item.orderNumber || '').trim().toUpperCase();
+        const assigned = byId.get((item.id || '').trim()) || (ref ? byRef.get(ref) : undefined);
+        if (!assigned) return item;
+        return {
+          ...item,
+          orderType: assigned,
+          orderSource: item.orderSource || 'ADMIN_MANUAL_ASSIGN',
+          orderTypeAssignedAt: nowIso,
+          orderTypeAssignedBy: actorName,
+        };
+      });
+
+      if (supabase) {
+        const { error } = await supabase.rpc('assign_order_types', {
+          p_request_id: generateRpcRequestId(),
+          p_branch_id: getActiveBranch(),
+          p_assignments: assignments,
+        });
+        if (!error) {
+          setOrderHistory(updated);
+          return true;
+        }
+        if (error.code === 'PGRST202') {
+          const batch = writeBatch(db);
+          for (const nextItem of updated) {
+            const prev = orderHistoryRef.current.find((old) => old.id === nextItem.id);
+            if (prev && (prev.orderType !== nextItem.orderType || prev.orderTypeAssignedAt !== nextItem.orderTypeAssignedAt)) {
+              batch.set(doc(db, 'orders', nextItem.id), nextItem);
+            }
+          }
+          await batch.commit();
+          setOrderHistory(updated);
+          return true;
+        }
+        throw new Error(error.message || 'Gagal mengklasifikasikan jenis order.');
+      }
+
+      saveOrderHistoryState(updated);
+      return true;
+    } catch (e) {
+      console.error('Failed to assign order types:', e);
+      alert(e instanceof Error ? e.message : 'Gagal mengklasifikasikan jenis order.');
       return false;
     }
   };
@@ -2503,7 +3323,27 @@ export default function App() {
     const snapshot=await getDocs(collection(db,'orders'));if(branch!==getActiveBranch())throw Error('Cabang berubah. Buka ulang tugas di cabang asal.');
     const fresh=snapshot.docs.map(d=>d.data() as unknown as OutboundItem);
     const updates=prepareSortingUpdates(fresh,tasks,currentUser?.fullName||currentUser?.username||'Operator');
-    if(updates.length){const batch=writeBatch(db);for(const order of updates)batch.set({...doc(db,'orders',order.id),expectedRevision:(order as any).__wms_revision??null},order);await batch.commit();}
+    let usedServerScan=false;
+    if(tasks.length>0){
+      let cursor=0,unavailable=false,completedAny=false;
+      const workerCount=Math.min(3,tasks.length);
+      await Promise.all(
+        Array.from({length:workerCount},async()=>{
+          while(!unavailable&&cursor<tasks.length){
+            const task=tasks[cursor++];
+            const rows=fresh.filter(o=>o.referenceNumber===task.referenceNumber);
+            const targetBasket=task.basketCode.trim().toUpperCase();
+            const alreadySorted=rows.length===task.items.length&&rows.every(o=>Boolean(o.sortedAt?.trim())&&Boolean(o.sortedBy?.trim())&&(o.basketNumber||'').trim().toUpperCase()===targetBasket);
+            if(alreadySorted){completedAny=true;continue;}
+            const mode=await completeServerScanPhase(branch,task.referenceNumber,targetBasket,'sorting',rows);
+            if(mode==='unavailable'){unavailable=true;break;}
+            completedAny=true;
+          }
+        })
+      );
+      usedServerScan=!unavailable&&completedAny;
+    }
+    if(!usedServerScan&&updates.length){const batch=writeBatch(db);for(const order of updates)batch.set({...doc(db,'orders',order.id),expectedRevision:(order as any).__wms_revision??null},order);await batch.commit();}
     const confirmed=await getDocs(collection(db,'orders'));if(branch!==getActiveBranch())throw Error('Cabang berubah setelah penyimpanan. Periksa cabang asal.');
     const confirmedOrders=confirmed.docs.map(d=>d.data() as unknown as OutboundItem);orderHistoryRef.current=confirmedOrders;setOrderHistory(confirmedOrders);
     for(const task of tasks){const rows=confirmedOrders.filter(o=>o.referenceNumber===task.referenceNumber);if(rows.length!==task.items.length||rows.some(o=>!o.sortedAt||!o.sortedBy||(o.basketNumber||'').trim().toUpperCase()!==task.basketCode.trim().toUpperCase()))throw Error('Status sortir belum terkonfirmasi. Periksa data terbaru sebelum mengulang.');}
@@ -2550,7 +3390,7 @@ export default function App() {
         <div className="text-center space-y-4 z-10">
           <div className="animate-spin rounded-full h-12 w-12 border-t-2 border-b-2 border-emerald-500 mx-auto mb-2"></div>
           <p className="text-sm font-semibold tracking-wide text-emerald-400 uppercase">TRUEBLUE WMS</p>
-          <p className="text-xs text-slate-400">Menghubungkan ke Database Cloud Retail DC...</p>
+          <p className="text-xs text-slate-400">{t('login.connecting')}</p>
         </div>
       </div>
     );
@@ -2563,34 +3403,65 @@ export default function App() {
         <div className="absolute top-1/4 left-1/4 -translate-x-1/2 -translate-y-1/2 w-80 h-80 rounded-full bg-emerald-500/5 blur-3xl pointer-events-none"></div>
         <div className="absolute bottom-1/4 right-1/4 translate-x-1/2 translate-y-1/2 w-96 h-96 rounded-full bg-teal-500/5 blur-3xl pointer-events-none"></div>
 
+        {/* Floating Language Switcher in Top-Right Corner */}
+        <div className="absolute top-4 right-4 sm:top-6 sm:right-6 z-30 flex items-center gap-2 bg-[#11141B]/90 backdrop-blur-md px-3 py-1.5 rounded-2xl border border-slate-800 shadow-xl">
+          <Globe className="w-4 h-4 text-emerald-400 shrink-0" />
+          <div className="flex items-center rounded-xl bg-slate-950 p-0.5 border border-slate-800">
+            <button
+              type="button"
+              onClick={() => setLanguage('id')}
+              className={`px-2.5 py-1 text-xs font-bold rounded-lg transition-all cursor-pointer ${
+                language === 'id'
+                  ? 'bg-emerald-500 text-slate-950 shadow-sm'
+                  : 'text-slate-400 hover:text-white'
+              }`}
+              title="Bahasa Indonesia"
+            >
+              🇮🇩 ID
+            </button>
+            <button
+              type="button"
+              onClick={() => setLanguage('en')}
+              className={`px-2.5 py-1 text-xs font-bold rounded-lg transition-all cursor-pointer ${
+                language === 'en'
+                  ? 'bg-emerald-500 text-slate-950 shadow-sm'
+                  : 'text-slate-400 hover:text-white'
+              }`}
+              title="English"
+            >
+              🇬🇧 EN
+            </button>
+          </div>
+        </div>
+
         <div className="max-w-4xl w-full grid grid-cols-1 md:grid-cols-12 gap-8 items-center relative z-10">
           {/* Brand Presentation Section */}
           <div className="md:col-span-5 space-y-6 text-center md:text-left">
-            <div className="inline-flex bg-emerald-500/10 border border-emerald-500/25 p-4 rounded-3xl shadow-xl shadow-emerald-500/5">
-              <img src="/trueblue-lion.png" alt="Logo singa biru TRUEBLUE" className="w-16 h-16  object-contain" />
+            <div className="inline-flex p-1">
+              <img src="/trueblue-wms-logo.png" alt="Logo TRUEBLUE WMS" className="w-40 h-40 sm:w-44 sm:h-44 object-contain drop-shadow-xl" />
             </div>
             <div>
               <h1 className="text-3xl font-black text-white tracking-wider leading-tight uppercase font-sans">
                 TRUEBLUE WMS
-                <span className="text-emerald-400 block text-lg font-bold tracking-widest mt-1">WAREHOUSE OPERATION</span>
+                <span className="text-emerald-400 block text-lg font-bold tracking-widest mt-1">{t('login.brandTag')}</span>
               </h1>
               <p className="text-slate-400 text-xs mt-3 leading-relaxed">
-                Sistem pengelolaan stok gudang supermarket modern: kontrol persediaan sembako &amp; FMCG, pelacakan tanggal kadaluarsa FEFO, inbound penerimaan supplier, dan order gerai toko secara real-time.
+                {t('login.brandDesc')}
               </p>
             </div>
             
             <div className="hidden md:block p-4 rounded-2xl bg-slate-900/60 border border-slate-800/70 space-y-3.5 text-xs">
               <div className="flex items-center gap-2.5 text-slate-300">
                 <div className="w-2 h-2 rounded-full bg-emerald-400"></div>
-                <span>Kontrol Kadaluarsa FEFO (First-Expired-First-Out)</span>
+                <span>{t('login.featureFefo')}</span>
               </div>
               <div className="flex items-center gap-2.5 text-slate-300">
                 <div className="w-2 h-2 rounded-full bg-emerald-400"></div>
-                <span>Inbound Supplier &amp; Outbound Gerai Toko</span>
+                <span>{t('login.featureInboundOutbound')}</span>
               </div>
               <div className="flex items-center gap-2.5 text-slate-300">
                 <div className="w-2 h-2 rounded-full bg-emerald-400"></div>
-                <span>Manajemen Satuan Karton (CTN), Pack, &amp; Pcs</span>
+                <span>{t('login.featurePackSizes')}</span>
               </div>
             </div>
           </div>
@@ -2599,19 +3470,48 @@ export default function App() {
           <div className="md:col-span-7 bg-[#11141B] border border-slate-800/80 rounded-3xl shadow-2xl p-6 sm:p-8 relative overflow-hidden">
             <div className="absolute top-0 left-0 w-full h-1 bg-gradient-to-r from-emerald-500 via-teal-500 to-amber-500"></div>
             
-            <div className="mb-6">
-              <h2 className="text-lg font-bold text-white">Akses Sistem TRUEBLUE WMS</h2>
-              <p className="text-slate-400 text-xs mt-1">Masuk dengan akun operator Supabase yang sudah diundang.</p>
-              {!isSupabaseConfigured && (
-                <p className="mt-3 rounded-lg border border-amber-500/30 bg-amber-500/10 p-3 text-xs text-amber-200">
-                  Supabase belum dikonfigurasi. Salin .env.example ke .env, lalu isi URL proyek dan anon key dari dashboard Supabase.
-                </p>
-              )}
+            <div className="flex items-start justify-between gap-4 mb-6">
+              <div>
+                <h2 className="text-lg font-bold text-white">{t('login.title')}</h2>
+                <p className="text-slate-400 text-xs mt-1">{t('login.subtitle')}</p>
+              </div>
+              <div className="flex items-center rounded-xl bg-[#161B25] p-1 border border-slate-800 shrink-0">
+                <button
+                  type="button"
+                  onClick={() => setLanguage('id')}
+                  className={`px-2.5 py-1 text-[11px] font-extrabold rounded-lg transition-all cursor-pointer ${
+                    language === 'id'
+                      ? 'bg-emerald-500 text-slate-950 shadow-sm'
+                      : 'text-slate-400 hover:text-white'
+                  }`}
+                  title="Bahasa Indonesia"
+                >
+                  🇮🇩 ID
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setLanguage('en')}
+                  className={`px-2.5 py-1 text-[11px] font-extrabold rounded-lg transition-all cursor-pointer ${
+                    language === 'en'
+                      ? 'bg-emerald-500 text-slate-950 shadow-sm'
+                      : 'text-slate-400 hover:text-white'
+                  }`}
+                  title="English"
+                >
+                  🇬🇧 EN
+                </button>
+              </div>
             </div>
+
+            {!isSupabaseConfigured && (
+              <p className="mb-4 rounded-lg border border-amber-500/30 bg-amber-500/10 p-3 text-xs text-amber-200">
+                Supabase belum dikonfigurasi. Salin .env.example ke .env, lalu isi URL proyek dan anon key dari dashboard Supabase.
+              </p>
+            )}
 
             <form onSubmit={handleLogin} className="space-y-4">
               <div>
-                <label className="block text-[10px] uppercase tracking-wider font-extrabold text-slate-450 mb-1.5">ID akun atau email</label>
+                <label className="block text-[10px] uppercase tracking-wider font-extrabold text-slate-450 mb-1.5">{t('login.usernameLabel')}</label>
                 <div className="relative">
                   <span className="absolute inset-y-0 left-0 flex items-center pl-3 text-slate-500">
                     <User className="w-4 h-4" />
@@ -2619,7 +3519,7 @@ export default function App() {
                   <input
                     type="text" autoComplete="username"
                     required
-                    placeholder="ID akun atau email admin"
+                    placeholder={t('login.usernamePlaceholder')}
                     value={emailInput}
                     onChange={(e) => {
                       setEmailInput(e.target.value);
@@ -2632,13 +3532,13 @@ export default function App() {
 
               <div>
                 <div className="flex justify-between items-center mb-1.5">
-                  <label className="block text-[10px] uppercase tracking-wider font-extrabold text-slate-450">Password</label>
+                  <label className="block text-[10px] uppercase tracking-wider font-extrabold text-slate-450">{t('login.passwordLabel')}</label>
                   <button
                     type="button"
                     onClick={() => setShowPassword(!showPassword)}
                     className="text-[10px] text-emerald-400 hover:text-emerald-300 font-bold"
                   >
-                    {showPassword ? 'Sembunyikan' : 'Tampilkan'}
+                    {showPassword ? t('login.hidePassword') : t('login.showPassword')}
                   </button>
                 </div>
                 <div className="relative">
@@ -2648,7 +3548,7 @@ export default function App() {
                   <input
                     type={showPassword ? 'text' : 'password'}
                     required
-                    placeholder="Sandi Anda"
+                    placeholder={t('login.passwordPlaceholder')}
                     value={passwordInput}
                     onChange={(e) => {
                       setPasswordInput(e.target.value);
@@ -2672,20 +3572,36 @@ export default function App() {
                 className="w-full py-3 bg-emerald-500 hover:bg-emerald-400 text-slate-950 font-extrabold text-xs rounded-xl flex items-center justify-center gap-2 transition-all shadow-lg shadow-emerald-500/10 cursor-pointer uppercase tracking-wider"
               >
                 <LogIn className="w-4 h-4" />
-                Masuk ke Aplikasi
+                {t('login.submitBtn')}
               </button>
             </form>
 
+            <div className="mt-6 pt-4 border-t border-slate-800/80 text-center text-[11px] text-slate-400">
+              <p>© 2026 TRUEBLUE WMS · Copyright by <strong className="text-emerald-400 font-bold">KHOERUL AMRI</strong>. All rights reserved.</p>
+            </div>
           </div>
         </div>
+
+        {/* Footer login */}
+        <footer className="mt-8 text-center text-xs text-slate-500 z-10">
+          <p>© 2026 TRUEBLUE WMS — Copyright by KHOERUL AMRI. All rights reserved.</p>
+        </footer>
       </div>
     );
   }
 
   return (
-    <AppShell theme={theme} onToggleTheme={() => setTheme(nextUiTheme)} activeTab={activeTab} onNavigate={navigateFromMenu} currentUser={currentUser} connected={dbStatus==='connected'} stockSyncState={stockSyncState} onLogout={handleLogout} onUpload={handleForcePushStockToCloud} totalQty={totalSystemQty} onRefresh={()=>{if(confirm('Muat ulang data terbaru? Form yang belum disimpan akan ditutup.')){setLoading(true);setSyncTrigger(value=>value+1)}}}>
+    <AppShell theme={theme} onToggleTheme={() => setTheme(nextUiTheme)} activeTab={activeTab} onNavigate={navigateFromMenu} currentUser={currentUser} connected={dbStatus==='connected'} stockSyncState={stockSyncState} onLogout={handleLogout} onUpload={handleForcePushStockToCloud} totalQty={totalSystemQty} onRefresh={()=>{if(confirm('Muat ulang data terbaru? Form yang belum disimpan akan ditutup.')){setLoading(true);setSyncTrigger(value=>value+1)}}} branchOperationType={branchOperationType} onBranchOperationTypeChange={setBranchOperationType}>
       <main className="blues-page">
-          {isLoggedIn && stock.length === 0 && (
+          {updateAvailable && (
+            <div role="status" className="mb-4 flex items-center justify-between gap-3 rounded-xl border border-sky-400/40 bg-sky-500/15 px-4 py-3 text-sm text-sky-100 shadow-lg">
+              <span>Versi WMS terbaru sudah tersedia.</span>
+              <button type="button" className="rounded-lg bg-sky-400 px-3 py-1.5 font-bold text-slate-950 hover:bg-sky-300" onClick={() => window.location.reload()}>
+                Muat ulang versi terbaru
+              </button>
+            </div>
+          )}
+          {isLoggedIn && currentUser?.role !== 'Shipping' && stock.length === 0 && (
             <div className="mb-6 bg-gradient-to-r from-amber-500/10 via-purple-500/10 to-indigo-500/10 border border-amber-500/30 rounded-2xl p-4 shadow-xl flex flex-col sm:flex-row items-center justify-between gap-4">
               <div className="flex items-center gap-3">
                 <div className="p-3 bg-amber-500/20 text-amber-400 rounded-xl border border-amber-500/30 shrink-0">
@@ -2712,14 +3628,20 @@ export default function App() {
               exit={{ opacity: 0, y: -15 }}
               transition={{ duration: 0.15 }}
             >
+              <UnassignedOrdersBanner
+                orderHistory={orderHistory}
+                currentUser={currentUser}
+                onAssignOrderType={handleAssignOrderType}
+              />
               <Dashboard 
                 stock={stock} 
                 logs={logs} 
                 orderHistory={orderHistory}
                 batches={batches}
+                returns={returnHistory}
                 onNavigate={navigateFromMenu}
                 onOpenInventory={focus=>{if(!canBrowseInventory(currentUser?.role))return;setActiveWarehouseFilter('ALL');setInventoryEntryFocus(focus);setActiveTab('inventory');}}
-                onOpenWork={stage=>{if(!canOpenWork(currentUser?.role,stage))return;setOutboundEntryMode(stage);setActiveTab('bulk');}} 
+                onOpenWork={stage=>{if(!canOpenWork(currentUser?.role,stage))return;setOutboundEntryMode(stage);setActiveTab(branchSupportsOperation(branchOperationType, 'B2B') ? (stage === 'validate' ? 'b2b-packing' : 'b2b-picking') : 'online-picking');}} 
                 userRole={currentUser?.role}
                 currentTheme={theme}
               />
@@ -2735,7 +3657,9 @@ export default function App() {
               transition={{ duration: 0.15 }}
             >
               <InventoryList initialStockFocus={inventoryEntryFocus}
-                stock={stock} 
+                stock={stock}
+                catalog={catalog}
+                onSyncImportedNamesToCatalog={handleSyncImportedNamesToCatalog}
                 onUpdateStock={handleUpdateStock}
                 onEditStockItem={handleEditStockItem}
                 onAddStockItem={handleAddStockItem}
@@ -2753,51 +3677,158 @@ export default function App() {
 
 
 
-          {activeTab === 'bulk' && (
+          {activeTab === 'picker-hub' && (
             <motion.div
-              key="bulk"
+              key="picker-hub"
               initial={{ opacity: 0, y: 15 }}
               animate={{ opacity: 1, y: 0 }}
               exit={{ opacity: 0, y: -15 }}
               transition={{ duration: 0.15 }}
             >
-              <BulkOutbound initialMode={outboundEntryMode}
-                stock={stock} 
-                warehouses={warehouses}
-                onProcessOutbound={handleProcessOutbound}
+              <PickerHub
                 currentUser={currentUser}
-                orderHistory={orderHistory}
-                onEditOrderHistory={handleEditOrderHistory}
-                onEditOrderHistoryBatch={handleEditOrderHistoryBatch}
-                onEditMultipleOrdersBatch={handleEditMultipleOrdersBatch}
-                onBatchEditExpiredDate={handleBatchEditExpiredDateOrderHistory}
-                onDeleteOrderHistory={handleDeleteOrderHistory}
-                onDeleteMultipleOrders={handleDeleteMultipleOrders}
-                onClearAllOrderHistory={undefined}
-                onUpdateOrderSession={handleUpdateOrderSession}
-                onUpdateOrdersShipped={handleUpdateOrdersShipped}
+                branchOperationType={branchOperationType}
+                onSelectMenu={(menuId) => navigateFromMenu(menuId)}
               />
             </motion.div>
           )}
 
-          {activeTab === 'mabang' && (
-            <motion.div key="mabang" initial={{ opacity: 0, y: 15 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: -15 }}>
+          {(activeTab === 'b2b-input' || activeTab === 'b2b-picking' || activeTab === 'b2b-packing' || activeTab === 'b2b-history' || activeTab === 'online-input' || activeTab === 'online-history' || activeTab === 'orders' || activeTab === 'bulk') && (() => {
+            const isOnlineTab = activeTab === 'online-input' || activeTab === 'online-history';
+            const channelMode: ChannelOperationType = isOnlineTab
+              ? 'ONLINE'
+              : (activeTab === 'orders' && !branchSupportsOperation(branchOperationType, 'B2B') ? 'ONLINE' : 'B2B');
+            const allowedModes: ('create' | 'pick' | 'validate' | 'history')[] =
+              activeTab === 'b2b-input' || activeTab === 'online-input'
+                ? ['create']
+                : activeTab === 'b2b-picking'
+                  ? ['pick']
+                  : activeTab === 'b2b-packing'
+                    ? ['validate']
+                    : activeTab === 'b2b-history' || activeTab === 'online-history'
+                      ? ['history']
+                      : activeTab === 'orders'
+                        ? ['create', 'history']
+                        : (currentUser?.role === 'Picker' ? ['pick'] : currentUser?.role === 'Packer' ? ['validate'] : ['pick', 'validate']);
+            const initialMode: OutboundMode =
+              activeTab === 'b2b-input' || activeTab === 'online-input'
+                ? 'create'
+                : activeTab === 'b2b-picking'
+                  ? 'pick'
+                  : activeTab === 'b2b-packing'
+                    ? 'validate'
+                    : activeTab === 'b2b-history' || activeTab === 'online-history'
+                      ? 'history'
+                      : activeTab === 'orders'
+                        ? (['create', 'history'].includes(outboundEntryMode as any) ? (outboundEntryMode as OutboundMode) : 'create')
+                        : (currentUser?.role === 'Picker' ? 'pick' : currentUser?.role === 'Packer' ? 'validate' : (outboundEntryMode === 'validate' ? 'validate' : 'pick'));
+            return (
+              <motion.div
+                key={activeTab}
+                initial={{ opacity: 0, y: 15 }}
+                animate={{ opacity: 1, y: 0 }}
+                exit={{ opacity: 0, y: -15 }}
+                transition={{ duration: 0.15 }}
+              >
+                <BulkOutbound
+                  key={activeTab}
+                  channelMode={channelMode}
+                  allowedModes={allowedModes}
+                  initialMode={initialMode}
+                  stock={stock}
+                  warehouses={warehouses}
+                  onProcessOutbound={handleProcessOutbound}
+                  currentUser={currentUser}
+                  orderHistory={orderHistory}
+                  onEditOrderHistory={handleEditOrderHistory}
+                  onEditOrderHistoryBatch={handleEditOrderHistoryBatch}
+                  onEditMultipleOrdersBatch={handleEditMultipleOrdersBatch}
+                  onBatchEditExpiredDate={handleBatchEditExpiredDateOrderHistory}
+                  onDeleteOrderHistory={handleDeleteOrderHistory}
+                  onDeleteMultipleOrders={handleDeleteMultipleOrders}
+                  onClearAllOrderHistory={undefined}
+                  onUpdateOrderSession={handleUpdateOrderSession}
+                  onUpdateOrdersShipped={handleUpdateOrdersShipped}
+                  onAssignOrderType={handleAssignOrderType}
+                />
+              </motion.div>
+            );
+          })()}
+
+          {(activeTab === 'online-picking' || activeTab === 'online-sorting' || activeTab === 'online-packing' || activeTab === 'mabang') && (
+            <motion.div key="mabang-online" initial={{ opacity: 0, y: 15 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: -15 }}>
               <MabangWmsOutbound
                 stock={stock}
                 orderHistory={orderHistory}
                 onCompleteSorting={handleCompleteSorting}
+                resolveSortingTarget={async (barcode, slots) => {
+                  const clean = barcode.trim().toUpperCase();
+                  const matchedSku = (findSkuId(clean) || clean).trim().toUpperCase();
+                  for (const s of slots) {
+                    const rows = orderHistoryRef.current.filter(o => o.referenceNumber === s.reference && o.status === 'Pending');
+                    if (rows.some(o => o.skuId.trim().toUpperCase() === matchedSku || o.skuId.trim().toUpperCase() === clean || getBarcodeForSku(o.skuId).trim().toUpperCase() === clean)) {
+                      return s.reference;
+                    }
+                  }
+                  return undefined;
+                }}
                 currentUser={currentUser}
                 onEditOrderHistoryBatch={handleEditOrderHistoryBatch}
                 onEditMultipleOrdersBatch={handleEditMultipleOrdersBatch}
                 onUpdateOrderSession={handleUpdateOrderSession}
                 onOpenBasketLabelModal={() => setIsBasketLabelModalOpen(true)}
+                requestedScreen={
+                  activeTab === 'online-sorting'
+                    ? 'sorting'
+                    : activeTab === 'online-packing'
+                      ? 'delivery'
+                      : activeTab === 'online-picking'
+                        ? 'distribution'
+                        : mabangScreen
+                }
+                onScreenChange={(screen) => {
+                  setMabangScreen(screen);
+                  setActiveTab(screen === 'sorting' ? 'online-sorting' : screen === 'delivery' ? 'online-packing' : 'online-picking');
+                }}
+                requireExplicitOnlineType={true}
+              />
+            </motion.div>
+          )}
+
+          {activeTab === 'shipping-manifest' && (
+            <motion.div key="shipping-manifest" initial={{ opacity: 0, y: 15 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: -15 }}>
+              <CourierManifestManager
+                orderHistory={orderHistory}
+                currentUser={currentUser}
+                onUpdateOrdersShipped={handleUpdateOrdersShipped}
+                warehouses={warehouses}
+                selectedWarehouseId={activeWarehouseFilter !== 'ALL' ? activeWarehouseFilter : (warehouses.find(w => w.isCentral)?.id || 'WH-CENTRAL')}
+                onSelectWarehouseId={setActiveWarehouseFilter}
+                branchOperationType={branchOperationType}
+              />
+            </motion.div>
+          )}
+
+          {activeTab === 'marketplace-webhook' && (currentUser?.role === 'Administrator' || currentUser?.role === 'Admin') && (
+            <motion.div key="marketplace-webhook" initial={{ opacity: 0, y: 15 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: -15 }}>
+              <MarketplaceWebhook
+                currentUser={currentUser}
+                branchOperationType={branchOperationType}
+                onNavigateTab={navigateFromMenu}
               />
             </motion.div>
           )}
 
           {activeTab === 'quick-outbound' && (
             <motion.div key="quick-outbound" initial={{ opacity: 0, y: 15 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: -15 }}>
-              <OutboundManager stock={stock} orderHistory={orderHistory} warehouses={warehouses} onProcessOutbound={handleProcessOutbound} />
+              <OutboundManager 
+                stock={stock} 
+                orderHistory={orderHistory} 
+                warehouses={warehouses} 
+                onProcessOutbound={handleProcessOutbound}
+                currentUser={currentUser}
+                branchOperationType={branchOperationType}
+              />
             </motion.div>
           )}
 
@@ -2806,6 +3837,8 @@ export default function App() {
               <AnalyticsDashboard stock={stock} logs={logs} />
             </motion.div>
           )}
+
+
 
           {activeTab === 'inbound' && (
             <motion.div
@@ -2818,6 +3851,7 @@ export default function App() {
               <InboundManager
                 stock={stock}
                 catalog={catalog}
+                warehouses={warehouses}
                 onUpdateStock={handleUpdateStock}
                 onAddLog={handleAddLog}
                 onAddBatchLogs={handleAddBatchLogs}
@@ -2839,9 +3873,8 @@ export default function App() {
                 catalog={catalog}
                 returnHistory={returnHistory}
                 currentUser={currentUser}
-                onAddStockItem={handleAddStockItem}
-                onAddStockItemsBatch={handleAddStockItemsBatch}
                 onSaveReturnHistory={saveReturnHistoryState}
+                onProcessQc={handleProcessReturnQc}
               />
             </motion.div>
           )}
@@ -2977,6 +4010,8 @@ export default function App() {
                 onDeleteCatalogItem={handleDeleteCatalogItem}
                 onBatchImportCatalog={handleBatchImportCatalog}
                 onSyncStockToCatalog={handleSyncStockToCatalog}
+                onFetchAccessibleBranches={fetchAccessibleBranches}
+                onFetchBranchCatalog={fetchBranchCatalog}
               />
             </motion.div>
           )}
@@ -2999,15 +4034,21 @@ export default function App() {
             </motion.div>
           )}
 
-          {activeTab === 'marketplace-webhook' && (currentUser?.role === 'Administrator' || currentUser?.role === 'Admin') && (
+          {activeTab === 'reconciliation' && (currentUser?.role === 'Administrator' || currentUser?.role === 'Admin') && (
             <motion.div
-              key="marketplace-webhook"
+              key="reconciliation"
               initial={{ opacity: 0, y: 15 }}
               animate={{ opacity: 1, y: 0 }}
               exit={{ opacity: 0, y: -15 }}
               transition={{ duration: 0.15 }}
             >
-              <MarketplaceWebhook stock={stock} onNavigateTab={navigateFromMenu} />
+              <InventoryReconciliation
+                stock={stock}
+                orderHistory={orderHistory}
+                catalog={catalog}
+                warehouses={warehouses}
+                currentUser={currentUser}
+              />
             </motion.div>
           )}
 
@@ -3042,7 +4083,7 @@ export default function App() {
 
       {/* Humble Footer */}
       <footer className="blues-footer">
-        <p>© 2026 TRUEBLUE WMS — Development Environment.</p>
+        <p>© 2026 TRUEBLUE WMS — Copyright by KHOERUL AMRI. All rights reserved.</p>
         <p>Warehouse operation · TRUEBLUE</p>
       </footer>
     </AppShell>

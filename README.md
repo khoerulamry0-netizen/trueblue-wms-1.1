@@ -1,39 +1,18 @@
 # BLUES WMS
 
-Satu aplikasi WMS yang menggabungkan alur stok, FEFO, inbound, outbound, picking dan packing Mabang, batch, transfer gudang, retur, stock opname, label, analitik, dan asisten operasional dari empat arsip yang diberikan.
+Satu aplikasi WMS yang menggabungkan alur stok, FEFO, inbound, outbound, picking dan packing Mabang, batch, transfer gudang, retur, stock opname, label, dan analitik dari empat arsip yang diberikan.
 
 Data operasional disimpan bersama di satu proyek Supabase. Perangkat yang masuk ke proyek dan alamat aplikasi yang sama menerima perubahan melalui Supabase Realtime.
 
 ## Menyiapkan Supabase
 
-1. Buat proyek Supabase di akun Anda.
-2. Jalankan seluruh isi `supabase/migrations/20261105000000_unified_wms.sql` lewat SQL Editor. Migrasi membuat tabel profil dan dokumen WMS, kebijakan akses RLS, serta publikasi Realtime.
-3. Di pengaturan Authentication, matikan pendaftaran publik. Atur Site URL dan Redirect URLs agar sesuai dengan alamat aplikasi.
-4. Buat akun pertama lewat Authentication > Users. Aktifkan akun tersebut sebagai admin pertama melalui SQL Editor:
+### Status deployment
 
-   ```sql
-   update public.profiles
-   set role = 'Administrator', is_active = true
-   where email = 'admin@perusahaan.co.id';
-   ```
+Migrasi dalam repo ini belum disetujui untuk database hosted. Secara khusus, `supabase/migrations/20261107100000_local_wms_operational.sql` adalah migrasi development lokal; `supabase/LOCAL-DEVELOPMENT.md` melarang penggunaan target hosted. Perintah `supabase db push --remote` dapat menerapkan semua migrasi tertunda ke project hosted.
 
-   Ganti alamat email contoh dengan email akun yang baru dibuat. Setelah masuk, admin dapat mengundang operator dari menu Kelola Operator.
-5. Pasang Supabase CLI dan login. Hubungkan proyek WMS ke proyek Supabase Anda, lalu terapkan migrasi ke database hosted:
+Jangan jalankan `supabase db push --remote`, `supabase link` ke project produksi, atau deploy fungsi Edge ke project live berdasarkan panduan ini. Deployment produksi memerlukan set migrasi terpisah yang sudah ditinjau dan runbook yang disetujui.
 
-   ```sh
-   supabase login
-   supabase link --project-ref PROJECT_REF
-   supabase db push --remote
-   ```
-
-   Periksa konfirmasi CLI sebelum migrasi dijalankan. CLI Supabase terbaru menargetkan database lokal secara default; `--remote` diperlukan untuk database hosted.
-6. Deploy fungsi undangan dan pengelolaan akun:
-
-   ```sh
-   supabase functions deploy admin-users --project-ref PROJECT_REF
-   ```
-
-7. Untuk produksi, atur `VITE_SUPABASE_URL`, `VITE_SUPABASE_ANON_KEY`, `SUPABASE_URL`, dan `SUPABASE_ANON_KEY` langsung pada environment hosting dari Project Settings > API. Jangan masukkan service-role key ke variabel `VITE_*` atau ke browser. Jangan gunakan URL atau key project hosted di `.env` lokal atau `npm run dev`.
+Simpan `SUPABASE_SERVICE_ROLE_KEY` hanya di secret server. Jangan masukkan service-role key ke variabel `VITE_*` atau ke browser. Development lokal hanya boleh menggunakan Supabase loopback seperti dijelaskan di bawah.
 
 ## Development dengan database terpisah
 
@@ -69,11 +48,7 @@ npm install
 npm run dev
 ```
 
-Server pengembangan berjalan di port 3000 dan dapat dijangkau perangkat lain di jaringan yang sama. Untuk akses dari luar jaringan lokal, deploy server ke hosting yang menjalankan Node.js dengan HTTPS, lalu tambahkan alamat publik ke Redirect URLs Supabase. Semua perangkat harus membuka alamat aplikasi yang sama dan masuk dengan akun masing-masing.
-
-Asisten WMS memakai Gemini secara opsional. Isi `GEMINI_API_KEY` di `.env` server jika fitur tersebut diperlukan. Kunci ini hanya digunakan oleh server.
-
-Pada development lokal, Asisten selalu memakai jalur `/api/chat` di server lokal dan mengabaikan `VITE_ASSISTANT_API_URL`. Jika pemisahan frontend dan server telah disetujui, gunakan `VITE_ASSISTANT_API_URL` untuk origin server Asisten, `WMS_ALLOWED_ORIGINS` untuk daftar origin frontend yang diizinkan (dipisahkan koma), dan `WMS_FRONTEND_URL` untuk origin HTTPS tujuan tautan lama. `WMS_API_ONLY=true` menonaktifkan penyajian frontend oleh server API. Origin Asisten dan CORS harus HTTPS, kecuali HTTP pada loopback lokal. Mengubah konfigurasi hosting atau melakukan deployment memerlukan persetujuan terpisah.
+Server pengembangan berjalan pada loopback di port 3000. Semua perangkat operasional memakai alamat aplikasi yang sama dan masuk dengan akun masing-masing.
 
 ## Data dan akses
 

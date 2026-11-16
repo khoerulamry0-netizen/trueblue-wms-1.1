@@ -7,7 +7,7 @@ export function prepareOrderCompletion(stock:StockItem[],history:OutboundItem[],
  if(!updates.length||new Set(updates.map(u=>u.refNum)).size!==updates.length)throw new Error('Daftar order kosong atau berulang.');
  const refs=new Set(updates.map(u=>u.refNum)), originals=history.filter(o=>refs.has(o.referenceNumber)&&o.status==='Pending');
  const others=history.filter(o=>!refs.has(o.referenceNumber)),reserved=getLockedStockSummary(others);
- const pool=stock.map(s=>({...s})),changed=new Set<string>(),orders:OutboundItem[]=[];
+ const pool=stock.map(s=>({...s})),initialQtyById=new Map(stock.map(s=>[s.id,s.qty])),changed=new Set<string>(),orders:OutboundItem[]=[];
  const key=(o:StockItem|OutboundItem)=>getCanonicalStockId(o.skuId,o.expiredDate,o.location,o.warehouseId);
  const find=(o:StockItem|OutboundItem)=>{const candidates=pool.filter(s=>key(s)===key(o));if(candidates.length!==1)throw new Error('Stok SKU '+o.skuId+' di '+o.location+' / '+(o.warehouseId||'WH-CENTRAL')+' tidak ditemukan atau ambigu.');return candidates[0];};
  const totals=(items:OutboundItem[])=>{const t:Record<string,number>={};for(const o of items){const k=JSON.stringify([(o.warehouseId||'WH-CENTRAL').trim().toUpperCase(),o.skuId.trim().toUpperCase()]);t[k]=(t[k]||0)+o.qty;}return JSON.stringify(Object.entries(t).sort());};
@@ -49,7 +49,7 @@ export function prepareOrderCompletion(stock:StockItem[],history:OutboundItem[],
   }
  }
  if(new Set(orders.map(o=>o.id)).size!==orders.length)throw new Error('Baris order duplikat.');
- const changedStock=pool.filter(s=>changed.has(s.id)).map(s=>{
+ const changedStock=pool.filter(s=>changed.has(s.id)&&s.qty!==initialQtyById.get(s.id)).map(s=>{
   const isNoExp = isNoExpiryDate(s.expiredDate);
   const cleanEd = isNoExp ? 'No Expired' : (normalizeDateToDmy(s.expiredDate) || s.expiredDate);
   const cleanStatus = isNoExp && !/damage|rusak/i.test(s.status || '') ? 'AMAN' : s.status;

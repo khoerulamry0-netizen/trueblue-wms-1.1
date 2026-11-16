@@ -140,8 +140,12 @@ if (-not $ready) { throw 'Isolated PostgreSQL did not become ready; inspect befo
 $bootstrap = Get-Content -Raw -Encoding UTF8 (Join-Path $PSScriptRoot 'isolated-pg\bootstrap.sql')
 $base = Get-Content -Raw -Encoding UTF8 (Join-Path $root 'supabase\migrations\20261105000000_unified_wms.sql')
 $operational = Get-Content -Raw -Encoding UTF8 (Join-Path $root 'supabase\migrations\20261107100000_local_wms_operational.sql')
+$legacyDeletion = Get-Content -Raw -Encoding UTF8 (Join-Path $root 'supabase\migrations\20261111100000_allow_branch_delete.sql')
+$deletionSafety = Get-Content -Raw -Encoding UTF8 (Join-Path $root 'supabase\migrations\20261112094034_branch_deletion_safety.sql')
+$permanentDeletion = Get-Content -Raw -Encoding UTF8 (Join-Path $root 'supabase\migrations\20261112175307_permanent_branch_deletion.sql')
+$branchDeletion = Get-Content -Raw -Encoding UTF8 (Join-Path $root 'supabase\migrations\20261113000453_lossless_multipart_branch_backup.sql')
 $cronExtension = 'create extension if not exists pg_cron;'
-$cronSchedule = "select cron.schedule('blues-wms-daily-backup','0 20 * * *','select wms_private.backup_all_branches();');"
+$cronSchedule = "select cron.schedule('blues-wms-daily-backup','0 12 * * *','select wms_private.backup_all_branches();');"
 foreach ($needle in @($cronExtension,$cronSchedule)) {
   if ([regex]::Matches($operational,[regex]::Escape($needle)).Count -ne 1) { throw 'Unexpected pg_cron baseline; no replacement attempted.' }
 }
@@ -150,8 +154,13 @@ $operational = $operational.Replace($cronSchedule,'-- cron schedule omitted in i
 Invoke-TestSql 'Supabase emulation' $bootstrap
 Invoke-TestSql 'base migration' $base
 Invoke-TestSql 'operational migration with pg_cron omitted' $operational
+Invoke-TestSql 'legacy branch deletion baseline' $legacyDeletion
+Invoke-TestSql 'branch deletion safety baseline' $deletionSafety
+Invoke-TestSql 'permanent branch deletion baseline' $permanentDeletion
+Invoke-TestSql 'lossless multipart branch migration' $branchDeletion
 Invoke-TestSql 'synthetic fixtures' (Get-Content -Raw -Encoding UTF8 (Join-Path $PSScriptRoot 'isolated-pg\fixtures.sql'))
 Invoke-TestSql 'review candidate' (Get-Content -Raw -Encoding UTF8 (Join-Path $root 'supabase\snippets\packing-server-candidate.sql'))
 Invoke-TestSql 'sequential regression' (Get-Content -Raw -Encoding UTF8 (Join-Path $PSScriptRoot 'isolated-pg\sequential.sql'))
 Invoke-TestSql 'concurrency regression' (Get-Content -Raw -Encoding UTF8 (Join-Path $PSScriptRoot 'isolated-pg\concurrency.sql'))
+Invoke-TestSql 'lossless multipart branch deletion and recovery' (Get-Content -Raw -Encoding UTF8 (Join-Path $PSScriptRoot 'isolated-pg\branch-deletion.sql'))
 Write-Host 'Isolated SQL stages completed. Supabase HTTP/JWT/Auth/Realtime and deployment integration were NOT tested.'

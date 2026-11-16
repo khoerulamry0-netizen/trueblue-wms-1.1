@@ -1,10 +1,12 @@
-import type {SortingTask} from '../utils/orderSorting';
-import type {OrderSessionData,OrderSessionResult} from '../utils/orderSession';
-import { scanServerUnavailable } from '../utils/packingValidation';
+import {findActiveBasketConflicts, formatBasketConflictSummary, selectSortLoadCandidates, type SortingTask} from '../utils/orderSorting';
+import {buildMasterBasketMonitorData} from '../utils/masterBasketTracker';
+import {isOrderClaimedByAnotherPicker, type OrderIssueReportInput, type OrderSessionData, type OrderSessionResult} from '../utils/orderSession';
+import { scanServerUnavailable, hasSavedSorting } from '../utils/packingValidation';
 import { DEV_BASELINE_SORTING, getActiveBranch, SERVER_SCAN_ENABLED, serverScanRpc, supabase } from '../supabase';
 import { createScanServerSession, createSortingServerSession } from '../utils/sortingServerSession';
 import type { ScanProgress } from '../utils/serverScanRpc';
 import { normalizeDateToDmy, isStockPickable } from '../utils/calculations';
+import { resolveOrderType } from '../utils/orderType';
 import React, { useState, useMemo, useRef, useEffect } from 'react';
 import { 
   StockItem, 
@@ -24,6 +26,7 @@ import {
   RefreshCw, 
   ArrowRight, 
   Check, 
+  Copy,
   X, 
   Clock, 
   User, 
@@ -35,10 +38,15 @@ import {
   HelpCircle,
   ExternalLink,
   ChevronDown,
-  Info
+  Info,
+  Maximize2,
+  Minimize2,
+  PanelLeftClose
 } from 'lucide-react';
 import { findSkuId, getBarcodeForSku, BARCODE_MAP } from '../data/barcodeMap';
 import BasketLabelGeneratorModal from './BasketLabelGeneratorModal';
+import MasterBasketMonitorModal from './MasterBasketMonitorModal';
+import OrderIssueModal from './OrderIssueModal';
 import ShippingReceiptModal, { type ShippingOrderData } from './ShippingReceiptModal';
 
 interface MabangWmsOutboundProps {
@@ -61,6 +69,9 @@ interface MabangWmsOutboundProps {
   clearSortingIndicatorOnSelection?: boolean;
   resolveSortingTarget?: (barcode: string, orders: {reference: string; basket: string}[]) => Promise<string>;
   onClose?: () => void;
+  requestedScreen?: MabangScreen;
+  onScreenChange?: (screen: MabangScreen) => void;
+  requireExplicitOnlineType?: boolean;
 }
 
 export type MabangScreen = 'distribution' | 'sorting' | 'delivery';
@@ -82,15 +93,42 @@ export default function MabangWmsOutbound({
   loadSortingReferences,
   clearSortingIndicatorOnSelection,
   resolveSortingTarget,
-  onClose
+  onClose,
+  requestedScreen,
+  onScreenChange,
+  requireExplicitOnlineType = false,
 }: MabangWmsOutboundProps) {
   // Screen sub-navigation: Picker starts at 'distribution', Packer starts at 'sorting'
   const isPickerRole = currentUser?.role === 'Picker';
   const isPackerRole = currentUser?.role === 'Packer';
+  const isAdminRole = ['Administrator', 'Admin', 'Manager'].includes(currentUser?.role || '');
   const [currentScreen, setCurrentScreen] = useState<MabangScreen>(() => {
-    if (isPackerRole) return 'sorting';
-    return 'distribution';
+    if (isPickerRole) return 'distribution';
+    if (isPackerRole) return requestedScreen === 'delivery' ? 'delivery' : 'sorting';
+    return requestedScreen || 'distribution';
   });
+
+  const switchScreen = (next: MabangScreen) => {
+    const allowed: MabangScreen = isPickerRole
+      ? 'distribution'
+      : isPackerRole && next === 'distribution'
+        ? 'sorting'
+        : next;
+    setCurrentScreen(allowed);
+    onScreenChange?.(allowed);
+  };
+
+  useEffect(() => {
+    if (!requestedScreen) return;
+    const allowed: MabangScreen = isPickerRole
+      ? 'distribution'
+      : isPackerRole && requestedScreen === 'distribution'
+        ? 'sorting'
+        : requestedScreen;
+    if (allowed !== currentScreen) {
+      setCurrentScreen(allowed);
+    }
+  }, [requestedScreen, isPickerRole, isPackerRole]);
 
   // Ensure role stays on allowed screens if role changes
   useEffect(() => {
@@ -99,7 +137,7 @@ export default function MabangWmsOutbound({
     } else if (isPackerRole && currentScreen === 'distribution') {
       setCurrentScreen('sorting');
     }
-  }, [currentUser?.role]);
+  }, [currentUser?.role, isPickerRole, isPackerRole, currentScreen]);
 
   // Voice Broadcast State
   const [isVoiceEnabled, setIsVoiceEnabled] = useState(true);
@@ -107,6 +145,68 @@ export default function MabangWmsOutbound({
 
   // Shipping Receipt Print Modal State
   const [isBasketLabelModalOpen, setIsBasketLabelModalOpen] = useState(false);
+  const [isMasterBasketMonitorOpen, setIsMasterBasketMonitorOpen] = useState(false);
+  const [issueModalOpen, setIssueModalOpen] = useState(false);
+  const [operatorFocusMode, setOperatorFocusMode] = useState<boolean>(() => {
+    try {
+      return localStorage.getItem('wms_operator_focus_mode') === 'true';
+    } catch {
+      return false;
+    }
+  });
+  const toggleOperatorFocusMode = () => {
+    setOperatorFocusMode(prev => {
+      const next = !prev;
+      try { localStorage.setItem('wms_operator_focus_mode', String(next)); } catch {}
+      return next;
+    });
+  };
+  useEffect(() => {
+    if (!operatorFocusMode) return;
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Escape' && !isMasterBasketMonitorOpen && !isBasketLabelModalOpen && !issueModalOpen) {
+        setOperatorFocusMode(false);
+        try { localStorage.setItem('wms_operator_focus_mode', 'false'); } catch {}
+      }
+    };
+    document.addEventListener('keydown', onKeyDown);
+    return () => document.removeEventListener('keydown', onKeyDown);
+  }, [operatorFocusMode, isMasterBasketMonitorOpen, isBasketLabelModalOpen, issueModalOpen]);
+  const activeMasterBasketCount = useMemo(
+    () => (isAdminRole ? buildMasterBasketMonitorData(orderHistory).groups.length : 0),
+    [isAdminRole, orderHistory]
+  );
+
+  // Copy feedback state
+  const [copiedKey, setCopiedKey] = useState<string | null>(null);
+
+  const handleCopyText = async (text: string, key: string, e?: React.MouseEvent) => {
+    if (e) {
+      e.stopPropagation();
+      e.preventDefault();
+    }
+    if (!text) return;
+    try {
+      if (navigator?.clipboard?.writeText) {
+        await navigator.clipboard.writeText(text);
+      } else {
+        const textArea = document.createElement('textarea');
+        textArea.value = text;
+        textArea.style.position = 'fixed';
+        textArea.style.left = '-999999px';
+        document.body.appendChild(textArea);
+        textArea.select();
+        document.execCommand('copy');
+        document.body.removeChild(textArea);
+      }
+      setCopiedKey(key);
+      setTimeout(() => {
+        setCopiedKey(prev => (prev === key ? null : prev));
+      }, 1500);
+    } catch (err) {
+      console.error('Failed to copy: ', err);
+    }
+  };
 
   // Group pending orders
   const pendingOrders = useMemo(() => {
@@ -120,10 +220,14 @@ export default function MabangWmsOutbound({
       batchNumber?: string;
       customerAddress?: string;
       basketNumber?: string;
+      masterBasketNumber?: string;
       timestamp: string;
       items: OutboundItem[];
       totalQty: number;
       isPicked: boolean;
+      isSorted: boolean;
+      sortedBy?: string;
+      sortedAt?: string;
       pickingBy?: string;
       pickingStartedAt?: string;
       packingBy?: string;
@@ -138,6 +242,9 @@ export default function MabangWmsOutbound({
 
     (orderHistory || []).forEach(item => {
       if (item.status === 'Pending') {
+        const orderType = resolveOrderType(item);
+        if (requireExplicitOnlineType ? orderType !== 'ONLINE' : orderType === 'B2B') return;
+
         if (!groups[item.referenceNumber]) {
           // Infer courier from batchNumber, customerAddress or orderId
           let courier = 'J&T Express';
@@ -162,10 +269,14 @@ export default function MabangWmsOutbound({
             batchNumber: item.batchNumber,
             customerAddress: item.customerAddress || '-',
             basketNumber: item.basketNumber || '',
+            masterBasketNumber: item.masterBasketNumber || '',
             timestamp: item.timestamp,
             items: [],
             totalQty: 0,
             isPicked: true,
+            isSorted: Boolean(item.sortedAt?.trim() && item.sortedBy?.trim()),
+            sortedBy: item.sortedBy,
+            sortedAt: item.sortedAt,
             pickingBy: item.pickingBy,
             pickingStartedAt: item.pickingStartedAt,
             packingBy: item.packingBy,
@@ -182,6 +293,15 @@ export default function MabangWmsOutbound({
         groups[item.referenceNumber].totalQty += item.qty;
         if (!item.picked) {
           groups[item.referenceNumber].isPicked = false;
+        }
+        if (!item.sortedAt?.trim() || !item.sortedBy?.trim()) {
+          groups[item.referenceNumber].isSorted = false;
+        }
+        if (item.sortedBy && !groups[item.referenceNumber].sortedBy) {
+          groups[item.referenceNumber].sortedBy = item.sortedBy;
+        }
+        if (item.sortedAt && !groups[item.referenceNumber].sortedAt) {
+          groups[item.referenceNumber].sortedAt = item.sortedAt;
         }
       }
     });
@@ -255,11 +375,34 @@ export default function MabangWmsOutbound({
   const [distCompletedBatchRefs, setDistCompletedBatchRefs] = useState<string[]>([]);
   const [distNotification, setDistNotification] = useState<{ type: 'success' | 'error' | 'info'; message: string } | null>(null);
 
+  const pickerActorName = (currentUser?.fullName || 'Picker Staff').trim();
+
   // Available unpicked orders for M Distribution
-  // Otomatis mengecualikan order yang sudah berstatus isPicked maupun yang sudah diselesaikan pada batch lokal
+  // Otomatis mengecualikan order yang sudah isPicked, selesai pada batch lokal, atau sedang diklaim Picker lain
   const unpickedOrders = useMemo(() => {
-    return pendingOrders.filter(ord => !ord.isPicked && !distCompletedBatchRefs.includes(ord.referenceNumber));
-  }, [pendingOrders, distCompletedBatchRefs]);
+    return pendingOrders.filter(
+      ord => !ord.isPicked && !distCompletedBatchRefs.includes(ord.referenceNumber) && !isOrderClaimedByAnotherPicker(ord, pickerActorName)
+    );
+  }, [pendingOrders, distCompletedBatchRefs, pickerActorName]);
+
+  // Deteksi real-time apakah kode keranjang yang sedang diketik picker sedang aktif dipakai oleh batch lain
+  const typedBasketConflict = useMemo(() => {
+    const clean = distBasketInput.trim().toUpperCase();
+    if (!clean || !distActiveBatchOrders.length) return null;
+    const currentBatchRefs = new Set(distActiveBatchOrders.map(o => o.referenceNumber));
+    const conflicts = pendingOrders.filter(ord => {
+      if (currentBatchRefs.has(ord.referenceNumber)) return false;
+      return (ord.basketNumber || '').trim().toUpperCase() === clean;
+    });
+    if (conflicts.length > 0) {
+      return {
+        basket: clean,
+        count: conflicts.length,
+        isPicked: conflicts.some(o => o.isPicked)
+      };
+    }
+    return null;
+  }, [distBasketInput, distActiveBatchOrders, pendingOrders]);
 
   // Helper untuk membandingkan dan mengurutkan rute lokasi fisik gudang
   // Format contoh: AA-01-01, AA-01-02, AB-01-01, RAK-01, PALET-01, dst.
@@ -352,11 +495,16 @@ export default function MabangWmsOutbound({
   // Handle "Ambil tugas" - Ambil Batch Global Maksimal 20 Order
   const handleGetTask = (excludeOrderRefs: string[] = []) => {
     const combinedExcludedRefs = new Set([...distCompletedBatchRefs, ...excludeOrderRefs]);
-    const candidateOrders = pendingOrders.filter(ord => {
-      if (ord.isPicked || combinedExcludedRefs.has(ord.referenceNumber)) return false;
-      if (distShipVia === 'ALL') return true;
-      return ord.courier?.toLowerCase() === distShipVia.toLowerCase();
-    });
+    const isUnclaimedOrder = (ord: (typeof pendingOrders)[number]) =>
+      !(ord.pickingBy || '').trim() && !(ord.masterBasketNumber || ord.basketNumber || '').trim();
+    const candidateOrders = pendingOrders
+      .filter(ord => {
+        if (ord.isPicked || combinedExcludedRefs.has(ord.referenceNumber)) return false;
+        if (isOrderClaimedByAnotherPicker(ord, pickerActorName)) return false;
+        if (distShipVia === 'ALL') return true;
+        return ord.courier?.toLowerCase() === distShipVia.toLowerCase();
+      })
+      .sort((a, b) => Number(isUnclaimedOrder(b)) - Number(isUnclaimedOrder(a)));
 
     if (distPrioritize) {
       candidateOrders.sort((a, b) => {
@@ -417,11 +565,42 @@ export default function MabangWmsOutbound({
       setDistNotification({type:'error',message:!cleanBasket ? 'Nomor keranjang induk tidak boleh kosong!' : 'Ambil tugas terlebih dahulu sebelum mengikat keranjang.'});
       return;
     }
+
+    // CEGAH KERANJANG INDUK YANG SAMA DIGUNAKAN LAGI SEBELUM SELESAI PROSES (COMPLETED)
+    const currentBatchRefs = new Set(distActiveBatchOrders.map(o => o.referenceNumber));
+    const conflictingOrders = pendingOrders.filter(ord => {
+      if (currentBatchRefs.has(ord.referenceNumber)) return false;
+      return (ord.basketNumber || '').trim().toUpperCase() === cleanBasket;
+    });
+
+    const conflictingHistory = (orderHistory || []).filter(item => {
+      if (item.status !== 'Pending') return false;
+      if (currentBatchRefs.has(item.referenceNumber)) return false;
+      return (item.basketNumber || '').trim().toUpperCase() === cleanBasket;
+    });
+
+    if (conflictingOrders.length > 0 || conflictingHistory.length > 0) {
+      const busyCount = Math.max(conflictingOrders.length, new Set(conflictingHistory.map(i => i.referenceNumber)).size);
+      const isAlreadyPicked = conflictingOrders.some(o => o.isPicked) || conflictingHistory.some(i => i.picked);
+      const stage = isAlreadyPicked ? 'Meja Sortir / Packing' : 'Sedang Dipicking oleh Picker Lain';
+      setDistNotification({
+        type: 'error',
+        message: `❌ KERANJANG INDUK SEDANG AKTIF: Keranjang "${cleanBasket}" saat ini masih aktif digunakan oleh ${busyCount} order lain (${stage}) yang belum selesai proses. Tunggu sampai keranjang ini selesai dikemas & dikirim, atau gunakan keranjang fisik yang lain!`
+      });
+      playBuzzer(false);
+      speakVoice('Keranjang induk sedang digunakan order lain');
+      setTimeout(() => {
+        distBasketInputRef.current?.focus();
+        distBasketInputRef.current?.select();
+      }, 100);
+      return;
+    }
+
     basketBindingBusy.current = true; setIsBindingBasket(true);
     try {
-      const result = await onUpdateOrderSession(distActiveBatchOrders.map(o => o.referenceNumber), {basketNumber:cleanBasket,pickingBy:currentUser?.fullName || 'Picker Staff',pickingStartedAt:new Date().toISOString()});
+      const result = await onUpdateOrderSession(distActiveBatchOrders.map(o => o.referenceNumber), {basketNumber:cleanBasket,masterBasketNumber:cleanBasket,pickingBy:pickerActorName || 'Picker Staff',pickingStartedAt:new Date().toISOString()});
       if (!result) throw new Error('Server belum mengonfirmasi. Periksa data terbaru sebelum mengulang.');
-      setDistActiveBatchOrders(prev => prev.map(order => ({...order,basketNumber:cleanBasket,items:result.orders.filter(o => o.referenceNumber === order.referenceNumber)})));
+      setDistActiveBatchOrders(prev => prev.map(order => ({...order,basketNumber:cleanBasket,masterBasketNumber:cleanBasket,pickingBy:pickerActorName || 'Picker Staff',items:result.orders.filter(o => o.referenceNumber === order.referenceNumber)})));
       setDistBoundBasket(cleanBasket);
       setDistNotification({type:'success',message:'Keranjang Induk "'+cleanBasket+'" berhasil diikat untuk '+distActiveBatchOrders.length+' Order!'});
       playBuzzer(true); speakVoice('Keranjang induk '+cleanBasket+' berhasil disimpan.');
@@ -440,6 +619,22 @@ export default function MabangWmsOutbound({
 
     const cleanBasket = basketCode.trim().toUpperCase();
 
+    // Verifikasi keranjang tidak konflik dengan batch lain
+    const currentBatchRefs = new Set(ordersToFinalize.map(o => o.referenceNumber));
+    const conflicts = pendingOrders.filter(ord => {
+      if (currentBatchRefs.has(ord.referenceNumber)) return false;
+      return (ord.basketNumber || '').trim().toUpperCase() === cleanBasket;
+    });
+    if (conflicts.length > 0) {
+      setDistNotification({
+        type: 'error',
+        message: `❌ Keranjang Induk "${cleanBasket}" sedang aktif digunakan oleh batch lain (${conflicts.length} order belum selesai). Ganti keranjang fisik lain sebelum menyelesaikan picking!`
+      });
+      playBuzzer(false);
+      speakVoice('Keranjang induk sedang dipakai order lain');
+      return;
+    }
+
     // 1. Simpan perubahan ke orderHistory & potong stok untuk semua order di batch ini secara atomic
     const batchUpdates = ordersToFinalize.map(ord => ({
       refNum: ord.referenceNumber,
@@ -447,7 +642,8 @@ export default function MabangWmsOutbound({
         ...it,
         picked: true,
         pickedBy: currentUser?.fullName || 'Picker Staff',
-        basketNumber: cleanBasket
+        basketNumber: cleanBasket,
+        masterBasketNumber: cleanBasket
       })),
       isPicking: true
     }));
@@ -465,8 +661,15 @@ export default function MabangWmsOutbound({
     setSortTaskInput(cleanBasket);
     setSortActiveMasterBasket(cleanBasket);
 
-    const currentPrefix = sortPackerPrefix.trim().toUpperCase() || 'A';
-    const newSlots: SortBasketSlot[] = ordersToFinalize.slice(0, 20).map((ord, idx) => {
+    const rawPrefix = sortPackerPrefix.trim().toUpperCase() || '';
+    const batchSlice = ordersToFinalize.slice(0, 20);
+    const batchRefs = batchSlice.map(o => o.referenceNumber);
+    const proposedBaskets = rawPrefix ? batchSlice.map((_, idx) => `${rawPrefix}${idx + 1}`) : [];
+    const prefixConflicts = rawPrefix
+      ? findActiveBasketConflicts(orderHistory || [], proposedBaskets, batchRefs)
+      : [];
+    const currentPrefix = rawPrefix && prefixConflicts.length === 0 ? rawPrefix : '';
+    const newSlots: SortBasketSlot[] = batchSlice.map((ord, idx) => {
       const slotNum = idx + 1;
       const initialDecomp: { [itemId: string]: number } = {};
       ord.items.forEach(it => {
@@ -475,11 +678,12 @@ export default function MabangWmsOutbound({
 
       return {
         slotNumber: slotNum,
-        basketCode: `${currentPrefix}${slotNum}`,
-        isBasketBound: true,
+        basketCode: currentPrefix ? `${currentPrefix}${slotNum}` : '',
+        isBasketBound: Boolean(currentPrefix),
         order: {
           ...ord,
           basketNumber: cleanBasket,
+          masterBasketNumber: cleanBasket,
           isPicked: true
         },
         itemsDecomposed: initialDecomp,
@@ -487,13 +691,19 @@ export default function MabangWmsOutbound({
       };
     });
 
+    setSortActiveMasterBasket(cleanBasket);
     setSortSlots(newSlots);
     setSortSelectedSlotNumber(1);
     setSortTargetSlotForBind(1);
     setSortBasketInputManual('');
+    saveSortSessionToStorage(cleanBasket, currentPrefix, newSlots);
     setSortNotification({ 
-      type: 'success', 
-      message: `✓ Batch Selesai! Keranjang Induk "${cleanBasket}" (${newSlots.length} pesanan) berhasil dimuat ke meja Sortir (${currentPrefix}1 s/d ${currentPrefix}${newSlots.length}).` 
+      type: prefixConflicts.length > 0 ? 'error' : 'success', 
+      message: prefixConflicts.length > 0
+        ? `❌ Keranjang Induk "${cleanBasket}" dimuat, namun Kode Packer "${rawPrefix}" DITOLAK karena masih aktif di ${formatBasketConflictSummary(prefixConflicts)}. Gunakan Kode Packer lain!`
+        : currentPrefix 
+        ? `✓ Batch Selesai! Keranjang Induk "${cleanBasket}" (${newSlots.length} pesanan) dimuat ke meja Sortir (${currentPrefix}1 s/d ${currentPrefix}${newSlots.length}).`
+        : `✓ Batch Selesai! Keranjang Induk "${cleanBasket}" (${newSlots.length} pesanan) dimuat ke meja Sortir. Silakan isi kode anak keranjang untuk setiap slot.`
     });
 
     // 3. Reset total layar picking agar kosong dan siap untuk batch berikutnya!
@@ -512,14 +722,14 @@ export default function MabangWmsOutbound({
 
     // 4. Pindah ke layar Sortir HANYA jika BUKAN akun Picker
     if (isPickerRole) {
-      setCurrentScreen('distribution');
+      switchScreen('distribution');
       playBuzzer(true);
       speakVoice(`Semua barang keranjang ${cleanBasket} selesai diambil. Silakan ambil tugas berikutnya.`);
       setTimeout(() => {
         distBasketInputRef.current?.focus();
       }, 100);
     } else {
-      setCurrentScreen('sorting');
+      switchScreen('sorting');
       playBuzzer(true);
       speakVoice(`Semua barang keranjang ${cleanBasket} selesai. Beralih ke meja sortir.`);
     }
@@ -639,10 +849,23 @@ export default function MabangWmsOutbound({
   const [sortProductInput, setSortProductInput] = useState<string>('');
   const sortProductRef = useRef<HTMLInputElement>(null);
   const sortPackerPrefixRef = useRef<HTMLInputElement>(null);
-  const [bigBasketDisplay, setBigBasketDisplay] = useState(false);
-  const [bigBasketResult, setBigBasketResult] = useState<{type:'success'|'error'; basket?:string} | null>(null);
+  const sortBasketInputRef = useRef<HTMLInputElement>(null);
+  const [sortCompactMode, setSortCompactMode] = useState<boolean>(() => {
+    try {
+      return localStorage.getItem('wms_sort_compact_mode') === 'true';
+    } catch {
+      return false;
+    }
+  });
+  const toggleSortCompactMode = () => {
+    setSortCompactMode(prev => {
+      const next = !prev;
+      try { localStorage.setItem('wms_sort_compact_mode', String(next)); } catch {}
+      return next;
+    });
+  };
   const [sortActiveMasterBasket, setSortActiveMasterBasket] = useState<string | null>(null);
-  const [sortPackerPrefix, setSortPackerPrefix] = useState<string>('A'); // default prefix misal A, RR, B, PACKER-1
+  const [sortPackerPrefix, setSortPackerPrefix] = useState<string>(''); // biarkan kosong default-nya sesuai instruksi
   const [sortTargetSlotForBind, setSortTargetSlotForBind] = useState<number>(1);
   const [sortBasketInputManual, setSortBasketInputManual] = useState<string>('');
   const useBaselineSort = DEV_BASELINE_SORTING || !SERVER_SCAN_ENABLED;
@@ -666,6 +889,103 @@ export default function MabangWmsOutbound({
   const [sortStarted, setSortStarted] = useState(false);
   const [sortServerReady, setSortServerReady] = useState(false);
   const sortRestoreAttempted = useRef(false);
+  const [sortRightPanelMode, setSortRightPanelMode] = useState<'sku' | 'slot'>('sku');
+  const [sortLastScannedSku, setSortLastScannedSku] = useState<{
+    skuId: string;
+    skuName: string;
+    barcode: string;
+    basketCode: string;
+    slotNumber: number;
+    itemScanned: number;
+    itemRequired: number;
+  } | null>(null);
+  const prevSortSnapshotRef = useRef<{
+    master: string | null;
+    refsKey: string;
+    countsByRef: Record<string, Record<string, number>>;
+  }>({ master: null, refsKey: '', countsByRef: {} });
+
+  // Deteksi SKU yang baru discan dari perubahan sortSlots agar panel hero & panel kanan
+  // selalu sinkron baik di mode server scan maupun baseline tanpa mengubah handler RPC.
+  useEffect(() => {
+    if (sortSlots.length === 0) {
+      prevSortSnapshotRef.current = { master: null, refsKey: '', countsByRef: {} };
+      setSortLastScannedSku(null);
+      setSortRightPanelMode('sku');
+      return;
+    }
+
+    const refsKey = sortSlots.map(s => s.order.referenceNumber).join('|');
+    const nextCountsByRef: Record<string, Record<string, number>> = {};
+    for (const slot of sortSlots) {
+      nextCountsByRef[slot.order.referenceNumber] = { ...slot.itemsDecomposed };
+    }
+
+    const prev = prevSortSnapshotRef.current;
+    const isSameBatch = prev.refsKey === refsKey && prev.master === (sortActiveMasterBasket || null);
+
+    if (!isSameBatch) {
+      prevSortSnapshotRef.current = {
+        master: sortActiveMasterBasket || null,
+        refsKey,
+        countsByRef: nextCountsByRef
+      };
+      setSortLastScannedSku(null);
+      setSortRightPanelMode('sku');
+      return;
+    }
+
+    const increments: Array<{
+      slot: SortBasketSlot;
+      item: OutboundItem;
+      nextCount: number;
+      diff: number;
+    }> = [];
+    let anyDecreased = false;
+
+    for (const slot of sortSlots) {
+      const prevMap = prev.countsByRef[slot.order.referenceNumber] || {};
+      for (const item of slot.order.items) {
+        const before = prevMap[item.id] || 0;
+        const after = slot.itemsDecomposed[item.id] || 0;
+        if (after > before) {
+          increments.push({ slot, item, nextCount: after, diff: after - before });
+        } else if (after < before) {
+          anyDecreased = true;
+        }
+      }
+    }
+
+    prevSortSnapshotRef.current = {
+      master: sortActiveMasterBasket || null,
+      refsKey,
+      countsByRef: nextCountsByRef
+    };
+
+    if (anyDecreased) {
+      setSortLastScannedSku(null);
+      setSortRightPanelMode('sku');
+      return;
+    }
+
+    if (increments.length === 1 && increments[0].diff === 1) {
+      const { slot, item, nextCount } = increments[0];
+      const catalogBarcode =
+        getBarcodeForSku(item.skuId) ||
+        stock.find(st => st.skuId.trim().toUpperCase() === item.skuId.trim().toUpperCase())?.barcode ||
+        '';
+      setSortLastScannedSku({
+        skuId: item.skuId,
+        skuName: item.skuName || item.skuId,
+        barcode: catalogBarcode,
+        basketCode: slot.basketCode,
+        slotNumber: slot.slotNumber,
+        itemScanned: nextCount,
+        itemRequired: item.qty
+      });
+      setSortRightPanelMode('sku');
+    }
+  }, [sortSlots, sortActiveMasterBasket, stock]);
 
   useEffect(() => {
     if ((DEV_BASELINE_SORTING || (resolveSortingTarget && SERVER_SCAN_ENABLED)) && currentScreen === 'sorting' && !savingSort &&
@@ -673,6 +993,54 @@ export default function MabangWmsOutbound({
       sortProductRef.current?.focus();
     }
   }, [resolveSortingTarget, currentScreen, savingSort, sortSlots]);
+
+  // Helper persistence functions for Sortir (Anti-Mati Listrik / Re-load Induk)
+  const getSortSessionKey = (branch: string, masterBasket: string) => 
+    `wms_mabang_sort_session_${branch.toUpperCase()}_${masterBasket.trim().toUpperCase()}`;
+  const getActiveSortMasterKey = (branch: string) => 
+    `wms_mabang_active_sort_basket_${branch.toUpperCase()}`;
+
+  const saveSortSessionToStorage = (
+    masterBasket: string,
+    packerPrefix: string,
+    slots: SortBasketSlot[]
+  ) => {
+    try {
+      const branch = getActiveBranch() || 'DEFAULT';
+      const cleanBasket = masterBasket.trim().toUpperCase();
+      if (!cleanBasket || !slots.length) return;
+
+      const sessionData = {
+        branch,
+        masterBasket: cleanBasket,
+        packerPrefix: packerPrefix.trim().toUpperCase() || '',
+        updatedAt: new Date().toISOString(),
+        slots: slots.map(s => ({
+          slotNumber: s.slotNumber,
+          basketCode: s.basketCode,
+          isBasketBound: s.isBasketBound,
+          referenceNumber: s.order.referenceNumber,
+          itemsDecomposed: s.itemsDecomposed,
+          isComplete: s.isComplete
+        }))
+      };
+
+      localStorage.setItem(getSortSessionKey(branch, cleanBasket), JSON.stringify(sessionData));
+      localStorage.setItem(getActiveSortMasterKey(branch), cleanBasket);
+    } catch (err) {
+      console.warn('Gagal menyimpan sesi sortir ke localStorage:', err);
+    }
+  };
+
+  const clearSortSessionFromStorage = (masterBasket?: string | null) => {
+    try {
+      const branch = getActiveBranch() || 'DEFAULT';
+      if (masterBasket) {
+        localStorage.removeItem(getSortSessionKey(branch, masterBasket));
+      }
+      localStorage.removeItem(getActiveSortMasterKey(branch));
+    } catch {}
+  };
 
   const sortingIdentity = async () => {
     if (!SERVER_SCAN_ENABLED || !supabase) throw new Error(scanServerUnavailable);
@@ -718,10 +1086,16 @@ export default function MabangWmsOutbound({
       throw new Error('Baris order tidak cocok dengan sesi server. Muat ulang data.');
     }
     const counts = Object.fromEntries(progress.counts.map(line => [line.documentId, line.scanned]));
-    setSortSlots(previous => previous.map(current => current.order.referenceNumber === slot.order.referenceNumber
-      ? { ...current, basketCode: progress.basket, itemsDecomposed: counts,
-          isComplete: progress.current && progress.counts.every(line => line.scanned === line.required) }
-      : current));
+    setSortSlots(previous => {
+      const next = previous.map(current => current.order.referenceNumber === slot.order.referenceNumber
+        ? { ...current, basketCode: progress.basket, itemsDecomposed: counts,
+            isComplete: progress.current && progress.counts.every(line => line.scanned === line.required) }
+        : current);
+      if (sortActiveMasterBasket) {
+        saveSortSessionToStorage(sortActiveMasterBasket, sortPackerPrefix, next);
+      }
+      return next;
+    });
   };
 
   useEffect(() => {
@@ -768,6 +1142,64 @@ export default function MabangWmsOutbound({
     return () => { active = false; };
   }, [currentUser?.username, pendingOrders.length > 0]);
 
+  // Auto-restore sesi sortir setelah mati listrik / refresh browser (Anti-Mati Listrik)
+  useEffect(() => {
+    if (currentScreen !== 'sorting' || sortSlots.length > 0 || !pendingOrders.length) return;
+    try {
+      const branch = getActiveBranch() || 'DEFAULT';
+      const activeMaster = localStorage.getItem(getActiveSortMasterKey(branch));
+      if (!activeMaster) return;
+
+      const savedRaw = localStorage.getItem(getSortSessionKey(branch, activeMaster));
+      if (!savedRaw) return;
+
+      const session = JSON.parse(savedRaw);
+      if (!session || !session.slots || !Array.isArray(session.slots) || !session.slots.length) return;
+
+      const restoredSlots: SortBasketSlot[] = [];
+      for (const s of session.slots) {
+        const ord = pendingOrders.find(o => o.referenceNumber === s.referenceNumber && o.isPicked && !o.isSorted);
+        if (ord) {
+          const initialDecomp: { [itemId: string]: number } = {};
+          ord.items.forEach(it => { initialDecomp[it.id] = 0; });
+          const itemsDecomp = { ...initialDecomp, ...(s.itemsDecomposed || {}) };
+          const isComplete = ord.items.every(line => (itemsDecomp[line.id] || 0) >= line.qty);
+          restoredSlots.push({
+            slotNumber: s.slotNumber,
+            basketCode: s.basketCode,
+            isBasketBound: true,
+            order: ord,
+            itemsDecomposed: itemsDecomp,
+            isComplete
+          });
+        }
+      }
+
+      if (restoredSlots.length > 0) {
+        setSortActiveMasterBasket(session.masterBasket);
+        setSortPackerPrefix(session.packerPrefix || '');
+        setSortTaskInput(session.masterBasket);
+        setSortSlots(restoredSlots);
+        setSortSelectedSlotNumber(1);
+        const completedCount = restoredSlots.filter(s => s.isComplete).length;
+        const totalScanned = restoredSlots.reduce((sum, s) => sum + Object.values(s.itemsDecomposed).reduce((a, b) => a + b, 0), 0);
+        setSortNotification({
+          type: 'info',
+          message: `⚡ SESI SORTIR DIPULIHKAN: Ditemukan sesi aktif keranjang induk "${session.masterBasket}" (${completedCount} dari ${restoredSlots.length} keranjang selesai, total ${totalScanned} pcs tersortir). Silakan lanjutkan!`
+        });
+        playBuzzer(true);
+        speakVoice(`Sesi sortir keranjang ${session.masterBasket} dipulihkan.`);
+        setTimeout(() => {
+          sortProductRef.current?.focus();
+        }, 150);
+      } else {
+        clearSortSessionFromStorage(activeMaster);
+      }
+    } catch (err) {
+      console.warn('Gagal memulihkan sesi sortir otomatis:', err);
+    }
+  }, [currentScreen, pendingOrders]);
+
   // Cek apakah semua slot yang aktif sudah diinput keranjangnya
   const allBasketsBound = useMemo(() => {
     if (sortSlots.length === 0) return false;
@@ -780,19 +1212,36 @@ export default function MabangWmsOutbound({
   }, [sortSlots]);
 
   // Handler Terapkan Kode Packer (misal "A" -> A1 s/d A20, "RR" -> RR1 s/d RR20)
-  const handleApplyPackerPrefix = (prefixToUse?: string) => {
-    if (sortStarted || sortSaveBusy.current) { setSortNotification({type:'error',message:'Keranjang tidak dapat diubah setelah sesi server dimulai.'}); return; }
+  const handleApplyPackerPrefix = (prefixToUse?: string): boolean => {
+    if (sortStarted || sortSaveBusy.current) { setSortNotification({type:'error',message:'Keranjang tidak dapat diubah setelah sesi server dimulai.'}); return false; }
     if (sortSlots.length === 0) {
       setSortNotification({ type: 'error', message: 'Muat tugas sortir terlebih dahulu sebelum mengatur keranjang packer!' });
       playBuzzer(false);
-      return;
+      return false;
     }
 
     const cleanPrefix = (prefixToUse || sortPackerPrefix).trim().toUpperCase();
     if (!cleanPrefix) {
       setSortNotification({ type: 'error', message: 'Kode Packer tidak boleh kosong (misal: A, RR, P1)!' });
       playBuzzer(false);
-      return;
+      return false;
+    }
+
+    const batchRefs = sortSlots.map(s => s.order.referenceNumber);
+    const candidateBaskets = sortSlots.map(s => `${cleanPrefix}${s.slotNumber}`);
+    const conflicts = findActiveBasketConflicts(orderHistory || [], candidateBaskets, batchRefs);
+    if (conflicts.length > 0) {
+      setSortNotification({
+        type: 'error',
+        message: `❌ DITOLAK: Kode Packer "${cleanPrefix}" bentrok dengan order yang masih aktif (${formatBasketConflictSummary(conflicts)}). Tunggu order di antrian Packing selesai dikemas atau gunakan Kode Packer lain!`
+      });
+      playBuzzer(false);
+      speakVoice('Kode packer masih dipakai di antrian packing');
+      setTimeout(() => {
+        sortPackerPrefixRef.current?.focus();
+        sortPackerPrefixRef.current?.select();
+      }, 50);
+      return false;
     }
 
     const updated = sortSlots.map(s => ({
@@ -803,8 +1252,10 @@ export default function MabangWmsOutbound({
 
     setSortSlots(updated);
     setSortLastAssignedSlot(null);
-    setBigBasketResult(null);
     setSortPackerPrefix(cleanPrefix);
+    if (sortActiveMasterBasket) {
+      saveSortSessionToStorage(sortActiveMasterBasket, cleanPrefix, updated);
+    }
     setSortNotification({ 
       type: 'success', 
       message: `✓ Berhasil mengatur keranjang Packer "${cleanPrefix}": ${updated[0].basketCode} s/d ${updated[updated.length - 1].basketCode}!` 
@@ -813,15 +1264,21 @@ export default function MabangWmsOutbound({
     speakVoice(`Keranjang packer ${cleanPrefix} dari satu sampai ${updated.length} terpasang.`);
     setTimeout(() => {
       sortProductRef.current?.focus();
+      sortProductRef.current?.select();
     }, 100);
+    return true;
   };
 
   // Load task / master basket for sorting
-  const handleLoadSortTask = async (e?: React.FormEvent) => {
+  const handleLoadSortTask = async (e?: React.FormEvent | null, explicitQuery?: string) => {
     if (e) e.preventDefault();
     if (sortSaveBusy.current || sortStarted) { setSortNotification({type:'error',message:'Selesaikan atau pulihkan sesi sortir sebelum memuat tugas lain.'}); return; }
-    const query = sortTaskInput.trim().toUpperCase();
+    const rawQuery = explicitQuery !== undefined ? explicitQuery : sortTaskInput;
+    const query = rawQuery.trim().toUpperCase();
     if (!query) return;
+    if (explicitQuery !== undefined) {
+      setSortTaskInput(query);
+    }
 
     let eligibleOrders = pendingOrders;
     if (loadSortingReferences) {
@@ -835,30 +1292,56 @@ export default function MabangWmsOutbound({
       } finally { sortSaveBusy.current = false; setSavingSort(false); }
     }
 
-    // Hanya muat keranjang atau nomor order yang benar-benar cocok.
-    let matchingOrders = eligibleOrders.filter(ord =>
-      ord.basketNumber?.toUpperCase() === query
-    );
-
-    if (matchingOrders.length === 0) {
-      const singleMatch = eligibleOrders.find(ord =>
-        ord.referenceNumber.toUpperCase() === query || 
-        ord.orderId?.toUpperCase() === query
-      );
-      if (singleMatch) {
-        matchingOrders = [singleMatch];
-      }
-    }
+    // Hanya muat pesanan yang benar-benar sudah selesai picking dan belum disortir.
+    const {
+      readyOrders: matchingOrders,
+      fellBackToSingleOrder,
+      alreadySortedCount,
+      unpickedCount
+    } = selectSortLoadCandidates(eligibleOrders, query);
 
 
     if (matchingOrders.length > 0) {
       const ordersToDecompose = matchingOrders.slice(0, 20);
-      const masterBasketName = query || ordersToDecompose[0].basketNumber || 'GB-01';
+      const resolvedSingleBasket = fellBackToSingleOrder
+        ? (ordersToDecompose[0].masterBasketNumber || ordersToDecompose[0].basketNumber || '').trim().toUpperCase()
+        : '';
+      const masterBasketName = resolvedSingleBasket || query || ordersToDecompose[0].masterBasketNumber || ordersToDecompose[0].basketNumber || 'GB-01';
       setSortActiveMasterBasket(masterBasketName);
 
-      // Inisialisasi 20 Slot Keranjang Sortir
-      // Otomatis terapkan prefix packer saat ini (misal A1 s/d A20 atau RR1 s/d RR20)
-      const currentPrefix = sortPackerPrefix.trim().toUpperCase() || 'A';
+      // Inisialisasi 20 Slot Keranjang Sortir dengan pemulihan progress sebelumnya (Anti-Mati Listrik)
+      const branch = getActiveBranch() || 'DEFAULT';
+      const savedRaw = localStorage.getItem(getSortSessionKey(branch, masterBasketName));
+      let savedSession: {
+        packerPrefix?: string;
+        slots?: Array<{
+          slotNumber: number;
+          basketCode: string;
+          isBasketBound?: boolean;
+          referenceNumber: string;
+          itemsDecomposed: { [itemId: string]: number };
+          isComplete: boolean;
+        }>;
+      } | null = null;
+
+      if (savedRaw) {
+        try {
+          savedSession = JSON.parse(savedRaw);
+        } catch {}
+      }
+
+      const batchRefs = ordersToDecompose.map(ord => ord.referenceNumber);
+      const rawPrefix = savedSession?.packerPrefix || sortPackerPrefix.trim().toUpperCase() || '';
+      const prefixConflicts = rawPrefix
+        ? findActiveBasketConflicts(orderHistory || [], ordersToDecompose.map((_, idx) => `${rawPrefix}${idx + 1}`), batchRefs)
+        : [];
+      const currentPrefix = rawPrefix && prefixConflicts.length === 0 ? rawPrefix : '';
+      if (savedSession?.packerPrefix && prefixConflicts.length === 0) {
+        setSortPackerPrefix(savedSession.packerPrefix);
+      }
+
+      const restoredBasketConflicts: ReturnType<typeof findActiveBasketConflicts> = [];
+      let restoredAnyProgress = false;
       const newSlots: SortBasketSlot[] = ordersToDecompose.map((ord, idx) => {
         const slotNum = idx + 1;
         const initialDecomp: { [itemId: string]: number } = {};
@@ -866,33 +1349,122 @@ export default function MabangWmsOutbound({
           initialDecomp[it.id] = 0;
         });
 
+        // Cari apakah ada progres tersimpan untuk order ini
+        const prevSlot = savedSession?.slots?.find(s => s.referenceNumber === ord.referenceNumber);
+        let itemsDecomp = initialDecomp;
+        let prevBasketCode = prevSlot?.basketCode || '';
+        if (prevBasketCode) {
+          const prevConflicts = findActiveBasketConflicts(orderHistory || [], [prevBasketCode], batchRefs);
+          if (prevConflicts.length > 0) {
+            restoredBasketConflicts.push(...prevConflicts);
+            prevBasketCode = '';
+          }
+        }
+        const basketCode = prevBasketCode || (currentPrefix ? `${currentPrefix}${slotNum}` : '');
+        const isBasketBound = Boolean(prevBasketCode ? prevSlot?.isBasketBound : (currentPrefix && basketCode));
+        let isComplete = false;
+
+        if (prevSlot && prevSlot.itemsDecomposed) {
+          itemsDecomp = { ...initialDecomp, ...prevSlot.itemsDecomposed };
+          isComplete = ord.items.every(line => (itemsDecomp[line.id] || 0) >= line.qty);
+          if (Object.values(itemsDecomp).some(cnt => cnt > 0)) {
+            restoredAnyProgress = true;
+          }
+        }
+
         return {
           slotNumber: slotNum,
-          basketCode: `${currentPrefix}${slotNum}`, // misal A1, A2... atau RR1, RR2...
-          isBasketBound: true, // langsung terikat otomatis dengan kode packer
+          basketCode,
+          isBasketBound,
           order: ord,
-          itemsDecomposed: initialDecomp,
-          isComplete: false
+          itemsDecomposed: itemsDecomp,
+          isComplete
         };
       });
 
       setSortSlots(newSlots);
       setSortSelectedSlotNumber(1);
       if (clearSortingIndicatorOnSelection) setSortLastAssignedSlot(null);
-      setBigBasketResult(null);
-      setSortTargetSlotForBind(1);
+      const firstUnbound = newSlots.find(s => !s.isBasketBound);
+      setSortTargetSlotForBind(firstUnbound ? firstUnbound.slotNumber : 1);
       setSortBasketInputManual('');
-      setSortNotification({ 
-        type: 'success', 
-        message: `Order berhasil dimuat (${newSlots.length} pesanan). Keranjang Packer "${currentPrefix}": ${newSlots[0].basketCode} s/d ${newSlots[newSlots.length - 1].basketCode} siap digunakan!` 
-      });
-      playBuzzer(true);
-      speakVoice(`Order dimuat. Keranjang packer ${currentPrefix} siap.`);
+
+      // Simpan sesi terverifikasi ke storage
+      saveSortSessionToStorage(masterBasketName, currentPrefix, newSlots);
+
+      const completedSlotsCount = newSlots.filter(s => s.isComplete).length;
+      const totalScannedPcs = newSlots.reduce((acc, s) => acc + Object.values(s.itemsDecomposed).reduce((a, b) => a + b, 0), 0);
+      const allBound = newSlots.every(s => s.isBasketBound && s.basketCode.trim());
+      const allLoadConflicts = [...prefixConflicts, ...restoredBasketConflicts];
+
+      if (allLoadConflicts.length > 0) {
+        setSortNotification({
+          type: 'error',
+          message: `❌ Order dimuat (${newSlots.length} pesanan), tetapi kode anak keranjang tidak dipasang otomatis karena masih aktif di antrian lain (${formatBasketConflictSummary(allLoadConflicts)}). Isi Kode Packer atau anak keranjang lain!`
+        });
+        playBuzzer(false);
+        speakVoice('Kode keranjang masih aktif di antrian packing. Gunakan kode lain.');
+      } else if (restoredAnyProgress) {
+        setSortNotification({ 
+          type: 'success', 
+          message: `⚡ SESI SORTIR DILANJUTKAN: Keranjang Induk "${masterBasketName}" berhasil dimuat kembali! Progress sebelumnya aman (${completedSlotsCount} dari ${newSlots.length} keranjang selesai, total ${totalScannedPcs} pcs tersortir). Silakan lanjutkan!` 
+        });
+        playBuzzer(true);
+        speakVoice(`Sesi sortir keranjang ${masterBasketName} dilanjutkan.`);
+      } else {
+        setSortNotification({ 
+          type: 'success', 
+          message: allBound
+            ? `Order berhasil dimuat (${newSlots.length} pesanan). Anak keranjang siap digunakan!` 
+            : `Order berhasil dimuat (${newSlots.length} pesanan). Silakan isi / scan kode anak keranjang untuk setiap slot terlebih dahulu!`
+        });
+        playBuzzer(true);
+        speakVoice(allBound ? 'Order dimuat. Keranjang siap.' : 'Order dimuat. Silakan isi kode anak keranjang.');
+      }
       setTimeout(() => {
         sortPackerPrefixRef.current?.focus();
         sortPackerPrefixRef.current?.select();
       }, 100);
     } else {
+      const b2bMatch = (orderHistory || []).find(it => 
+        it.status === 'Pending' && 
+        Boolean(it.noPo && it.noPo.trim() !== '' && it.noPo.trim() !== '-') &&
+        (it.referenceNumber?.toUpperCase() === query || 
+         it.orderNumber?.toUpperCase() === query || 
+         it.noPo?.toUpperCase() === query ||
+         it.basketNumber?.toUpperCase() === query)
+      );
+      if (b2bMatch) {
+        setSortNotification({ 
+          type: 'error', 
+          message: `Order "${b2bMatch.orderNumber || b2bMatch.referenceNumber}" terdeteksi sebagai Order B2B (No. PO: ${b2bMatch.noPo}). Silakan proses di menu Operasional > Outbound!` 
+        });
+        playBuzzer(false);
+        speakVoice('Order B2B. Buka menu Outbound.');
+        return;
+      }
+      if (unpickedCount > 0) {
+        setSortNotification({
+          type: 'error',
+          message: `Keranjang / order "${query}" (${unpickedCount} pesanan) masih dalam proses 1. Picking. Tidak ada pesanan aktif yang siap disortir!`
+        });
+        playBuzzer(false);
+        speakVoice('Order belum selesai dipick.');
+        return;
+      }
+      if (alreadySortedCount > 0) {
+        try {
+          const branch = getActiveBranch() || 'DEFAULT';
+          localStorage.removeItem(getSortSessionKey(branch, query));
+        } catch {}
+        setSortNotification({
+          type: 'error',
+          message: `Keranjang / order "${query}" (${alreadySortedCount} pesanan) sudah selesai disortir dan menunggu di 3. Packing! Tidak ada pesanan aktif yang siap disortir ulang.`
+        });
+        playBuzzer(false);
+        speakVoice(`Keranjang ${query} sudah selesai disortir.`);
+        return;
+      }
       setSortNotification({ type: 'error', message: `Tidak ada pesanan aktif yang siap disortir untuk "${query}"!` });
       playBuzzer(false);
       speakVoice('Keranjang tidak ditemukan');
@@ -901,7 +1473,6 @@ export default function MabangWmsOutbound({
 
   const handleBaselineLoadSortTask = (e?: React.FormEvent) => {
     setSortLastAssignedSlot(null);
-    setBigBasketResult(null);
     return handleLoadSortTask(e);
   };
 
@@ -910,8 +1481,16 @@ export default function MabangWmsOutbound({
     if (sortStarted || sortSaveBusy.current) { setSortNotification({type:'error',message:'Keranjang tidak dapat diubah setelah sesi server dimulai.'}); return; }
     const code = (basketVal !== undefined ? basketVal : sortBasketInputManual).trim().toUpperCase();
     if (!code) {
-      setSortNotification({ type: 'error', message: 'Kode keranjang tidak boleh kosong!' });
+      setSortNotification({ type: 'error', message: 'Kode anak keranjang tidak boleh kosong!' });
       playBuzzer(false);
+      return;
+    }
+
+    // Cek apakah kode basket sama dengan keranjang induk
+    if (code === (sortActiveMasterBasket || '').trim().toUpperCase()) {
+      setSortNotification({ type: 'error', message: `Kode "${code}" adalah Keranjang Induk! Tidak boleh digunakan sebagai anak keranjang.` });
+      playBuzzer(false);
+      speakVoice('Tidak boleh memakai kode keranjang induk');
       return;
     }
 
@@ -921,6 +1500,26 @@ export default function MabangWmsOutbound({
       setSortNotification({ type: 'error', message: `Kode keranjang "${code}" sudah dipakai di slot lain! Gunakan keranjang berbeda.` });
       playBuzzer(false);
       speakVoice('Keranjang sudah dipakai');
+      return;
+    }
+
+    // Cek apakah kode anak keranjang masih aktif dipakai oleh order lain di antrian Packing / Sortir / Picking
+    const activeConflicts = findActiveBasketConflicts(
+      orderHistory || [],
+      [code],
+      sortSlots.map(s => s.order.referenceNumber)
+    );
+    if (activeConflicts.length > 0) {
+      setSortNotification({
+        type: 'error',
+        message: `❌ DITOLAK: Kode keranjang "${code}" masih aktif dipakai di ${formatBasketConflictSummary(activeConflicts)}. Tunggu sampai order tersebut selesai dikemas atau gunakan anak keranjang lain!`
+      });
+      playBuzzer(false);
+      speakVoice('Keranjang masih aktif di antrian packing');
+      setTimeout(() => {
+        sortBasketInputRef.current?.focus();
+        sortBasketInputRef.current?.select();
+      }, 50);
       return;
     }
 
@@ -937,23 +1536,33 @@ export default function MabangWmsOutbound({
 
     setSortSlots(updated);
     setSortLastAssignedSlot(null);
-    setBigBasketResult(null);
     setSortBasketInputManual('');
+    if (sortActiveMasterBasket) {
+      saveSortSessionToStorage(sortActiveMasterBasket, sortPackerPrefix, updated);
+    }
     playBuzzer(true);
-    speakVoice(`Slot ${slotNum} diubah ke keranjang ${code}`);
+    speakVoice(`Slot ${slotNum} diikat ke ${code}`);
 
     const nextUnbound = updated.find(s => !s.isBasketBound);
     if (nextUnbound) {
       setSortTargetSlotForBind(nextUnbound.slotNumber);
+      setSortSelectedSlotNumber(nextUnbound.slotNumber);
       setSortNotification({ 
         type: 'success', 
-        message: `✓ Slot #${slotNum} diikat ke keranjang "${code}". Selanjutnya Slot #${nextUnbound.slotNumber}.` 
+        message: `✓ Slot #${slotNum} diikat ke anak keranjang "${code}". Selanjutnya Slot #${nextUnbound.slotNumber}.` 
       });
+      setTimeout(() => {
+        sortBasketInputRef.current?.focus();
+      }, 50);
     } else {
       setSortNotification({ 
         type: 'success', 
-        message: `✓ Semua ${updated.length} keranjang packer valid!` 
+        message: `✓ Semua ${updated.length} anak keranjang berhasil diikat! Silakan mulai scan produk (Langkah 3).` 
       });
+      speakVoice('Semua anak keranjang lengkap. Silakan scan produk.');
+      setTimeout(() => {
+        sortProductRef.current?.focus();
+      }, 100);
     }
   };
 
@@ -963,7 +1572,6 @@ export default function MabangWmsOutbound({
     const barcode = sortProductInput.trim();
     if (!barcode) return;
     setSortLastAssignedSlot(null);
-    setBigBasketResult(null);
     if (!sortSlots.length || !allBasketsBound) {
       setSortNotification({type:'error',message:!sortSlots.length ? 'Scan barcode tugas keranjang induk terlebih dahulu!' : 'Harap lengkapi nomor keranjang dahulu.'});
       playBuzzer(false);
@@ -971,7 +1579,7 @@ export default function MabangWmsOutbound({
       return;
     }
 
-    const matchedSkuId = findSkuId(barcode);
+    const matchedSkuId = findSkuId(barcode).trim().toUpperCase();
     let targetSlotIndex = -1;
     let targetItemIndex = -1;
     for (let sIdx = 0; sIdx < sortSlots.length; sIdx++) {
@@ -990,7 +1598,6 @@ export default function MabangWmsOutbound({
     }
     setSortProductInput('');
     if (targetSlotIndex === -1 || targetItemIndex === -1) {
-      setBigBasketResult({type:'error'});
       setSortNotification({type:'error',message:`Barang "${barcode}" tidak diperlukan di keranjang ini atau sudah penuh!`});
       playBuzzer(false);
       speakVoice('Barang tidak cocok atau keranjang sudah penuh');
@@ -1004,7 +1611,10 @@ export default function MabangWmsOutbound({
       setSortSlots(updatedSlots);
       setSortLastAssignedSlot(target.slotNumber);
       setSortSelectedSlotNumber(target.slotNumber);
-      setBigBasketResult({type:'success',basket:target.basketCode});
+
+      const masterBasket = sortActiveMasterBasket || target.order.basketNumber || sortTaskInput.trim() || 'GB-01';
+      saveSortSessionToStorage(masterBasket, sortPackerPrefix, updatedSlots);
+
       setSortNotification({type:'success',message:updatedSlots.every(slot => slot.isComplete)
         ? `Seluruh ${updatedSlots.length} keranjang lengkap. Silakan klik "Selesaikan sortir".`
         : `Masukkan 1x ${item.skuName} ke Keranjang ${target.basketCode} (Slot #${target.slotNumber} - ${target.order.customerName})`});
@@ -1023,7 +1633,7 @@ export default function MabangWmsOutbound({
       setSortNotification({type:'error',message:SERVER_SCAN_ENABLED ? 'Pilih basket dan masukkan barcode.' : scanServerUnavailable});
       return;
     }
-    sortSaveBusy.current = true; setSavingSort(true); setSortStarted(true); setBigBasketResult(null);
+    sortSaveBusy.current = true; setSavingSort(true); setSortStarted(true);
     try {
       if (resolveSortingTarget && Array.from(sortControllers.current.values()).some(controller => controller.hasPending())) {
         throw new Error('Ada request belum terkonfirmasi. Pulihkan sesi terlebih dahulu.');
@@ -1041,14 +1651,12 @@ export default function MabangWmsOutbound({
       applySortingProgress(slot, progress);
       if (resolveSortingTarget) setSortSelectedSlotNumber(slot.slotNumber);
       setSortProductInput(''); setSortLastAssignedSlot(slot.slotNumber);
-      setBigBasketResult({type:'success',basket:progress.basket});
       setSortServerReady(true);
       setSortNotification({type:'success',message:`Scan dikonfirmasi server untuk keranjang ${progress.basket}.`});
       playBuzzer(true); speakVoice(`Masukkan ke keranjang ${progress.basket}`);
     } catch (error) {
       setSortProductInput('');
       setSortLastAssignedSlot(null);
-      setBigBasketResult({type:'error'});
       setSortServerReady(false);
       setSortNotification({type:'error',message:error instanceof Error ? error.message : 'Scan belum terkonfirmasi.'});
       playBuzzer(false);
@@ -1094,10 +1702,10 @@ export default function MabangWmsOutbound({
       setSortNotification({type:'success',message:`Sortir ${sortSlots.length} keranjang berhasil disimpan. Lanjut ke pengemasan.`});
       playBuzzer(true);
       speakVoice('Sortir selesai. Lanjut ke pengemasan.');
-      setCurrentScreen('delivery');
+      clearSortSessionFromStorage(sortActiveMasterBasket);
+      switchScreen('delivery');
       setSortSlots([]);
       setSortLastAssignedSlot(null);
-      setBigBasketResult(null);
     } catch (error) {
       setSortNotification({type:'error',message:error instanceof Error ? error.message : 'Sortir belum tersimpan.'});
     } finally {
@@ -1128,8 +1736,8 @@ export default function MabangWmsOutbound({
         localStorage.removeItem(key);
       });
       setSortStarted(false); setSortSlots([]);
+      clearSortSessionFromStorage(sortActiveMasterBasket);
       setSortServerReady(false);
-      setBigBasketResult(null);
       onSortingSessionReleased?.();
     } catch (error) {
       setSortServerReady(false);
@@ -1144,9 +1752,40 @@ export default function MabangWmsOutbound({
   const deliveryBasketInputRef = useRef<HTMLInputElement>(null);
   const [deliveryActiveRef, setDeliveryActiveRef] = useState<string | null>(null);
   const [deliveryWeight, setDeliveryWeight] = useState<string>('');
+  const deliveryWeightInputRef = useRef<HTMLInputElement>(null);
+  const lastWeightFocusTimeRef = useRef<number>(0);
   const [deliveryProductInput, setDeliveryProductInput] = useState<string>('');
   const deliveryProductRef = useRef<HTMLInputElement>(null);
   const [receiptOrder, setReceiptOrder] = useState<ShippingOrderData | null>(null);
+  const lastReceiptStorageKey = `wms_last_packed_receipt_${getActiveBranch()}_${(currentUser?.username || 'default').toLowerCase()}`;
+  const [lastPackedReceipt, setLastPackedReceipt] = useState<ShippingOrderData | null>(() => {
+    try {
+      const saved = localStorage.getItem(lastReceiptStorageKey);
+      return saved ? JSON.parse(saved) : null;
+    } catch {
+      return null;
+    }
+  });
+
+  useEffect(() => {
+    try {
+      const saved = localStorage.getItem(lastReceiptStorageKey);
+      setLastPackedReceipt(saved ? JSON.parse(saved) : null);
+    } catch {
+      setLastPackedReceipt(null);
+    }
+  }, [lastReceiptStorageKey]);
+
+  const handlePrintAgain = () => {
+    if (!lastPackedReceipt) {
+      setDeliveryNotification({ type: 'info', message: 'Belum ada order yang diselesaikan untuk dicetak ulang.' });
+      playBuzzer(false);
+      return;
+    }
+    setReceiptOrder(lastPackedReceipt);
+    playBuzzer(true);
+    speakVoice('Mencetak ulang resi terakhir.');
+  };
   const [autoPrintReceipt, setAutoPrintReceipt] = useState<boolean>(true);
   const [deliveryScannedCounts, setDeliveryScannedCounts] = useState<{ [itemId: string]: number }>({});
   const [deliveryNotification, setDeliveryNotification] = useState<{ type: 'success' | 'error' | 'info'; message: string } | null>(null);
@@ -1198,7 +1837,7 @@ export default function MabangWmsOutbound({
     setDeliveryReady(false);
     setDeliveryFinished(true);
     const finishedOrder = pendingOrders.find(candidate => candidate.referenceNumber === task.reference) || deliveryActiveOrder;
-    if (finishedOrder && autoPrintReceipt) {
+    if (finishedOrder) {
       const orderToPrint: ShippingOrderData = {
         referenceNumber: finishedOrder.referenceNumber,
         orderNumber: finishedOrder.orderNumber,
@@ -1211,6 +1850,7 @@ export default function MabangWmsOutbound({
         trackingNumber: (finishedOrder.items[0] as any)?.trackingNumber || (finishedOrder as any)?.trackingNumber,
         timestamp: finishedOrder.timestamp,
         branchId: getActiveBranch(),
+        weight: deliveryWeight ? `${deliveryWeight} g` : undefined,
         items: finishedOrder.items.map(it => ({
           id: it.id,
           skuId: it.skuId,
@@ -1223,7 +1863,15 @@ export default function MabangWmsOutbound({
         packerName: currentUser?.fullName || 'Packer Staff',
         pickerName: finishedOrder.pickingBy || finishedOrder.pickedBy || 'Picker Staff'
       };
-      setReceiptOrder(orderToPrint);
+      setLastPackedReceipt(orderToPrint);
+      try {
+        localStorage.setItem(lastReceiptStorageKey, JSON.stringify(orderToPrint));
+      } catch {
+        // ignore
+      }
+      if (autoPrintReceipt) {
+        setReceiptOrder(orderToPrint);
+      }
     }
     setDeliveryNotification({
       type: 'success',
@@ -1269,30 +1917,139 @@ export default function MabangWmsOutbound({
     return () => { active = false; };
   }, [currentUser?.username]);
 
+  const handleCancelDelivery = () => {
+    setDeliveryActiveRef(null);
+    setDeliveryReady(false);
+    setDeliveryScannedCounts({});
+    setDeliveryWeight('');
+    setDeliveryNotification({ type: 'info', message: 'Sesi keranjang pengemasan telah dikosongkan. Silakan pindai keranjang sortir yang baru.' });
+    setDeliveryBasketInput('');
+    if (SERVER_SCAN_ENABLED && deliveryTask) {
+      sortingIdentity().then(({ branch, actor }) => {
+        const key = deliveryTaskKey(branch, actor);
+        localStorage.removeItem(key);
+      }).catch(() => {});
+      setDeliveryTask(null);
+    }
+    setTimeout(() => {
+      deliveryBasketInputRef.current?.focus();
+    }, 100);
+  };
+
   const handleLoadDeliveryBasket = async (e?: React.FormEvent) => {
     e?.preventDefault();
     if (deliveryBusyRef.current) return;
     const query = deliveryBasketInput.trim().toUpperCase();
     if (!query) return;
 
-    if (!SERVER_SCAN_ENABLED) {
-      const matchedOrder = pendingOrders.find(ord => 
-        ord.basketNumber?.toUpperCase() === query ||
+    // 1. CEK KERANJANG INDUK YANG SEDANG AKTIF DI SESI PICKING ATAU SORTIR LOKAL
+    const activeSortMaster = (sortActiveMasterBasket || '').trim().toUpperCase();
+    const activePickMaster = (distBoundBasket || '').trim().toUpperCase();
+    if ((activeSortMaster && query === activeSortMaster) || (activePickMaster && query === activePickMaster)) {
+      setDeliveryNotification({
+        type: 'error',
+        message: `❌ DITOLAK: "${query}" adalah KERANJANG INDUK yang diikat oleh Picker. Keranjang induk tidak boleh dimuat di pengemasan (Packing). Silakan lakukan sortir di Meja Sortir (Tahap 2) terlebih dahulu!`
+      });
+      playBuzzer(false);
+      speakVoice(`Keranjang induk ${query} tidak boleh dimuat di pengemasan.`);
+      setDeliveryBasketInput('');
+      return;
+    }
+
+    // 2. CEK APAKAH QUERY ADALAH KERANJANG INDUK BATCH DENGAN LEBIH DARI 1 PESANAN PENDING
+    const ordersWithThisBasket = pendingOrders.filter(ord => (ord.basketNumber || '').trim().toUpperCase() === query);
+    if (ordersWithThisBasket.length > 1) {
+      const pickerName = ordersWithThisBasket.find(o => o.pickingBy || o.pickedBy)?.pickingBy ||
+                         ordersWithThisBasket.find(o => o.pickingBy || o.pickedBy)?.pickedBy || 'Picker';
+      setDeliveryNotification({
+        type: 'error',
+        message: `❌ DITOLAK: Keranjang "${query}" adalah KERANJANG INDUK yang diikat oleh Picker (${pickerName}) untuk ${ordersWithThisBasket.length} pesanan. Keranjang induk tidak boleh dimuat di pengemasan. Silakan bawa ke Meja Sortir (Tahap 2) terlebih dahulu!`
+      });
+      playBuzzer(false);
+      speakVoice(`Keranjang induk ${query} berisi ${ordersWithThisBasket.length} pesanan. Bawa ke meja sortir terlebih dahulu.`);
+      setDeliveryBasketInput('');
+      return;
+    }
+
+    // 3. CARI ORDER YANG COCOK
+    let matchedOrder = ordersWithThisBasket[0];
+    if (!matchedOrder) {
+      matchedOrder = pendingOrders.find(ord => 
         ord.referenceNumber.toUpperCase() === query ||
         ord.orderId?.toUpperCase() === query ||
         (ord.orderNumber && ord.orderNumber.toUpperCase() === query)
       );
-      if (!matchedOrder) {
-        setDeliveryNotification({ type: 'error', message: `Order atau keranjang "${query}" tidak ditemukan di antrean pending.` });
+    }
+
+    if (!matchedOrder) {
+      const blockedMatch = (orderHistory || []).find(it => 
+        it.status === 'Pending' && 
+        (requireExplicitOnlineType ? resolveOrderType(it) !== 'ONLINE' : resolveOrderType(it) === 'B2B') &&
+        (it.referenceNumber?.toUpperCase() === query || 
+         it.orderNumber?.toUpperCase() === query || 
+         it.noPo?.toUpperCase() === query ||
+         it.basketNumber?.toUpperCase() === query)
+      );
+      if (blockedMatch) {
+        const blockedType = resolveOrderType(blockedMatch);
+        setDeliveryNotification({
+          type: 'error',
+          message:
+            blockedType === 'B2B'
+              ? `Order "${blockedMatch.orderNumber || blockedMatch.referenceNumber}" bertipe B2B. Silakan proses di menu Outbound B2B!`
+              : `Order "${blockedMatch.orderNumber || blockedMatch.referenceNumber}" berstatus UNASSIGNED. Klasifikasikan sebagai ONLINE terlebih dahulu sebelum memproses!`
+        });
         playBuzzer(false);
+        speakVoice(blockedType === 'B2B' ? 'Order B2B. Buka menu Outbound B2B.' : 'Order belum diklasifikasikan.');
         return;
       }
+      setDeliveryNotification({ type: 'error', message: `Order atau keranjang "${query}" tidak ditemukan di antrean pending.` });
+      playBuzzer(false);
+      return;
+    }
+
+    // 4. CEK APAKAH ORDER SUDAH SELESAI DIPICK
+    if (!matchedOrder.isPicked) {
+      const boundBasket = (matchedOrder.masterBasketNumber || matchedOrder.basketNumber || '').trim();
+      const basketInfo = boundBasket ? ` (Keranjang Induk: ${boundBasket})` : '';
+      setDeliveryNotification({
+        type: 'error',
+        message: `❌ PESANAN BELUM SELESAI DIPICK: Order "${matchedOrder.referenceNumber}"${basketInfo} belum selesai diambil oleh Picker.`
+      });
+      playBuzzer(false);
+      speakVoice(`Order belum selesai dipick.`);
+      setDeliveryBasketInput('');
+      return;
+    }
+
+    // 5. CEK APAKAH ORDER BELUM DISORTIR (MASIH MENGGUNAKAN KERANJANG INDUK PICKER)
+    const isOrderSorted = Boolean(
+      matchedOrder.isSorted &&
+      matchedOrder.items.length > 0 &&
+      matchedOrder.items.every(it => Boolean(it.sortedAt?.trim()) && Boolean(it.sortedBy?.trim()))
+    );
+
+    if (!isOrderSorted) {
+      const pickerName = matchedOrder.pickingBy || matchedOrder.pickedBy || 'Picker';
+      const basketLabel = matchedOrder.basketNumber ? `Keranjang "${matchedOrder.basketNumber}"` : 'Pesanan ini';
+      setDeliveryNotification({
+        type: 'error',
+        message: `❌ DITOLAK: ${basketLabel} adalah Keranjang Induk yang diikat oleh Picker (${pickerName}). Pesanan (${matchedOrder.referenceNumber}) belum disortir ke keranjang pesanan (A1, A2, dst.). Silakan selesaikan proses sortir di Meja Sortir (Tahap 2) terlebih dahulu!`
+      });
+      playBuzzer(false);
+      speakVoice(`Keranjang ${matchedOrder.basketNumber || query} belum disortir. Bawa ke meja sortir terlebih dahulu.`);
+      setDeliveryBasketInput('');
+      return;
+    }
+
+    if (!SERVER_SCAN_ENABLED) {
       setDeliveryActiveRef(matchedOrder.referenceNumber);
       const initCounts: { [itemId: string]: number } = {};
       matchedOrder.items.forEach(it => { initCounts[it.id] = 0; });
       setDeliveryScannedCounts(initCounts);
       setDeliveryReady(true);
       setDeliveryFinished(false);
+      setDeliveryWeight('');
       setDeliveryBasketInput('');
       setDeliveryNotification({ type: 'success', message: `✓ Keranjang "${matchedOrder.basketNumber || query}" (Order ${matchedOrder.referenceNumber}) siap dipack. Silakan scan SKU.` });
       playBuzzer(true);
@@ -1304,12 +2061,7 @@ export default function MabangWmsOutbound({
     }
 
     if (deliveryTask && !deliveryFinished) { setDeliveryNotification({type:'error',message:'Pulihkan atau selesaikan sesi packing sebelumnya.'}); return; }
-    const matchedOrder = pendingOrders.find(ord => 
-      ord.basketNumber?.toUpperCase() === query ||
-      ord.referenceNumber.toUpperCase() === query ||
-      ord.orderId?.toUpperCase() === query
-    );
-    if (!matchedOrder || !matchedOrder.basketNumber?.trim()) {
+    if (!matchedOrder.basketNumber?.trim()) {
       setDeliveryNotification({type:'error',message:'Order pending atau keranjang sortir tidak ditemukan.'}); return;
     }
     deliveryBusyRef.current = true; setDeliveryBusy(true); setDeliveryReady(false);
@@ -1363,6 +2115,7 @@ export default function MabangWmsOutbound({
         trackingNumber: (targetOrder.items[0] as any)?.trackingNumber || (targetOrder as any)?.trackingNumber,
         timestamp: targetOrder.timestamp,
         branchId: getActiveBranch(),
+        weight: deliveryWeight ? `${deliveryWeight} g` : undefined,
         items: targetOrder.items.map(it => ({
           id: it.id,
           skuId: it.skuId,
@@ -1384,6 +2137,12 @@ export default function MabangWmsOutbound({
       }
 
       if (success) {
+        setLastPackedReceipt(orderToPrint);
+        try {
+          localStorage.setItem(lastReceiptStorageKey, JSON.stringify(orderToPrint));
+        } catch {
+          // ignore
+        }
         setDeliveryNotification({ 
           type: 'success', 
           message: `✓ Packing selesai! Order ${finishedRef} status Selesai.${autoPrintReceipt ? ' Mencetak resi pengiriman...' : ''}` 
@@ -1398,6 +2157,7 @@ export default function MabangWmsOutbound({
         if (autoPrintReceipt) {
           setReceiptOrder(orderToPrint);
         } else {
+          setDeliveryWeight('');
           setTimeout(() => {
             deliveryBasketInputRef.current?.focus();
           }, 100);
@@ -1411,7 +2171,7 @@ export default function MabangWmsOutbound({
     }
   };
 
-  // Auto-complete & print receipt whenever all items are 100% validated
+  // Otomatis pindah fokus ke kolom berat paket saat seluruh barang 100% lengkap
   useEffect(() => {
     if (
       currentScreen === 'delivery' &&
@@ -1423,8 +2183,10 @@ export default function MabangWmsOutbound({
       deliveryActiveOrder.items.every(it => (deliveryScannedCounts[it.id] || 0) >= it.qty)
     ) {
       const timer = setTimeout(() => {
-        executeCompleteDelivery(deliveryActiveOrder, deliveryScannedCounts);
-      }, 250);
+        lastWeightFocusTimeRef.current = Date.now();
+        deliveryWeightInputRef.current?.focus();
+        deliveryWeightInputRef.current?.select();
+      }, 100);
       return () => clearTimeout(timer);
     }
   }, [currentScreen, deliveryReady, deliveryActiveOrder, deliveryScannedCounts, deliveryFinished]);
@@ -1464,9 +2226,16 @@ export default function MabangWmsOutbound({
 
       const allPacked = deliveryActiveOrder.items.every(it => (nextCounts[it.id] || 0) >= it.qty);
       if (allPacked) {
-        setDeliveryNotification({ type: 'success', message: '✓ Seluruh barang lengkap (100%)! Menyelesaikan packing dan mencetak resi...' });
-        speakVoice('Semua barang lengkap. Menyelesaikan packing.');
-        await executeCompleteDelivery(deliveryActiveOrder, nextCounts);
+        setDeliveryNotification({ 
+          type: 'success', 
+          message: '✓ Seluruh barang lengkap (100%)! Silakan masukkan berat paket, lalu tekan Enter untuk cetak resi.' 
+        });
+        speakVoice('Semua barang lengkap. Masukkan berat paket lalu tekan Enter.');
+        setTimeout(() => {
+          lastWeightFocusTimeRef.current = Date.now();
+          deliveryWeightInputRef.current?.focus();
+          deliveryWeightInputRef.current?.select();
+        }, 150);
         return;
       } else {
         setDeliveryNotification({ type: 'success', message: `✓ Scan ${targetItem.skuId}: ${nextCounts[targetItem.id]}/${targetItem.qty} pcs.` });
@@ -1485,12 +2254,6 @@ export default function MabangWmsOutbound({
       setDeliveryProductInput('');
       setDeliveryNotification({type:'success',message:'Scan dikonfirmasi server.'});
       playBuzzer(true);
-      if (progress.counts.every(line => line.scanned >= line.required)) {
-        speakVoice('Semua barang lengkap. Menyelesaikan packing.');
-        const finishProgress = await controller.finish(deliveryTask.basket);
-        applyDeliveryProgress(deliveryTask, finishProgress);
-        await verifyDeliveryCompletion(deliveryTask, finishProgress);
-      }
     } catch (error) {
       setDeliveryReady(false);
       setDeliveryNotification({type:'error',message:error instanceof Error ? error.message : 'Scan belum terkonfirmasi.'});
@@ -1511,12 +2274,46 @@ export default function MabangWmsOutbound({
 
     if (!SERVER_SCAN_ENABLED) {
       if (!deliveryActiveOrder) return;
+      const isOrderSorted = Boolean(
+        deliveryActiveOrder.isSorted &&
+        deliveryActiveOrder.items.length > 0 &&
+        deliveryActiveOrder.items.every(it => Boolean(it.sortedAt?.trim()) && Boolean(it.sortedBy?.trim()))
+      );
+      if (!isOrderSorted) {
+        setDeliveryNotification({
+          type: 'error',
+          message: '❌ GAGAL: Pesanan ini belum melalui Meja Sortir (Tahap 2). Keranjang induk tidak boleh diselesaikan di pengemasan!'
+        });
+        playBuzzer(false);
+        speakVoice('Pesanan belum disortir. Tidak dapat menyelesaikan packing.');
+        return;
+      }
       const isComplete = deliveryActiveOrder.items.every(it => (deliveryScannedCounts[it.id] || 0) >= it.qty);
       if (!isComplete) {
-        if (!window.confirm('Perhatian: Masih ada barang yang belum discan 100%. Apakah Anda yakin ingin menyelesaikan packing sekarang?')) {
-          return;
-        }
+        setDeliveryNotification({
+          type: 'error',
+          message: '❌ Barang belum discan 100%! Selesaikan scan seluruh barcode SKU terlebih dahulu.'
+        });
+        playBuzzer(false);
+        speakVoice('Barang belum lengkap. Scan semua barang terlebih dahulu.');
+        deliveryProductRef.current?.focus();
+        return;
       }
+
+      const weightNum = parseFloat(deliveryWeight);
+      if (!deliveryWeight || isNaN(weightNum) || weightNum <= 0) {
+        setDeliveryNotification({
+          type: 'error',
+          message: '⚠️ Silakan isi berat paket yang valid (dalam gram, contoh: 250) lalu tekan Enter untuk cetak resi!'
+        });
+        playBuzzer(false);
+        speakVoice('Masukkan berat paket.');
+        lastWeightFocusTimeRef.current = Date.now();
+        deliveryWeightInputRef.current?.focus();
+        deliveryWeightInputRef.current?.select();
+        return;
+      }
+
       return executeCompleteDelivery(deliveryActiveOrder, deliveryScannedCounts);
     }
 
@@ -1530,6 +2327,11 @@ export default function MabangWmsOutbound({
     } catch (error) {
       setDeliveryNotification({type:'error',message:error instanceof Error ? error.message : 'Penyelesaian belum dikonfirmasi.'});
     } finally { deliveryBusyRef.current = false; setDeliveryBusy(false); }
+  };
+
+  const handleWeightSubmit = async (e?: React.FormEvent) => {
+    e?.preventDefault();
+    await handleCompleteDelivery();
   };
 
   // Helper counts for header
@@ -1568,8 +2370,44 @@ export default function MabangWmsOutbound({
     return () => clearTimeout(timer);
   }, [currentScreen]);
 
+  const activeIssueStage: 'Picking' | 'Sortir' | 'Packing' =
+    currentScreen === 'distribution' ? 'Picking' : currentScreen === 'sorting' ? 'Sortir' : 'Packing';
+
+  const activeIssueReferences: string[] = useMemo(() => {
+    if (currentScreen === 'distribution') {
+      return distActiveBatchOrders.map(o => o.referenceNumber);
+    }
+    if (currentScreen === 'sorting') {
+      return sortSlots.map(s => s.order.referenceNumber);
+    }
+    return deliveryActiveOrder ? [deliveryActiveOrder.referenceNumber] : [];
+  }, [currentScreen, distActiveBatchOrders, sortSlots, deliveryActiveOrder]);
+
+  const handleReportOrderIssue = async (
+    reference: string,
+    report: Exclude<OrderIssueReportInput, { resolveBy: string }>
+  ) => {
+    if (!onUpdateOrderSession) {
+      throw new Error('Fungsi simpan kendala order belum tersedia.');
+    }
+    const saved = await onUpdateOrderSession(reference, { issueReport: report });
+    if (!saved) {
+      throw new Error('Laporan kendala gagal disimpan. Periksa koneksi dan muat ulang order.');
+    }
+    const noticeMsg = `Kendala order ${reference} (${report.type}) tercatat ke Laporan Exception Supervisor.`;
+    if (currentScreen === 'distribution') setDistNotification({ type: 'info', message: noticeMsg });
+    else if (currentScreen === 'sorting') setSortNotification({ type: 'info', message: noticeMsg });
+    else setDeliveryNotification({ type: 'info', message: noticeMsg });
+  };
+
   return (
-    <div className="wms-picking-flow space-y-4 font-sans text-slate-800 bg-[#F4F6F9] p-3 sm:p-5 rounded-2xl border border-slate-300 shadow-xl">
+    <div
+      className={`wms-picking-flow space-y-4 font-sans text-slate-800 bg-[#F4F6F9] ${
+        operatorFocusMode
+          ? 'fixed inset-0 z-[70] overflow-y-auto p-4 sm:p-6 rounded-none border-0 shadow-none wms-focus-mode'
+          : 'p-3 sm:p-5 rounded-2xl border border-slate-300 shadow-xl'
+      }`}
+    >
       {/* 1. MABANG TOP BREADCRUMB & UTILITY BAR */}
       <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 bg-white p-3 rounded-xl border border-slate-200 shadow-sm">
         <div className="wms-stage-breadcrumb flex items-center gap-2 text-sm text-slate-600 font-medium">
@@ -1598,7 +2436,7 @@ export default function MabangWmsOutbound({
         <div className="wms-stage-tabs" role="group" aria-label="Tahap picking dan packing">
           {(!isPackerRole) && (
             <button
-              onClick={() => setCurrentScreen('distribution')}
+              onClick={() => switchScreen('distribution')}
               aria-current={currentScreen === 'distribution' ? 'step' : undefined}
               aria-label="1. Pengambilan (Picking)"
               className={`wms-stage-tab px-3 py-1.5 text-xs font-bold rounded-lg transition-all border flex items-center gap-1.5 cursor-pointer shrink-0 ${
@@ -1619,7 +2457,7 @@ export default function MabangWmsOutbound({
 
           {(!isPickerRole) && (
             <button
-              onClick={() => setCurrentScreen('sorting')}
+              onClick={() => switchScreen('sorting')}
               aria-current={currentScreen === 'sorting' ? 'step' : undefined}
               aria-label="2. Sortir"
               className={`wms-stage-tab px-3 py-1.5 text-xs font-bold rounded-lg transition-all border flex items-center gap-1.5 cursor-pointer shrink-0 ${
@@ -1630,12 +2468,17 @@ export default function MabangWmsOutbound({
             >
               <Layers className="w-3.5 h-3.5" />
               <span>2. Sortir</span>
+              {pendingOrders.filter(o => o.isPicked && !o.isSorted).length > 0 && (
+                <span className="ml-1 px-1.5 py-0.2 bg-amber-500 text-white rounded-full text-[10px] font-black" title={`${pendingOrders.filter(o => o.isPicked && !o.isSorted).length} order menunggu disortir`}>
+                  {pendingOrders.filter(o => o.isPicked && !o.isSorted).length}
+                </span>
+              )}
             </button>
           )}
 
           {(!isPickerRole) && (
             <button
-              onClick={() => setCurrentScreen('delivery')}
+              onClick={() => switchScreen('delivery')}
               aria-current={currentScreen === 'delivery' ? 'step' : undefined}
               aria-label="3. Pengemasan (Packing)"
               className={`wms-stage-tab px-3 py-1.5 text-xs font-bold rounded-lg transition-all border flex items-center gap-1.5 cursor-pointer shrink-0 ${
@@ -1646,9 +2489,9 @@ export default function MabangWmsOutbound({
             >
               <Scan className="w-3.5 h-3.5" />
               <span>3. Packing</span>
-              {pendingOrders.filter(o => o.isPicked).length > 0 && (
-                <span className="ml-1 px-1.5 py-0.2 bg-emerald-500 text-white rounded-full text-[10px] font-black">
-                  {pendingOrders.filter(o => o.isPicked).length}
+              {pendingOrders.filter(o => o.isPicked && o.isSorted).length > 0 && (
+                <span className="ml-1 px-1.5 py-0.2 bg-emerald-500 text-white rounded-full text-[10px] font-black" title={`${pendingOrders.filter(o => o.isPicked && o.isSorted).length} order selesai disortir, siap dipacking`}>
+                  {pendingOrders.filter(o => o.isPicked && o.isSorted).length}
                 </span>
               )}
             </button>
@@ -1672,6 +2515,24 @@ export default function MabangWmsOutbound({
             {isVoiceEnabled ? <Volume2 className="w-4 h-4 text-emerald-600" /> : <VolumeX className="w-4 h-4 text-slate-400" />}
           </button>
 
+          {/* Admin Monitor & Koreksi Keranjang Induk */}
+          {isAdminRole && (
+            <button
+              type="button"
+              onClick={() => setIsMasterBasketMonitorOpen(true)}
+              className="px-2.5 py-1.5 text-xs font-bold bg-indigo-500/10 hover:bg-indigo-500/20 text-indigo-800 border border-indigo-300 rounded-lg flex items-center gap-1.5 shrink-0 cursor-pointer"
+              title="Monitor & Koreksi Keranjang Induk"
+            >
+              <Layers className="w-3.5 h-3.5 text-indigo-600" />
+              <span className="hidden md:inline">Monitor Keranjang</span>
+              {activeMasterBasketCount > 0 && (
+                <span className="px-1.5 py-0.5 text-[10px] rounded-full bg-indigo-600 text-white font-bold leading-none">
+                  {activeMasterBasketCount}
+                </span>
+              )}
+            </button>
+          )}
+
           {/* Basket Label Generator Shortcut */}
           <button
             onClick={() => setIsBasketLabelModalOpen(true)}
@@ -1681,6 +2542,48 @@ export default function MabangWmsOutbound({
             <Printer className="w-3.5 h-3.5 text-amber-600" />
             <span className="hidden md:inline">Cetak Label Basket (4x6)</span>
           </button>
+
+          {/* Lapor Kendala Lapangan (Opsi A - aman tanpa memotong stok paksa) */}
+          {onUpdateOrderSession && (
+            <button
+              type="button"
+              disabled={activeIssueReferences.length === 0}
+              onClick={() => setIssueModalOpen(true)}
+              className="px-2.5 py-1.5 text-xs font-bold bg-rose-500/10 hover:bg-rose-500/20 text-rose-800 border border-rose-300 rounded-lg flex items-center gap-1 shrink-0 cursor-pointer disabled:opacity-45 disabled:cursor-not-allowed"
+              title="Laporkan kendala stok kurang, barang rusak, atau salah barcode ke Supervisor"
+            >
+              <AlertTriangle className="w-3.5 h-3.5 text-rose-600" />
+              <span className="hidden md:inline">Lapor Kendala</span>
+            </button>
+          )}
+
+          {/* Mode Fokus Operator (Sembunyikan Chrome & Perbesar Input Scan) */}
+          <button
+            type="button"
+            onClick={toggleOperatorFocusMode}
+            className={`px-2.5 py-1.5 text-xs font-bold rounded-lg flex items-center gap-1.5 shrink-0 cursor-pointer border transition-colors ${
+              operatorFocusMode
+                ? 'bg-emerald-600 hover:bg-emerald-700 text-white border-emerald-700 shadow-sm'
+                : 'bg-white hover:bg-slate-50 text-slate-700 border-slate-300 shadow-xs'
+            }`}
+            title={operatorFocusMode ? 'Keluar Mode Fokus Operator (Esc)' : 'Aktifkan Mode Fokus Operator (Layar Penuh Tanpa Distraksi)'}
+          >
+            {operatorFocusMode ? <Minimize2 className="w-3.5 h-3.5" /> : <Maximize2 className="w-3.5 h-3.5 text-emerald-600" />}
+            <span className="hidden sm:inline">{operatorFocusMode ? 'Keluar Fokus (Esc)' : 'Mode Fokus'}</span>
+          </button>
+
+          {/* Toggle Lebarkan Meja (Sembunyikan / Tampilkan Sidebar) */}
+          {!operatorFocusMode && (
+            <button
+              type="button"
+              onClick={() => window.dispatchEvent(new CustomEvent('wms-toggle-sidebar'))}
+              className="px-2.5 py-1.5 text-xs font-bold bg-white hover:bg-slate-50 text-slate-700 border border-slate-300 rounded-lg flex items-center gap-1.5 shrink-0 cursor-pointer shadow-xs transition-colors"
+              title="Lebarkan Meja Kerja (Sembunyikan / Tampilkan Sidebar Navigasi)"
+            >
+              <PanelLeftClose className="w-3.5 h-3.5 text-sky-600" />
+              <span className="hidden sm:inline">Lebarkan Meja</span>
+            </button>
+          )}
         </div>
         </div>
       </div>
@@ -1745,13 +2648,17 @@ export default function MabangWmsOutbound({
             <form 
               onSubmit={handleBindBasket} 
               className={`flex items-center text-xs border rounded-md overflow-hidden bg-white transition-all ${
-                distActiveBatchOrders.length > 0 && !distBoundBasket 
+                typedBasketConflict
+                  ? 'border-rose-500 ring-2 ring-rose-300 shadow-md'
+                  : distActiveBatchOrders.length > 0 && !distBoundBasket 
                   ? 'border-amber-500 ring-2 ring-amber-300 shadow-md animate-pulse' 
                   : 'border-slate-300'
               }`}
             >
               <span className={`px-2.5 py-1.5 font-bold border-r ${
-                distActiveBatchOrders.length > 0 && !distBoundBasket 
+                typedBasketConflict
+                  ? 'bg-rose-100 text-rose-900 border-rose-300'
+                  : distActiveBatchOrders.length > 0 && !distBoundBasket 
                   ? 'bg-amber-100 text-amber-900 border-amber-300' 
                   : 'bg-slate-100 text-slate-600 border-slate-300'
               }`}>
@@ -1767,54 +2674,69 @@ export default function MabangWmsOutbound({
               />
               <button
                 type="submit"
-                disabled={isBindingBasket}
+                disabled={isBindingBasket || Boolean(typedBasketConflict)}
                 className={`px-3 py-1.5 font-black border-l cursor-pointer transition-all ${
-                  distActiveBatchOrders.length > 0 && !distBoundBasket
+                  typedBasketConflict
+                    ? 'bg-rose-600 text-white border-rose-700 cursor-not-allowed'
+                    : distActiveBatchOrders.length > 0 && !distBoundBasket
                     ? 'bg-amber-500 hover:bg-amber-600 text-slate-950 border-amber-400'
                     : 'bg-sky-50 text-sky-700 hover:bg-sky-100 border-slate-300'
                 }`}
               >
-                {isBindingBasket ? 'Menyimpan…' : 'Ikat'}
+                {isBindingBasket ? 'Menyimpan…' : typedBasketConflict ? 'Sedang Dipakai' : 'Ikat'}
               </button>
             </form>
+
+            {/* Warning badge jika keranjang yang diketik sedang aktif dipakai */}
+            {typedBasketConflict && (
+              <div className="wms-inline-danger-banner flex items-center gap-1.5 px-2.5 py-1 bg-rose-50 border border-rose-300 rounded-md text-[11px] font-bold text-rose-700 animate-pulse">
+                <span>⚠️ Keranjang "{typedBasketConflict.basket}" sedang aktif dipakai ({typedBasketConflict.count} Order {typedBasketConflict.isPicked ? 'di Sortir/Packing' : 'di Picking'}). Gunakan keranjang lain!</span>
+              </div>
+            )}
 
             {/* Notification alert (DIPERBESAR JIKA ERROR KARENA TANPA SPEAKER) */}
             {distNotification && (
               distNotification.type === 'error' ? (
-                <div className="w-full bg-gradient-to-r from-rose-600 via-red-600 to-rose-700 text-white border-4 border-rose-950 rounded-xl p-3.5 sm:p-4 shadow-2xl animate-bounce flex items-center justify-between gap-3">
+                <div
+                  role="alert"
+                  className="wms-scan-error-alert w-full bg-rose-600 bg-gradient-to-r from-rose-600 via-red-600 to-rose-700 text-white border-4 border-rose-950 rounded-xl p-3.5 sm:p-4 shadow-2xl animate-bounce flex items-center justify-between gap-3"
+                >
                   <div className="flex items-center gap-3">
-                    <div className="w-10 h-10 rounded-full bg-white text-rose-600 flex items-center justify-center font-black text-xl shrink-0 shadow-lg ring-4 ring-rose-300">
+                    <div className="wms-scan-error-badge w-10 h-10 rounded-full bg-white text-rose-600 flex items-center justify-center font-black text-xl shrink-0 shadow-lg ring-4 ring-rose-300">
                       ✕
                     </div>
                     <div>
-                      <div className="text-[11px] font-black uppercase tracking-wider text-rose-100 flex items-center gap-1.5">
-                        <span className="w-2 h-2 rounded-full bg-white animate-ping"></span>
+                      <div className="wms-scan-error-title text-[11px] font-black uppercase tracking-wider text-rose-100 flex items-center gap-1.5">
+                        <span className="wms-scan-error-dot w-2 h-2 rounded-full bg-white animate-ping"></span>
                         PERINGATAN SALAH SCAN PICKING (CEK VISUAL):
                       </div>
-                      <div className="text-sm sm:text-base md:text-lg font-black text-white leading-tight drop-shadow-sm mt-0.5">
+                      <div className="wms-scan-error-message text-sm sm:text-base md:text-lg font-black text-white leading-tight drop-shadow-sm mt-0.5">
                         {distNotification.message}
                       </div>
                     </div>
                   </div>
-                  <button 
-                    onClick={() => setDistNotification(null)} 
-                    className="px-3 py-1.5 bg-black/40 hover:bg-black/60 text-white font-bold rounded-lg text-xs cursor-pointer shrink-0 transition-colors border border-white/20"
+                  <button
+                    type="button"
+                    onClick={() => setDistNotification(null)}
+                    className="wms-scan-error-close px-3 py-1.5 bg-black/40 hover:bg-black/60 text-white font-bold rounded-lg text-xs cursor-pointer shrink-0 transition-colors border border-white/20"
                     title="Tutup Peringatan"
                   >
                     TUTUP (✕)
                   </button>
                 </div>
               ) : (
-                <div className={`w-full text-xs sm:text-sm font-bold px-3.5 py-2.5 rounded-lg flex items-center justify-between shadow-sm ${
-                  distNotification.type === 'success' 
-                    ? 'bg-emerald-500 text-white border-2 border-emerald-600' 
-                    : 'bg-blue-600 text-white border-2 border-blue-700'
-                }`}>
+                <div
+                  className={`wms-scan-status-banner w-full text-xs sm:text-sm font-bold px-3.5 py-2.5 rounded-lg flex items-center justify-between shadow-sm ${
+                    distNotification.type === 'success'
+                      ? 'is-success bg-emerald-500 text-white border-2 border-emerald-600'
+                      : 'is-info bg-blue-600 text-white border-2 border-blue-700'
+                  }`}
+                >
                   <div className="flex items-center gap-2">
                     <span className="text-base">{distNotification.type === 'success' ? '✓' : 'ℹ'}</span>
                     <span>{distNotification.message}</span>
                   </div>
-                  <button onClick={() => setDistNotification(null)} className="text-white hover:text-slate-200 cursor-pointer p-1">
+                  <button type="button" onClick={() => setDistNotification(null)} className="text-white hover:text-slate-200 cursor-pointer p-1">
                     <X className="w-4 h-4" />
                   </button>
                 </div>
@@ -1932,7 +2854,7 @@ export default function MabangWmsOutbound({
                           <>
                             <button
                               type="button"
-                              onClick={() => setCurrentScreen('sorting')}
+                              onClick={() => switchScreen('sorting')}
                               className="px-3.5 py-1.5 text-xs font-black bg-gradient-to-r from-sky-600 to-blue-600 hover:from-sky-500 hover:to-blue-500 text-white rounded-md shadow-md flex items-center gap-1.5 cursor-pointer active:scale-95 transition-all"
                               title="Bawa keranjang induk ke meja sortir untuk disortir ke 20 basket"
                             >
@@ -2003,7 +2925,7 @@ export default function MabangWmsOutbound({
                         <>
                           <button
                             type="button"
-                            onClick={() => setCurrentScreen('sorting')}
+                            onClick={() => switchScreen('sorting')}
                             className="flex-1 sm:flex-none px-4 py-2 bg-emerald-600 hover:bg-emerald-700 text-white font-black text-xs rounded-lg shadow-md cursor-pointer flex items-center justify-center gap-1.5 transition-all active:scale-95"
                           >
                             <span>Lanjut ke 2. Sortir</span>
@@ -2082,7 +3004,22 @@ export default function MabangWmsOutbound({
                               {grp.skuName}
                             </div>
                             <div className="flex flex-wrap items-center gap-1.5 mt-1 font-mono text-xs">
-                              <span className="font-black text-slate-700">{grp.skuId}</span>
+                              <span className="inline-flex items-center gap-1 font-black text-slate-700">
+                                <span>{grp.skuId}</span>
+                                <button
+                                  type="button"
+                                  onClick={(e) => handleCopyText(grp.skuId, `pick-mob-${grp.skuId}`, e)}
+                                  title="Salin SKU ID"
+                                  aria-label={`Salin SKU ${grp.skuId}`}
+                                  className="p-0.5 hover:bg-slate-200 text-slate-400 hover:text-slate-700 rounded transition-colors cursor-pointer inline-flex items-center justify-center"
+                                >
+                                  {copiedKey === `pick-mob-${grp.skuId}` ? (
+                                    <Check className="w-3 h-3 text-emerald-600" />
+                                  ) : (
+                                    <Copy className="w-3 h-3" />
+                                  )}
+                                </button>
+                              </span>
                               {barcode && (
                                 <span className="text-slate-500 text-[11px] bg-slate-100 px-1.5 py-0.5 rounded">
                                   {barcode}
@@ -2227,7 +3164,22 @@ export default function MabangWmsOutbound({
                                 <span className="px-1.5 py-0.5 bg-sky-100 text-sky-800 rounded text-[10px] font-black font-mono">
                                   Rute #{idx + 1}
                                 </span>
-                                <span>{grp.skuId}</span>
+                                <span className="inline-flex items-center gap-1 font-mono">
+                                  <span>{grp.skuId}</span>
+                                  <button
+                                    type="button"
+                                    onClick={(e) => handleCopyText(grp.skuId, `pick-desk-${grp.skuId}`, e)}
+                                    title="Salin SKU ID"
+                                    aria-label={`Salin SKU ${grp.skuId}`}
+                                    className="p-0.5 hover:bg-slate-200 text-slate-400 hover:text-slate-700 rounded transition-colors cursor-pointer inline-flex items-center justify-center"
+                                  >
+                                    {copiedKey === `pick-desk-${grp.skuId}` ? (
+                                      <Check className="w-3 h-3 text-emerald-600" />
+                                    ) : (
+                                      <Copy className="w-3 h-3" />
+                                    )}
+                                  </button>
+                                </span>
                                 {barcode && (
                                   <span className="px-1.5 py-0.5 bg-slate-100 text-slate-600 rounded text-[10px] font-mono">
                                     Barcode: {barcode}
@@ -2339,201 +3291,329 @@ export default function MabangWmsOutbound({
       {/* ========================================================================= */}
       {/* SCREEN 2: M SORTING UI (PECAH 1 KERANJANG INDUK MENJADI 20 BASKET ORDER)  */}
       {/* ========================================================================= */}
-      {currentScreen === 'sorting' && (
-        <div className="space-y-3">
-          {DEV_BASELINE_SORTING ? <div role="status" className="p-3 bg-amber-100 text-amber-900 font-bold">Mode sortir baseline untuk pengujian development lokal. Scan belum divalidasi server; jangan gunakan untuk operasional.</div> :
-            SERVER_SCAN_ENABLED && !sortServerReady && <div role="alert" className="p-3 bg-amber-100 text-amber-900 font-bold">{scanServerUnavailable}</div>}
-          {/* Green Tips Box (Exact Mabang) */}
-          <div className="wms-info-panel bg-[#E7F6E7] border border-[#BDE5BD] text-[#2F6F2F] text-xs p-3 rounded-lg leading-relaxed shadow-sm">
-            <span className="font-bold">Tips Sortir 20 Keranjang! </span>
-            <span>1. Scan nomor keranjang induk (contoh: GB-01) untuk memuat batch pesanan. &nbsp;&nbsp;</span>
-            <span>2. Sistem otomatis memecah pesanan ke dalam 20 basket (B-01 s/d B-20). &nbsp;&nbsp;</span>
-            <span className="text-[#D32F2F] font-bold">{useBaselineSort ? '3. Scan barcode; sistem menentukan basket tujuan otomatis.' : resolveSortingTarget ? '3. Scan barcode; server menentukan basket tujuan.' : '3. Pilih basket tujuan, lalu scan barcode produk untuk divalidasi server.'}</span>
+      {currentScreen === 'sorting' && (() => {
+        const boundCount = sortSlots.filter(s => s.isBasketBound).length;
+        const completedCount = sortSlots.filter(s => s.isComplete).length;
+        const totalBatchQty = sortSlots.reduce((sum, s) => sum + s.order.totalQty, 0);
+        const totalBatchScanned = sortSlots.reduce(
+          (sum, s) => sum + Object.values(s.itemsDecomposed).reduce((a, b) => a + b, 0),
+          0
+        );
+        const allSlotsComplete = sortSlots.length > 0 && sortSlots.every(s => s.isComplete);
+        const selectedSlot = sortSlots.find(s => s.slotNumber === (sortSelectedSlotNumber || 1)) || sortSlots[0] || null;
+        const lastAssignedSlotObj = sortLastAssignedSlot
+          ? sortSlots.find(s => s.slotNumber === sortLastAssignedSlot) || null
+          : null;
+        const showAssignedBanner = Boolean(lastAssignedSlotObj);
+        const pickerDisplay = sortSlots[0]?.order.pickedBy || sortSlots[0]?.order.pickingBy || '-';
+        const heroSlotObj = showAssignedBanner
+          ? lastAssignedSlotObj
+          : sortLastScannedSku
+          ? sortSlots.find(s => s.slotNumber === sortLastScannedSku.slotNumber) || null
+          : null;
+        const heroSlotDecomp = heroSlotObj
+          ? Object.values(heroSlotObj.itemsDecomposed).reduce((a, b) => a + b, 0)
+          : 0;
+
+        return (
+        <div className="space-y-2.5">
+          {DEV_BASELINE_SORTING ? <div role="status" className="p-2.5 bg-amber-100 text-amber-900 font-bold text-xs rounded border border-amber-300">Mode sortir baseline untuk pengujian development lokal. Scan belum divalidasi server; jangan gunakan untuk operasional.</div> :
+            SERVER_SCAN_ENABLED && !sortServerReady && <div role="alert" className="p-2.5 bg-amber-100 text-amber-900 font-bold text-xs rounded border border-amber-300">{scanServerUnavailable}</div>}
+
+          {/* Green Tips Strip (Mabang WMS style - ringkas 1 baris) */}
+          <div className="wms-info-panel bg-[#E7F6E7] border border-[#BDE5BD] text-[#2F6F2F] text-xs px-3 py-2 rounded-md leading-snug shadow-xs">
+            <span className="font-bold">Tips! </span>
+            <span>1. Scan keranjang induk (contoh: GB-01) untuk memuat batch order &rarr; </span>
+            <span>2. Pastikan 20 anak keranjang terikat (isi Kode Packer bila memakai awalan otomatis) &rarr; </span>
+            <span className="text-[#D32F2F] font-bold">{useBaselineSort ? '3. Scan barcode SKU; sistem menentukan basket tujuan otomatis.' : resolveSortingTarget ? '3. Scan barcode SKU; server menentukan basket tujuan otomatis.' : '3. Pilih basket tujuan, lalu scan barcode produk untuk divalidasi server.'}</span>
           </div>
 
-          {/* Action & Scan Bar */}
-          <div className="bg-white p-3 rounded-lg border border-slate-200 shadow-sm flex flex-wrap items-center gap-3">
-            {/* 1. Muat Induk */}
-            <form onSubmit={useBaselineSort ? handleBaselineLoadSortTask : handleLoadSortTask} className="flex items-center text-xs border border-slate-300 rounded-md overflow-hidden bg-white">
-              <span className="px-2.5 py-1.5 bg-slate-100 text-slate-600 border-r border-slate-300 font-bold">1. Muat Induk</span>
-              <input
-                ref={sortTaskInputRef}
-                type="text"
-                placeholder="Pindai keranjang induk (contoh GB-01)..."
-                value={sortTaskInput}
-                onChange={e => setSortTaskInput(e.target.value)}
-                className="px-2.5 py-1.5 text-xs outline-none w-44 sm:w-52 text-slate-800 focus:ring-1 focus:ring-sky-500"
-              />
-              <button type="submit" className="px-2.5 py-1.5 bg-sky-50 text-sky-700 font-bold border-l border-slate-300 hover:bg-sky-100">
-                Muat Order
-              </button>
-            </form>
+          {/* Top Action Toolbar + Picker/Induk Info + Hero Status Container */}
+          <div className="bg-white rounded-md border border-slate-300 shadow-xs overflow-hidden">
+            {/* Toolbar Row */}
+            <div className="p-2.5 border-b border-slate-200 flex flex-wrap items-center gap-2 bg-[#FAFAFA]">
+              {/* 1. Muat Induk */}
+              <form onSubmit={useBaselineSort ? handleBaselineLoadSortTask : handleLoadSortTask} className="flex items-center text-xs border border-slate-300 rounded overflow-hidden bg-white">
+                <span className="px-2 py-1.5 bg-slate-100 text-slate-700 border-r border-slate-300 font-bold whitespace-nowrap">1. Muat Induk</span>
+                <input
+                  ref={sortTaskInputRef}
+                  type="text"
+                  placeholder="Pindai keranjang induk (contoh GB-01)..."
+                  value={sortTaskInput}
+                  onChange={e => setSortTaskInput(e.target.value)}
+                  className="px-2 py-1.5 text-xs outline-none w-40 sm:w-48 text-slate-800 focus:ring-1 focus:ring-sky-500"
+                />
+                <button type="submit" className="px-2.5 py-1.5 bg-sky-50 text-sky-700 font-bold border-l border-slate-300 hover:bg-sky-100 whitespace-nowrap cursor-pointer">
+                  Muat Order
+                </button>
+              </form>
 
-            {/* 2. KONTROL KODE KERANJANG PACKER (misal A -> A1-A20, RR -> RR1-RR20) */}
-            <div className="flex items-center text-xs border-2 border-indigo-400 bg-indigo-50/60 rounded-md overflow-hidden shadow-sm">
-              <span className="px-2.5 py-1.5 bg-indigo-600 text-white font-black">
-                2. Kode Packer
-              </span>
-              <input
-                ref={sortPackerPrefixRef}
-                type="text"
-                placeholder="contoh A atau RR"
-                value={sortPackerPrefix}
-                onChange={e => setSortPackerPrefix(e.target.value.toUpperCase())}
-                onKeyDown={e => {
-                  if (e.key === 'Enter') {
-                    e.preventDefault();
-                    handleApplyPackerPrefix();
-                  }
-                }}
-                className="px-2 py-1.5 text-xs font-black font-mono w-20 text-center uppercase bg-white outline-none text-indigo-950 focus:ring-2 focus:ring-indigo-500"
-              />
-              <button
-                type="button"
-                onClick={() => handleApplyPackerPrefix()}
-                className="px-2.5 py-1.5 bg-indigo-600 hover:bg-indigo-700 text-white font-bold cursor-pointer"
-                title={`Terapkan kode ${sortPackerPrefix}1 s/d ${sortPackerPrefix}20 ke semua slot`}
-              >
-                Setel ({sortPackerPrefix || 'A'}1-{sortPackerPrefix || 'A'}20)
-              </button>
-            </div>
-
-            {/* Scan Product Form (Aktif jika seluruh keranjang sudah diikat) */}
-            <form onSubmit={useBaselineSort ? handleBaselineSortScanProduct : handleSortScanProduct} className={`wms-scan-field flex items-center text-xs border rounded-md overflow-hidden bg-white ${
-              allBasketsBound 
-                ? 'border-emerald-400 ring-2 ring-emerald-200' 
-                : 'border-slate-300 opacity-60'
-            }`}>
-              <span className={`px-2.5 py-1.5 font-bold text-white ${allBasketsBound ? 'bg-emerald-600' : 'bg-slate-400'}`}>
-                3. Scan Produk
-              </span>
-              <input
-                type="text"
-                placeholder={allBasketsBound ? "Tembak barcode SKU untuk sortir..." : "Wajib input basket dulu..."}
-                ref={sortProductRef}
-                value={sortProductInput}
-                onChange={e => setSortProductInput(e.target.value)}
-                disabled={savingSort || !allBasketsBound}
-                className="px-2.5 py-1.5 text-xs outline-none w-48 sm:w-56 text-slate-800"
-              />
-            </form>
-
-            {/* Selesaikan sortir Button */}
-            <button
-              onClick={useBaselineSort ? handleBaselineEndSorting : handleEndSorting}
-              disabled={useBaselineSort
-                ? savingSort || sortSlots.length === 0 || !allBasketsBound || sortSlots.some(s=>!s.isComplete)
-                : !SERVER_SCAN_ENABLED || !sortServerReady || savingSort || sortSlots.length === 0 || !allBasketsBound || sortSlots.some(s=>!s.isComplete)}
-              className={`px-4 py-1.5 text-xs font-bold rounded-md flex items-center gap-1.5 shadow-sm transition-all cursor-pointer ${
-                sortSlots.length > 0 && allBasketsBound
-                  ? 'bg-[#52C41A] hover:bg-emerald-600 text-white'
-                  : 'bg-slate-200 text-slate-400 cursor-not-allowed'
-              }`}
-            >
-              <Check className="w-3.5 h-3.5" />
-              <span>{savingSort?'Menyimpan sortir…':'Selesaikan sortir'}</span>
-            </button>
-            {!useBaselineSort && <button type="button" onClick={handleRecoverSorting}
-              disabled={!SERVER_SCAN_ENABLED || savingSort || sortSlots.length === 0}
-              className="px-3 py-1.5 text-xs font-bold rounded-md bg-sky-700 text-white disabled:bg-slate-300">
-              Pulihkan sesi
-            </button>}
-            <button type="button" onClick={() => { setBigBasketDisplay(value => !value); if (useBaselineSort && allBasketsBound) sortProductRef.current?.focus(); }}
-              aria-pressed={bigBasketDisplay}
-              className="px-3 py-1.5 text-xs font-bold rounded-md bg-slate-700 text-white">
-              BIG BASKET {bigBasketDisplay ? 'ON' : 'OFF'}
-            </button>
-
-            {/* Last Assigned Indicator */}
-            {sortLastAssignedSlot && (
-              <div className="animate-pulse bg-amber-400 text-slate-950 px-3 py-1 rounded-md text-xs font-black ml-auto">
-                👉 Masukkan ke Keranjang: {sortSlots.find(s => s.slotNumber === sortLastAssignedSlot)?.basketCode}
-              </div>
-            )}
-
-            {bigBasketDisplay && bigBasketResult && (
-              <div role="status" aria-live="polite"
-                className={`w-full rounded-xl p-6 text-center font-black text-white ${bigBasketResult.type === 'success' ? 'bg-green-700' : 'bg-red-700'}`}>
-                <div className="text-xl">{bigBasketResult.type === 'success' ? 'MASUKKAN KE KERANJANG' : 'SCAN GAGAL / BELUM TERKONFIRMASI'}</div>
-                <div className="text-6xl sm:text-8xl break-all">{bigBasketResult.type === 'success' ? bigBasketResult.basket : '✕'}</div>
-              </div>
-            )}
-
-            {/* Notification alert (DIPERBESAR KHUSUSNYA JIKA ERROR / SALAH SCAN KARENA TANPA SPEAKER) */}
-            {sortNotification && (
-              sortNotification.type === 'error' ? (
-                <div className="w-full bg-gradient-to-r from-rose-600 via-red-600 to-rose-700 text-white border-4 border-rose-950 rounded-xl p-3.5 sm:p-4 shadow-2xl animate-bounce flex items-center justify-between gap-3">
-                  <div className="flex items-center gap-3">
-                    <div className="w-10 h-10 rounded-full bg-white text-rose-600 flex items-center justify-center font-black text-xl shrink-0 shadow-lg ring-4 ring-rose-300">
-                      ✕
-                    </div>
-                    <div>
-                      <div className="text-[11px] font-black uppercase tracking-wider text-rose-100 flex items-center gap-1.5">
-                        <span className="w-2 h-2 rounded-full bg-white animate-ping"></span>
-                        PERINGATAN SALAH SCAN PRODUK (CEK VISUAL):
-                      </div>
-                      <div className="text-sm sm:text-base md:text-lg font-black text-white leading-tight drop-shadow-sm mt-0.5">
-                        {sortNotification.message}
-                      </div>
-                    </div>
-                  </div>
-                  <button 
-                    onClick={() => setSortNotification(null)} 
-                    className="px-3 py-1.5 bg-black/40 hover:bg-black/60 text-white font-bold rounded-lg text-xs cursor-pointer shrink-0 transition-colors border border-white/20"
-                    title="Tutup Peringatan"
+              {/* 2. Kode Packer */}
+              <div className="flex items-center text-xs border border-indigo-300 bg-indigo-50/40 rounded overflow-hidden">
+                <span className="px-2 py-1.5 bg-indigo-600 text-white font-bold shrink-0 whitespace-nowrap">
+                  2. Kode Packer
+                </span>
+                <input
+                  ref={sortPackerPrefixRef}
+                  type="text"
+                  placeholder="Kosong (Manual)"
+                  value={sortPackerPrefix}
+                  onChange={e => setSortPackerPrefix(e.target.value.toUpperCase())}
+                  onKeyDown={e => {
+                    if (e.key === 'Enter') {
+                      e.preventDefault();
+                      const applied = sortPackerPrefix.trim() ? handleApplyPackerPrefix() : true;
+                      if (applied) {
+                        setTimeout(() => {
+                          sortProductRef.current?.focus();
+                          sortProductRef.current?.select();
+                        }, 100);
+                      }
+                    }
+                  }}
+                  className="px-2 py-1.5 text-xs font-black font-mono w-24 text-center uppercase bg-white outline-none text-indigo-950 focus:ring-1 focus:ring-indigo-500 placeholder:text-slate-400 placeholder:font-normal"
+                />
+                {sortPackerPrefix.trim() ? (
+                  <button
+                    type="button"
+                    onClick={() => handleApplyPackerPrefix()}
+                    className="px-2 py-1.5 bg-indigo-600 hover:bg-indigo-700 text-white font-bold cursor-pointer shrink-0 transition-colors whitespace-nowrap"
+                    title={`Terapkan kode ${sortPackerPrefix}1 s/d ${sortPackerPrefix}${sortSlots.length || 20} ke semua slot`}
                   >
-                    TUTUP (✕)
+                    Setel ({sortPackerPrefix}1-{sortPackerPrefix}{sortSlots.length || 20})
                   </button>
-                </div>
-              ) : (
-                <div className={`w-full text-xs sm:text-sm font-bold px-3.5 py-2.5 rounded-lg flex items-center justify-between shadow-sm ${
-                  sortNotification.type === 'success' 
-                    ? 'bg-emerald-500 text-white border-2 border-emerald-600' 
-                    : 'bg-blue-600 text-white border-2 border-blue-700'
-                }`}>
-                  <div className="flex items-center gap-2">
-                    <span className="text-base">{sortNotification.type === 'success' ? '✓' : 'ℹ'}</span>
-                    <span>{sortNotification.message}</span>
-                  </div>
-                  <button onClick={() => setSortNotification(null)} className="text-white hover:text-slate-200 cursor-pointer p-1">
-                    <X className="w-4 h-4" />
-                  </button>
-                </div>
-              )
-            )}
-          </div>
+                ) : null}
+              </div>
 
-          {/* Visual Matrix: 20 Basket Slots Grid */}
-          <div className="bg-white rounded-lg border border-slate-200 shadow-sm p-4 space-y-3">
-            <div className="flex flex-wrap items-center justify-between text-xs font-bold text-slate-700 border-b border-slate-200 pb-2">
-              <div className="flex items-center gap-2">
-                <Layers className="w-4 h-4 text-sky-600" />
-                <span>Matriks Sortir: 20 Slot Keranjang Pesanan ({sortSlots.filter(s => s.isComplete).length} / {sortSlots.length || 20} Lengkap)</span>
+              {/* 3. Scan Produk */}
+              <form onSubmit={useBaselineSort ? handleBaselineSortScanProduct : handleSortScanProduct} className={`wms-scan-field flex items-center text-xs border rounded overflow-hidden bg-white ${
+                allBasketsBound
+                  ? 'border-emerald-500 ring-2 ring-emerald-200'
+                  : 'border-slate-300'
+              }`}>
+                <span className={`px-2 py-1.5 font-bold text-white whitespace-nowrap ${allBasketsBound ? 'bg-emerald-600' : 'bg-slate-500'}`}>
+                  3. Scan Produk
+                </span>
+                <input
+                  type="text"
+                  placeholder="Tembak barcode SKU untuk sortir..."
+                  ref={sortProductRef}
+                  value={sortProductInput}
+                  onChange={e => setSortProductInput(e.target.value)}
+                  disabled={savingSort || sortSlots.length === 0}
+                  className="px-2.5 py-1.5 text-xs outline-none w-44 sm:w-52 text-slate-800 focus:ring-1 focus:ring-emerald-500"
+                />
+              </form>
+
+              {/* Selesaikan sortir */}
+              <button
+                onClick={useBaselineSort ? handleBaselineEndSorting : handleEndSorting}
+                disabled={useBaselineSort
+                  ? savingSort || sortSlots.length === 0 || !allBasketsBound || sortSlots.some(s=>!s.isComplete)
+                  : !SERVER_SCAN_ENABLED || !sortServerReady || savingSort || sortSlots.length === 0 || !allBasketsBound || sortSlots.some(s=>!s.isComplete)}
+                className={`px-3 py-1.5 text-xs font-bold rounded flex items-center gap-1.5 shadow-xs transition-all cursor-pointer whitespace-nowrap ${
+                  sortSlots.length > 0 && allBasketsBound && allSlotsComplete
+                    ? 'bg-[#52C41A] hover:bg-emerald-600 text-white ring-2 ring-emerald-300'
+                    : sortSlots.length > 0 && allBasketsBound
+                    ? 'bg-[#52C41A]/80 hover:bg-emerald-600 text-white'
+                    : 'bg-slate-200 text-slate-400 cursor-not-allowed'
+                }`}
+              >
+                <Check className="w-3.5 h-3.5" />
+                <span>{savingSort ? 'Menyimpan sortir…' : 'Selesaikan sortir'}</span>
+              </button>
+
+              {!useBaselineSort && (
+                <button
+                  type="button"
+                  onClick={handleRecoverSorting}
+                  disabled={!SERVER_SCAN_ENABLED || savingSort || sortSlots.length === 0}
+                  className="px-2.5 py-1.5 text-xs font-bold rounded bg-[#1890FF] hover:bg-sky-600 text-white disabled:bg-slate-300 cursor-pointer whitespace-nowrap"
+                >
+                  Pulihkan sesi
+                </button>
+              )}
+
+              {sortSlots.length > 0 && (
+                <button
+                  type="button"
+                  onClick={() => {
+                    if (window.confirm(`Apakah Anda yakin ingin mereset sesi sortir untuk keranjang induk "${sortActiveMasterBasket || 'ini'}"?\n\nSeluruh barang yang telah discan akan dikembalikan ke 0 untuk batch ini.`)) {
+                      clearSortSessionFromStorage(sortActiveMasterBasket);
+                      const resetSlots = sortSlots.map(s => {
+                        const initialDecomp: { [itemId: string]: number } = {};
+                        s.order.items.forEach(it => { initialDecomp[it.id] = 0; });
+                        return {
+                          ...s,
+                          itemsDecomposed: initialDecomp,
+                          isComplete: false
+                        };
+                      });
+                      setSortSlots(resetSlots);
+                      setSortLastAssignedSlot(null);
+                      setSortLastScannedSku(null);
+                      if (sortActiveMasterBasket) {
+                        saveSortSessionToStorage(sortActiveMasterBasket, sortPackerPrefix, resetSlots);
+                      }
+                      setSortNotification({ type: 'info', message: 'Sesi sortir berhasil di-reset kembali ke 0.' });
+                    }
+                  }}
+                  disabled={savingSort}
+                  className="px-2.5 py-1.5 text-xs font-bold rounded bg-rose-50 text-rose-700 border border-rose-300 hover:bg-rose-100 transition-colors cursor-pointer whitespace-nowrap"
+                  title="Mulai ulang sortir keranjang induk ini dari 0"
+                >
+                  Mulai Ulang (Reset 0)
+                </button>
+              )}
+
+              {/* Mabang Right Info Readout: Picker & Induk */}
+              <div className="ml-auto flex items-center gap-2 text-xs">
                 {sortActiveMasterBasket && (
-                  <span className="px-2 py-0.5 bg-sky-100 text-sky-800 rounded font-mono font-bold">
+                  <span className="px-2 py-0.5 bg-sky-100 text-sky-800 border border-sky-200 rounded font-mono font-bold">
                     Induk: {sortActiveMasterBasket}
                   </span>
                 )}
-                {!allBasketsBound && sortSlots.length > 0 && (
-                  <span className="px-2 py-0.5 bg-amber-100 text-amber-900 border border-amber-300 rounded font-bold text-[11px] animate-pulse">
-                    ⚠ Wajib Input Basket ({sortSlots.filter(s => s.isBasketBound).length} / {sortSlots.length} Terikat)
-                  </span>
-                )}
-              </div>
-              <div className="flex items-center gap-2 text-[11px]">
-                <span className="flex items-center gap-1">
-                  <span className="w-3 h-3 rounded bg-amber-100 border border-amber-300 inline-block"></span>
-                  <span>Menunggu sortir</span>
-                </span>
-                <span className="flex items-center gap-1">
-                  <span className="w-3 h-3 rounded bg-[#52C41A] inline-block"></span>
-                  <span>Sortir lengkap</span>
-                </span>
+                <span className="text-slate-500 font-medium">Picker:</span>
+                <span className="font-bold text-[#1890FF]">{pickerDisplay}</span>
               </div>
             </div>
 
+            {/* Mabang 3-Column Hero Status Strip: Basket | SKU / Barcode | Tersortir / Total */}
+            <div className="bg-[#F2F4F7]">
+              <div className="grid grid-cols-3 text-center text-[11px] font-semibold text-slate-600 border-b border-slate-200 bg-[#E8ECEF] py-1">
+                <span>Basket</span>
+                <span>SKU / Barcode</span>
+                <span>Tersortir / Total</span>
+              </div>
+
+              {allSlotsComplete ? (
+                <div className="py-3.5 px-4 text-center bg-[#EDF8EE]">
+                  <span className="block text-xl sm:text-2xl font-black text-[#00897B] tracking-tight">
+                    Sortir Batch Selesai — Klik &ldquo;Selesaikan sortir&rdquo;
+                  </span>
+                  <span className="block text-xs font-semibold text-emerald-700 mt-0.5">
+                    {completedCount}/{sortSlots.length} Keranjang Lengkap &middot; Total {totalBatchScanned}/{totalBatchQty} pcs
+                  </span>
+                </div>
+              ) : sortSlots.length > 0 && (showAssignedBanner || sortLastScannedSku) ? (
+                <div className="grid grid-cols-3 items-center text-center py-2.5 px-3 bg-white">
+                  <div className="flex flex-col items-center justify-center min-w-0">
+                    <span className="text-3xl sm:text-4xl font-black font-mono text-[#00897B] leading-none truncate max-w-full">
+                      {showAssignedBanner ? lastAssignedSlotObj?.basketCode : sortLastScannedSku?.basketCode}
+                    </span>
+                    {showAssignedBanner && lastAssignedSlotObj && (
+                      <span className="mt-1 px-2 py-0.5 bg-amber-300 text-slate-950 rounded text-[11px] font-black">
+                        Masukkan ke Keranjang: {lastAssignedSlotObj.basketCode}
+                      </span>
+                    )}
+                  </div>
+
+                  <div className="flex flex-col items-center justify-center px-2 min-w-0">
+                    <span className="text-sm sm:text-base font-black font-mono text-slate-900 truncate max-w-full">
+                      {sortLastScannedSku?.skuId || '-'}
+                    </span>
+                    {sortLastScannedSku?.barcode && (
+                      <span className="text-xs font-mono text-slate-600 truncate max-w-full">
+                        {sortLastScannedSku.barcode}
+                      </span>
+                    )}
+                    {sortLastScannedSku?.skuName && (
+                      <span className="text-[11px] text-slate-500 truncate max-w-full" title={sortLastScannedSku.skuName}>
+                        {sortLastScannedSku.skuName}
+                      </span>
+                    )}
+                  </div>
+
+                  <div className="flex flex-col items-center justify-center min-w-0">
+                    <span className="text-3xl sm:text-4xl font-black font-mono text-[#00897B] leading-none tabular-nums">
+                      {sortLastScannedSku ? `${sortLastScannedSku.itemScanned}/${sortLastScannedSku.itemRequired}` : '0/0'}
+                    </span>
+                    {heroSlotObj && (
+                      <span className="text-[11px] font-mono text-slate-500 mt-1">
+                        Total keranjang: {heroSlotDecomp}/{heroSlotObj.order.totalQty} pcs
+                      </span>
+                    )}
+                  </div>
+                </div>
+              ) : sortSlots.length > 0 ? (
+                <div className="px-4 py-2.5 flex items-center gap-3 bg-[#E9ECEF] text-slate-700 text-xs">
+                  <div className="w-6 h-6 rounded-full border border-slate-400 flex items-center justify-center text-slate-500 shrink-0 font-bold">
+                    {allBasketsBound ? '✓' : '!'}
+                  </div>
+                  <div>
+                    <div className="font-bold text-slate-800">
+                      {allBasketsBound ? 'Siap Sortir' : `Menunggu Pengikatan Keranjang (${boundCount}/${sortSlots.length})`}
+                    </div>
+                    <div className="text-[11px] text-slate-600">
+                      {allBasketsBound
+                        ? 'Semua anak keranjang sudah terikat — silakan tembak barcode SKU pada kolom Scan Produk.'
+                        : 'Isi/scan seluruh kode anak keranjang atau ketik Kode Packer sebelum memulai scan produk.'}
+                    </div>
+                  </div>
+                </div>
+              ) : (
+                <div className="grid grid-cols-3 items-center text-center py-2.5 px-3 text-xs text-slate-400">
+                  <span className="font-mono font-bold">&mdash;</span>
+                  <span>Belum ada keranjang induk dimuat</span>
+                  <span className="font-mono font-bold">0/0</span>
+                </div>
+              )}
+            </div>
+          </div>
+
+          {/* Notification alert (DIPERBESAR KHUSUSNYA JIKA ERROR / SALAH SCAN KARENA TANPA SPEAKER) */}
+          {sortNotification && (
+            sortNotification.type === 'error' ? (
+              <div
+                role="alert"
+                className="wms-scan-error-alert w-full bg-rose-600 bg-gradient-to-r from-rose-600 via-red-600 to-rose-700 text-white border-4 border-rose-950 rounded-xl p-3.5 sm:p-4 shadow-xl flex items-center justify-between gap-3"
+              >
+                <div className="flex items-center gap-3">
+                  <div className="wms-scan-error-badge w-10 h-10 rounded-full bg-white text-rose-600 flex items-center justify-center font-black text-xl shrink-0 shadow-lg ring-4 ring-rose-300">
+                    ✕
+                  </div>
+                  <div>
+                    <div className="wms-scan-error-title text-[11px] font-black uppercase tracking-wider text-rose-100 flex items-center gap-1.5">
+                      <span className="wms-scan-error-dot w-2 h-2 rounded-full bg-white animate-ping"></span>
+                      PERINGATAN SALAH SCAN PRODUK (CEK VISUAL):
+                    </div>
+                    <div className="wms-scan-error-message text-sm sm:text-base md:text-lg font-black text-white leading-tight drop-shadow-sm mt-0.5">
+                      {sortNotification.message}
+                    </div>
+                  </div>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => setSortNotification(null)}
+                  className="wms-scan-error-close px-3 py-1.5 bg-black/40 hover:bg-black/60 text-white font-bold rounded-lg text-xs cursor-pointer shrink-0 transition-colors border border-white/20"
+                  title="Tutup Peringatan"
+                >
+                  TUTUP (✕)
+                </button>
+              </div>
+            ) : (
+              <div
+                className={`wms-scan-status-banner w-full text-xs sm:text-sm font-bold px-3.5 py-2.5 rounded-lg flex items-center justify-between shadow-xs ${
+                  sortNotification.type === 'success'
+                    ? 'is-success bg-emerald-500 text-white border border-emerald-600'
+                    : 'is-info bg-blue-600 text-white border border-blue-700'
+                }`}
+              >
+                <div className="flex items-center gap-2">
+                  <span className="text-base">{sortNotification.type === 'success' ? '✓' : 'ℹ'}</span>
+                  <span>{sortNotification.message}</span>
+                </div>
+                <button type="button" onClick={() => setSortNotification(null)} className="text-white hover:text-slate-200 cursor-pointer p-1">
+                  <X className="w-4 h-4" />
+                </button>
+              </div>
+            )
+          )}
+
+          {/* Main Mabang Split Area: Left 4x5 Task list Grid + Right Dual-Mode Panel */}
+          <div className="bg-white rounded-md border border-slate-300 shadow-xs overflow-hidden">
             {sortSlots.length === 0 ? (
-              <div className="py-16 text-center text-slate-400 space-y-2">
+              <div className="py-14 text-center text-slate-400 space-y-2">
                 <div className="w-14 h-14 mx-auto rounded-full bg-slate-100 flex items-center justify-center text-slate-300">
                   <Layers className="w-8 h-8" />
                 </div>
@@ -2542,253 +3622,527 @@ export default function MabangWmsOutbound({
                 <button
                   onClick={() => DEV_BASELINE_SORTING ? handleBaselineLoadSortTask() : handleLoadSortTask()}
                   disabled={!sortTaskInput.trim()}
-                  className="mt-3 px-4 py-2 text-xs font-bold bg-sky-500 hover:bg-sky-600 text-white rounded-lg shadow-sm"
+                  className="mt-3 px-4 py-2 text-xs font-bold bg-sky-500 hover:bg-sky-600 text-white rounded-lg shadow-xs cursor-pointer disabled:bg-slate-300"
                 >
                   Muat keranjang induk yang dipindai
                 </button>
               </div>
             ) : (
-              /* DUAL PANEL LAYOUT: KIRI KOTAK BASKET RINGKAS (HURUF BESAR) + KANAN DESKRIPSI ISI PRODUK */
-              <div className="grid grid-cols-1 lg:grid-cols-12 gap-4 items-start">
-                
-                {/* 1. PANEL KIRI: 20 KOTAK BASKET KECIL / COMPACT DENGAN HURUF/KODE BESAR (8 Kolom) */}
-                <div className="lg:col-span-7 xl:col-span-8 space-y-2">
-                  <div className="flex items-center justify-between text-[11px] text-slate-500 px-1 font-medium">
-                    <span>💡 Klik kotak basket untuk melihat rincian isi produk di panel kanan:</span>
-                    <span className="font-bold text-sky-600">Terpilih: {sortSlots.find(s => s.slotNumber === (sortSelectedSlotNumber || 1))?.basketCode || `Slot #${sortSelectedSlotNumber || 1}`}</span>
+              <div className="p-2.5 space-y-2.5">
+                {/* Banner Input Manual Anak Keranjang jika ada yang belum terikat */}
+                {!allBasketsBound && (
+                  <div className="bg-amber-50 border-2 border-amber-400 p-2.5 rounded-lg flex flex-wrap items-center justify-between gap-2.5">
+                    <div className="flex items-center gap-2">
+                      <div className="w-7 h-7 rounded bg-amber-500 text-white font-black flex items-center justify-center text-xs shrink-0">
+                        #{sortTargetSlotForBind || nextUnboundSlot?.slotNumber || 1}
+                      </div>
+                      <div>
+                        <div className="text-xs font-black text-amber-950 flex items-center gap-1.5 flex-wrap">
+                          <span>Wajib Isi Manual Kode Anak Keranjang untuk Slot #{sortTargetSlotForBind || nextUnboundSlot?.slotNumber || 1}</span>
+                          <span className="text-[10px] bg-amber-200 text-amber-900 px-1.5 py-0.5 rounded font-mono font-bold">
+                            {boundCount} / {sortSlots.length} Terikat
+                          </span>
+                        </div>
+                        <p className="text-[11px] text-amber-800">
+                          Pindai barcode atau ketik kode anak keranjang fisik yang nantinya dimuat di menu Packing.
+                        </p>
+                      </div>
+                    </div>
+
+                    <form
+                      onSubmit={(e) => {
+                        e.preventDefault();
+                        handleBindSlotBasket(sortTargetSlotForBind || nextUnboundSlot?.slotNumber || 1);
+                      }}
+                      className="flex items-center gap-1.5 ml-auto"
+                    >
+                      <input
+                        ref={sortBasketInputRef}
+                        type="text"
+                        placeholder={`Kode anak keranjang Slot #${sortTargetSlotForBind || nextUnboundSlot?.slotNumber || 1}...`}
+                        value={sortBasketInputManual}
+                        onChange={(e) => setSortBasketInputManual(e.target.value.toUpperCase())}
+                        className="px-2.5 py-1.5 text-xs font-black font-mono bg-white border-2 border-amber-400 rounded outline-none text-slate-900 w-48 sm:w-60 focus:ring-2 focus:ring-amber-500 placeholder:text-slate-400 placeholder:font-normal"
+                      />
+                      <button
+                        type="submit"
+                        className="px-3 py-1.5 bg-amber-600 hover:bg-amber-700 text-white font-black rounded text-xs cursor-pointer transition-colors shrink-0"
+                      >
+                        Ikat Slot #{sortTargetSlotForBind || nextUnboundSlot?.slotNumber || 1}
+                      </button>
+                    </form>
+                  </div>
+                )}
+
+                <div className="grid grid-cols-1 lg:grid-cols-12 gap-3 items-start">
+                  {/* PANEL KIRI (8/12): Mabang Task list 4 Kolom x 5 Baris */}
+                  <div className="lg:col-span-8 space-y-2">
+                    {/* Header Task list + Contoh Warna Status + Mode Kompak */}
+                    <div className="flex flex-wrap items-center justify-between gap-2 pb-1.5 border-b border-slate-200 text-xs">
+                      <div className="flex items-center gap-2 flex-wrap">
+                        <span className="inline-flex items-center gap-1 font-bold text-slate-800">
+                          <Layers className="w-3.5 h-3.5 text-slate-600" />
+                          <span>Task list</span>
+                        </span>
+                        <span className="text-[11px] font-mono font-bold text-slate-600">
+                          ({completedCount}/{sortSlots.length} Lengkap &middot; {totalBatchScanned}/{totalBatchQty} pcs)
+                        </span>
+                        <span className="text-[11px] font-bold text-sky-700 bg-sky-50 border border-sky-200 px-2 py-0.5 rounded">
+                          Terpilih: {selectedSlot?.basketCode || `Slot #${sortSelectedSlotNumber || 1} (Belum Diikat)`}
+                        </span>
+                      </div>
+
+                      <div className="flex items-center gap-1.5 text-[11px] flex-wrap">
+                        <span className="text-slate-500">Contoh:</span>
+                        <span className="px-2 py-0.5 rounded bg-[#D9363E] text-white font-semibold">Belum Diikat / Error</span>
+                        <span className="px-2 py-0.5 rounded bg-[#F5F7FA] border border-slate-300 text-slate-700 font-semibold">Menunggu sortir</span>
+                        <span className="px-2 py-0.5 rounded bg-[#B7EB34] border border-[#8CCB1E] text-slate-900 font-semibold">Sortir lengkap</span>
+                        <button
+                          type="button"
+                          onClick={toggleSortCompactMode}
+                          className={`ml-1 px-2 py-0.5 text-[11px] font-bold rounded border transition-all cursor-pointer flex items-center gap-1 ${
+                            sortCompactMode
+                              ? 'bg-indigo-600 text-white border-indigo-500'
+                              : 'bg-white text-slate-700 border-slate-300 hover:bg-slate-50'
+                          }`}
+                          title="Mode Kompak untuk Layar Tablet / PDA Handheld agar 20 keranjang muat lebih rapat"
+                        >
+                          <Minimize2 className="w-3 h-3" />
+                          <span>{sortCompactMode ? 'Kompak: ON' : 'Kompak: OFF'}</span>
+                        </button>
+                      </div>
+                    </div>
+
+                    {/* Grid 4 Kolom x 5 Baris (20 Basket Fit Cleanly) */}
+                    <div className={`grid grid-cols-2 sm:grid-cols-4 ${sortCompactMode ? 'gap-1.5' : 'gap-2'}`}>
+                      {sortSlots.map(slot => {
+                        const isAssigned = sortLastAssignedSlot === slot.slotNumber;
+                        const isSelected = (sortSelectedSlotNumber || 1) === slot.slotNumber;
+                        const totalItems = slot.order.totalQty;
+                        const currentDecomp = Object.values(slot.itemsDecomposed).reduce((a, b) => a + b, 0);
+
+                        return (
+                          <div
+                            key={slot.slotNumber}
+                            onClick={() => {
+                              setSortSelectedSlotNumber(slot.slotNumber);
+                              setSortTargetSlotForBind(slot.slotNumber);
+                              setSortRightPanelMode('slot');
+                              if (clearSortingIndicatorOnSelection) setSortLastAssignedSlot(null);
+                            }}
+                            className={`rounded border transition-all cursor-pointer select-none text-left flex flex-col justify-between ${
+                              sortCompactMode ? 'p-1.5' : 'p-2'
+                            } ${
+                              !slot.isBasketBound
+                                ? 'bg-[#FFF1F0] border-[#D9363E] text-rose-950 hover:bg-rose-50'
+                                : slot.isComplete
+                                ? 'bg-[#B7EB34] border-[#8CCB1E] text-slate-900 hover:brightness-95'
+                                : isAssigned
+                                ? 'bg-emerald-50 border-emerald-600 ring-2 ring-emerald-400 text-slate-900'
+                                : 'bg-[#F5F7FA] border-slate-300 text-slate-800 hover:bg-white hover:border-sky-400'
+                            } ${isSelected ? 'ring-2 ring-indigo-600 ring-offset-1 z-10' : ''}`}
+                          >
+                            {/* Baris 1: Basket code + qty */}
+                            <div className="flex items-center justify-between gap-1">
+                              <div className="flex items-baseline gap-1 min-w-0">
+                                <span className={`text-[10px] shrink-0 ${slot.isComplete ? 'text-slate-700' : 'text-slate-500'}`}>
+                                  Basket:
+                                </span>
+                                <div className={`font-black font-mono leading-tight truncate ${
+                                  sortCompactMode ? 'text-xs' : 'text-sm'
+                                } ${
+                                  !slot.isBasketBound
+                                    ? 'text-[#D9363E]'
+                                    : slot.isComplete
+                                    ? 'text-slate-900'
+                                    : isAssigned
+                                    ? 'text-emerald-700'
+                                    : 'text-slate-900'
+                                }`}>
+                                  {slot.isBasketBound && slot.basketCode ? slot.basketCode : `Slot #${slot.slotNumber}`}
+                                </div>
+                              </div>
+                              <span className={`text-[10px] font-mono font-bold px-1 py-0.5 rounded shrink-0 ${
+                                slot.isComplete
+                                  ? 'bg-black/10 text-slate-900'
+                                  : !slot.isBasketBound
+                                  ? 'bg-rose-100 text-rose-700'
+                                  : 'bg-slate-200/80 text-slate-700'
+                              }`}>
+                                {currentDecomp}/{totalItems} pcs
+                              </span>
+                            </div>
+
+                            {/* Baris 2: Order */}
+                            <div className={`flex items-baseline gap-1 text-[10px] leading-tight truncate ${sortCompactMode ? 'mt-0.5' : 'mt-1'}`}>
+                              <span className={`shrink-0 ${slot.isComplete ? 'text-slate-700' : 'text-slate-500'}`}>Order:</span>
+                              <span className="font-mono font-semibold truncate" title={slot.order.referenceNumber}>
+                                {slot.order.orderNumber || slot.order.referenceNumber}
+                              </span>
+                            </div>
+
+                            {/* Baris 3: Batch / Pelanggan */}
+                            <div className="flex items-baseline gap-1 text-[10px] leading-tight truncate mt-0.5">
+                              <span className={`shrink-0 ${slot.isComplete ? 'text-slate-700' : 'text-slate-500'}`}>
+                                {slot.order.batchNumber ? 'Batch:' : 'Cust:'}
+                              </span>
+                              <span className="truncate font-medium" title={`${slot.order.batchNumber || ''} ${slot.order.customerName || ''}`.trim()}>
+                                {slot.order.batchNumber || slot.order.customerName}
+                              </span>
+                            </div>
+                          </div>
+                        );
+                      })}
+                    </div>
                   </div>
 
-                  <div className="grid grid-cols-2 sm:grid-cols-4 md:grid-cols-5 gap-2.5">
-                    {sortSlots.map(slot => {
-                      const isAssigned = sortLastAssignedSlot === slot.slotNumber;
-                      const isSelected = (sortSelectedSlotNumber || 1) === slot.slotNumber;
-                      const totalItems = slot.order.totalQty;
-                      const currentDecomp = Object.values(slot.itemsDecomposed).reduce((a, b) => a + b, 0);
+                  {/* PANEL KANAN (4/12): Mabang Light Dual-Mode Panel (SKU Ter-scan vs Isi Basket Terpilih) */}
+                  <div className="lg:col-span-4 bg-white border border-slate-200 rounded-md overflow-hidden sticky top-20 shadow-xs text-slate-800">
+                    {/* Mode Switcher Tabs */}
+                    <div className="grid grid-cols-2 border-b border-slate-200 bg-[#F5F7FA] text-xs font-bold">
+                      <button
+                        type="button"
+                        onClick={() => setSortRightPanelMode('sku')}
+                        className={`py-2 px-2 text-center border-b-2 transition-colors cursor-pointer ${
+                          sortRightPanelMode === 'sku'
+                            ? 'bg-white text-sky-700 border-sky-600'
+                            : 'text-slate-500 border-transparent hover:text-slate-700'
+                        }`}
+                      >
+                        SKU Ter-scan
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => setSortRightPanelMode('slot')}
+                        className={`py-2 px-2 text-center border-b-2 transition-colors cursor-pointer truncate ${
+                          sortRightPanelMode === 'slot'
+                            ? 'bg-white text-sky-700 border-sky-600'
+                            : 'text-slate-500 border-transparent hover:text-slate-700'
+                        }`}
+                      >
+                        Isi Basket ({selectedSlot?.isBasketBound && selectedSlot.basketCode ? selectedSlot.basketCode : `#${selectedSlot?.slotNumber || 1}`})
+                      </button>
+                    </div>
+
+                    {sortRightPanelMode === 'sku' ? (() => {
+                      const targetSkuKey = sortLastScannedSku ? sortLastScannedSku.skuId.trim().toUpperCase() : '';
+                      const matchingRows = sortLastScannedSku
+                        ? sortSlots
+                            .map(slot => {
+                              const itemsForSku = slot.order.items.filter(
+                                it => it.skuId.trim().toUpperCase() === targetSkuKey
+                              );
+                              if (itemsForSku.length === 0) return null;
+                              const required = itemsForSku.reduce((sum, it) => sum + it.qty, 0);
+                              const scanned = itemsForSku.reduce((sum, it) => sum + (slot.itemsDecomposed[it.id] || 0), 0);
+                              return {
+                                slot,
+                                required,
+                                scanned,
+                                isDone: scanned >= required
+                              };
+                            })
+                            .filter((entry): entry is NonNullable<typeof entry> => Boolean(entry))
+                        : [];
 
                       return (
-                        <div
-                          key={slot.slotNumber}
-                          onClick={() => {
-                            setSortSelectedSlotNumber(slot.slotNumber);
-                            if (clearSortingIndicatorOnSelection) setSortLastAssignedSlot(null);
-                          }}
-                          className={`p-2.5 rounded-xl border-2 transition-all cursor-pointer select-none text-center relative flex flex-col justify-between ${
-                            isSelected
-                              ? 'border-indigo-600 bg-indigo-50/80 shadow-md ring-2 ring-indigo-400/50 scale-[1.02] z-10'
-                              : isAssigned
-                              ? 'border-sky-500 bg-sky-50 shadow-md ring-2 ring-sky-300 animate-pulse'
-                              : slot.isComplete
-                              ? 'border-emerald-500 bg-emerald-50/90 hover:bg-emerald-100/80'
-                              : !slot.isBasketBound
-                              ? 'border-amber-400 bg-amber-50/60 hover:bg-amber-100/60'
-                              : 'border-slate-300 bg-white hover:border-sky-400 hover:bg-slate-50 shadow-xs'
-                          }`}
-                        >
-                          {/* Top badge baris kecil */}
-                          <div className="flex items-center justify-between text-[10px] leading-none mb-1">
-                            <span className="font-bold text-slate-500 font-mono">#{slot.slotNumber}</span>
-                            <span className={`px-1.5 py-0.5 rounded text-[9px] font-black uppercase ${
-                              slot.isComplete
-                                ? 'bg-emerald-600 text-white'
-                                : slot.isBasketBound
-                                ? 'bg-amber-200 text-amber-950'
-                                : 'bg-rose-100 text-rose-700'
-                            }`}>
-                              {slot.isComplete ? '✓ Selesai' : slot.isBasketBound ? `${currentDecomp}/${totalItems}` : 'Belum'}
-                            </span>
+                        <div>
+                          {/* Top SKU Preview Box (Mabang Photo 1 & 2 right top card) */}
+                          <div className="p-3 border-b border-slate-200 flex flex-col items-center text-center bg-white">
+                            {sortLastScannedSku ? (
+                              <>
+                                <div className="w-16 h-16 rounded-md bg-teal-50 border border-teal-200 flex flex-col items-center justify-center text-teal-700">
+                                  <Package className="w-7 h-7" />
+                                  <span className="text-[9px] font-bold uppercase tracking-wider mt-0.5">SKU</span>
+                                </div>
+                                <div className="text-xs font-mono font-black text-slate-900 mt-1.5 break-all">
+                                  {sortLastScannedSku.skuId}
+                                </div>
+                                {sortLastScannedSku.barcode && (
+                                  <div className="text-[11px] font-mono text-slate-500">
+                                    {sortLastScannedSku.barcode}
+                                  </div>
+                                )}
+                                <div className="text-[11px] font-medium text-slate-700 mt-0.5 line-clamp-2 max-w-full" title={sortLastScannedSku.skuName}>
+                                  {sortLastScannedSku.skuName}
+                                </div>
+                              </>
+                            ) : (
+                              <>
+                                <div className="w-16 h-16 rounded-md bg-slate-100 border border-dashed border-slate-300 flex items-center justify-center text-slate-300">
+                                  <Scan className="w-7 h-7" />
+                                </div>
+                                <div className="text-[11px] font-medium text-slate-400 mt-1.5">
+                                  Siap Scan Barcode SKU
+                                </div>
+                              </>
+                            )}
                           </div>
 
-                          {/* KODE KERANJANG BESAR (HURUF DIPERBESAR SESUAI PERMINTAAN) */}
-                          <div className="py-1">
-                            <div className={`text-2xl sm:text-3xl font-black font-mono tracking-tight leading-none ${
-                              slot.isComplete
-                                ? 'text-emerald-700'
-                                : isSelected
-                                ? 'text-indigo-900'
-                                : isAssigned
-                                ? 'text-sky-700'
-                                : 'text-slate-900'
-                            }`}>
-                              {slot.basketCode || `B-${String(slot.slotNumber).padStart(2, '0')}`}
+                          {/* 3-Column Table Header: Basket | Tersortir / Total | Status */}
+                          <div className="grid grid-cols-12 text-[11px] font-bold text-slate-600 bg-[#F5F7FA] border-b border-slate-200 px-3 py-1.5">
+                            <div className="col-span-4 text-left">Basket</div>
+                            <div className="col-span-4 text-center">Tersortir / Total</div>
+                            <div className="col-span-4 text-right">Status</div>
+                          </div>
+
+                          {!sortLastScannedSku ? (
+                            <div className="py-10 px-4 text-center text-slate-400">
+                              <div className="w-9 h-9 mx-auto rounded-full border border-slate-300 flex items-center justify-center text-slate-400 mb-2">
+                                <Package className="w-4 h-4" />
+                              </div>
+                              <div className="text-sm font-semibold text-slate-500">Initialize!</div>
+                              <div className="text-[11px] text-slate-400 mt-0.5">Belum ada produk discan pada batch ini</div>
                             </div>
-                            <div className="text-[10px] font-bold text-slate-600 mt-1 truncate" title={slot.order.customerName}>
-                              {slot.order.customerName}
+                          ) : matchingRows.length === 0 ? (
+                            <div className="py-8 px-4 text-center text-xs text-slate-400">
+                              Tidak ada slot lain yang menunggu SKU ini.
                             </div>
-                          </div>
-
-                          {/* Bottom compact status bar */}
-                          <div className="pt-1.5 border-t border-slate-200/80 flex items-center justify-between text-[10px] font-mono leading-none">
-                            <span className="text-slate-500 text-[9px]">{new Set(slot.order.items.map(i=>i.skuId)).size} SKU unik · {slot.order.items.length} baris</span>
-                            <span className={`font-black ${slot.isComplete ? 'text-emerald-700' : 'text-amber-700'}`}>
-                              {currentDecomp}/{totalItems} pcs
-                            </span>
-                          </div>
-                        </div>
-                      );
-                    })}
-                  </div>
-                </div>
-
-                {/* 2. PANEL KANAN: DESKRIPSI ISI PRODUK PER BASKET (Sticky & Responsif) (4 Kolom / 5 Kolom) */}
-                <div className="lg:col-span-5 xl:col-span-4 bg-slate-900 text-white rounded-xl border border-slate-800 p-4 shadow-xl sticky top-20">
-                  {(() => {
-                    const activeSlot = sortSlots.find(s => s.slotNumber === (sortSelectedSlotNumber || 1)) || sortSlots[0];
-                    if (!activeSlot) return null;
-
-                    const totalItems = activeSlot.order.totalQty;
-                    const currentDecomp = Object.values(activeSlot.itemsDecomposed).reduce((a, b) => a + b, 0);
-                    const remainingPcs = totalItems - currentDecomp;
-
-                    return (
-                      <div className="space-y-3.5">
-                        {/* Header Panel Kanan: Keranjang Terpilih */}
-                        <div className="border-b border-slate-800 pb-3 flex items-start justify-between gap-2">
-                          <div>
-                            <div className="flex items-center gap-2">
-                              <span className="px-2 py-0.5 bg-indigo-500/20 text-indigo-400 border border-indigo-500/40 rounded text-[10px] font-mono font-bold">
-                                Slot #{activeSlot.slotNumber}
-                              </span>
-                              <span className={`px-2 py-0.5 rounded text-[10px] font-black uppercase ${
-                                activeSlot.isComplete 
-                                  ? 'bg-emerald-500/20 text-emerald-400 border border-emerald-500/30' 
-                                  : 'bg-amber-500/20 text-amber-400 border border-amber-500/30 animate-pulse'
-                              }`}>
-                                {activeSlot.isComplete ? '✓ Lengkap / Siap Packing' : `Kurang ${remainingPcs} pcs`}
-                              </span>
-                            </div>
-                            <h3 className="text-2xl font-black font-mono text-white mt-1 flex items-baseline gap-2">
-                              <span>Keranjang:</span>
-                              <span className="text-sky-400 text-3xl font-extrabold">{activeSlot.basketCode}</span>
-                            </h3>
-                          </div>
-
-                          <div className="text-right">
-                            <span className="text-[10px] text-slate-400 block uppercase font-bold">Total Kuantitas</span>
-                            <div className="font-mono text-lg font-black text-white">
-                              <span className={activeSlot.isComplete ? 'text-emerald-400' : 'text-amber-400'}>
-                                {currentDecomp}
-                              </span>
-                              <span className="text-slate-500 text-sm"> / {totalItems} pcs</span>
-                            </div>
-                          </div>
-                        </div>
-
-                        {/* Info Pelanggan & Order */}
-                        <div className="bg-slate-950/70 border border-slate-800/80 rounded-lg p-2.5 text-xs space-y-1">
-                          <div className="flex items-center justify-between">
-                            <span className="text-slate-400 text-[11px]">Pelanggan:</span>
-                            <span className="font-bold text-white truncate max-w-[200px]">{activeSlot.order.customerName}</span>
-                          </div>
-                          <div className="flex items-center justify-between">
-                            <span className="text-slate-400 text-[11px]">No. Order / Ref:</span>
-                            <span className="font-mono text-sky-400 text-[11px] truncate max-w-[200px]">{activeSlot.order.referenceNumber}</span>
-                          </div>
-                          {activeSlot.order.courier && (
-                            <div className="flex items-center justify-between">
-                              <span className="text-slate-400 text-[11px]">Ekspedisi:</span>
-                              <span className="font-semibold text-slate-300 text-[11px]">{activeSlot.order.courier}</span>
+                          ) : (
+                            <div className="divide-y divide-slate-100 max-h-[340px] overflow-y-auto">
+                              {matchingRows.map(entry => {
+                                const isCurrentTarget = sortLastScannedSku.slotNumber === entry.slot.slotNumber;
+                                return (
+                                  <div
+                                    key={entry.slot.slotNumber}
+                                    className={`grid grid-cols-12 items-center px-3 py-2 text-xs ${
+                                      isCurrentTarget ? 'bg-emerald-50/70' : 'bg-white'
+                                    }`}
+                                  >
+                                    <div className="col-span-4 text-left">
+                                      <button
+                                        type="button"
+                                        onClick={() => {
+                                          setSortSelectedSlotNumber(entry.slot.slotNumber);
+                                          setSortTargetSlotForBind(entry.slot.slotNumber);
+                                          setSortRightPanelMode('slot');
+                                          if (clearSortingIndicatorOnSelection) setSortLastAssignedSlot(null);
+                                        }}
+                                        className="font-mono font-black text-sm text-[#1890FF] hover:underline cursor-pointer"
+                                        title="Klik untuk melihat detail keranjang ini"
+                                      >
+                                        {entry.slot.isBasketBound && entry.slot.basketCode
+                                          ? entry.slot.basketCode
+                                          : `Slot #${entry.slot.slotNumber}`}
+                                      </button>
+                                    </div>
+                                    <div className="col-span-4 text-center font-mono font-bold text-sm text-sky-700 tabular-nums">
+                                      {entry.scanned}/{entry.required}
+                                    </div>
+                                    <div className="col-span-4 text-right">
+                                      {entry.isDone ? (
+                                        <span className="inline-block px-2 py-0.5 rounded bg-[#52C41A] text-white text-[10px] font-bold">
+                                          OK
+                                        </span>
+                                      ) : (
+                                        <span className="inline-block px-2 py-0.5 rounded bg-amber-100 text-amber-800 border border-amber-300 text-[10px] font-bold">
+                                          Kurang {entry.required - entry.scanned}
+                                        </span>
+                                      )}
+                                    </div>
+                                  </div>
+                                );
+                              })}
                             </div>
                           )}
                         </div>
+                      );
+                    })() : (() => {
+                      const activeSlot = selectedSlot;
+                      if (!activeSlot) return null;
 
-                        {/* DAFTAR DESKRIPSI ISI PRODUK PER BASKET */}
-                        <div className="space-y-2">
-                          <div className="flex items-center justify-between text-xs font-bold text-slate-300 px-0.5">
-                            <span className="flex items-center gap-1.5">
-                              <Package className="w-3.5 h-3.5 text-sky-400" />
-                              <span>Deskripsi Isi Produk ({new Set(activeSlot.order.items.map(i=>i.skuId)).size} SKU unik · {activeSlot.order.items.length} baris):</span>
-                            </span>
-                            <span className="text-[10px] text-slate-500 font-mono">Pindai barcode</span>
+                      const totalItems = activeSlot.order.totalQty;
+                      const currentDecomp = Object.values(activeSlot.itemsDecomposed).reduce((a, b) => a + b, 0);
+                      const remainingPcs = totalItems - currentDecomp;
+
+                      return (
+                        <div className="p-3 space-y-3 bg-white">
+                          {/* Header Panel Kanan: Keranjang Terpilih */}
+                          <div className="border-b border-slate-200 pb-2.5 flex items-start justify-between gap-2">
+                            <div className="min-w-0 flex-1">
+                              <div className="flex items-center gap-1.5 flex-wrap">
+                                <span className="px-2 py-0.5 bg-indigo-50 text-indigo-700 border border-indigo-200 rounded text-[10px] font-mono font-bold">
+                                  Slot #{activeSlot.slotNumber}
+                                </span>
+                                <span className={`px-2 py-0.5 rounded text-[10px] font-black uppercase ${
+                                  activeSlot.isComplete
+                                    ? 'bg-emerald-100 text-emerald-800 border border-emerald-300'
+                                    : !activeSlot.isBasketBound
+                                    ? 'bg-rose-100 text-rose-700 border border-rose-300'
+                                    : 'bg-amber-100 text-amber-800 border border-amber-300'
+                                }`}>
+                                  {activeSlot.isComplete ? '✓ Lengkap / Siap Packing' : !activeSlot.isBasketBound ? '⚠ Wajib Input' : `Kurang ${remainingPcs} pcs`}
+                                </span>
+                              </div>
+                              <h3 className="text-base sm:text-lg font-black font-mono text-slate-900 mt-1 flex items-baseline gap-1.5 flex-wrap">
+                                <span>Anak Keranjang:</span>
+                                <span className={activeSlot.isBasketBound && activeSlot.basketCode ? 'text-[#00897B] text-xl font-black' : 'text-amber-600 text-xs font-bold'}>
+                                  {activeSlot.isBasketBound && activeSlot.basketCode ? activeSlot.basketCode : '(Belum Diisi)'}
+                                </span>
+                              </h3>
+
+                              {/* Form Input / Edit Anak Keranjang untuk Slot ini */}
+                              <form
+                                onSubmit={(e) => {
+                                  e.preventDefault();
+                                  handleBindSlotBasket(activeSlot.slotNumber);
+                                }}
+                                className="flex items-center gap-1.5 mt-2"
+                              >
+                                <input
+                                  type="text"
+                                  placeholder={`Kode anak keranjang Slot #${activeSlot.slotNumber}...`}
+                                  value={sortTargetSlotForBind === activeSlot.slotNumber ? sortBasketInputManual : ''}
+                                  onFocus={() => setSortTargetSlotForBind(activeSlot.slotNumber)}
+                                  onChange={(e) => {
+                                    setSortTargetSlotForBind(activeSlot.slotNumber);
+                                    setSortBasketInputManual(e.target.value.toUpperCase());
+                                  }}
+                                  className="px-2 py-1 text-xs bg-slate-50 border border-slate-300 rounded text-slate-900 font-mono font-bold flex-1 min-w-0 focus:ring-1 focus:ring-sky-500 placeholder:text-slate-400"
+                                />
+                                <button
+                                  type="submit"
+                                  className="px-2.5 py-1 bg-indigo-600 hover:bg-indigo-700 text-white rounded text-xs font-bold cursor-pointer shrink-0 transition-colors"
+                                >
+                                  {activeSlot.isBasketBound ? 'Ubah' : 'Ikat'}
+                                </button>
+                              </form>
+                            </div>
+
+                            <div className="text-right shrink-0">
+                              <span className="text-[10px] text-slate-500 block uppercase font-bold">Total</span>
+                              <div className="font-mono text-base font-black text-slate-900 tabular-nums">
+                                <span className={activeSlot.isComplete ? 'text-emerald-600' : 'text-amber-600'}>
+                                  {currentDecomp}
+                                </span>
+                                <span className="text-slate-400 text-xs"> / {totalItems} pcs</span>
+                              </div>
+                            </div>
                           </div>
 
-                          <div className="space-y-2 max-h-[360px] overflow-y-auto pr-1 scrollbar-thin">
-                            {activeSlot.order.items.map((it, idx) => {
-                              const scanned = activeSlot.itemsDecomposed[it.id] || 0;
-                              const isItemDone = scanned >= it.qty;
-                              const barcode = getBarcodeForSku(it.skuId);
+                          {/* Info Pelanggan & Order */}
+                          <div className="bg-slate-50 border border-slate-200 rounded p-2 text-xs space-y-1">
+                            <div className="flex items-center justify-between gap-2">
+                              <span className="text-slate-500 text-[11px]">Pelanggan:</span>
+                              <span className="font-bold text-slate-900 truncate max-w-[180px]">{activeSlot.order.customerName}</span>
+                            </div>
+                            <div className="flex items-center justify-between gap-2">
+                              <span className="text-slate-500 text-[11px]">No. Order / Ref:</span>
+                              <span className="font-mono text-sky-700 font-semibold text-[11px] truncate max-w-[180px]">{activeSlot.order.referenceNumber}</span>
+                            </div>
+                            {activeSlot.order.courier && (
+                              <div className="flex items-center justify-between gap-2">
+                                <span className="text-slate-500 text-[11px]">Ekspedisi:</span>
+                                <span className="font-semibold text-slate-700 text-[11px]">{activeSlot.order.courier}</span>
+                              </div>
+                            )}
+                          </div>
 
-                              return (
-                                <div
-                                  key={it.id || idx}
-                                  className={`p-2.5 rounded-xl border transition-all ${
-                                    isItemDone
-                                      ? 'bg-emerald-950/40 border-emerald-500/40 text-slate-200'
-                                      : 'bg-slate-950/80 border-slate-800 text-slate-300 hover:border-slate-700'
-                                  }`}
-                                >
-                                  <div className="flex items-start justify-between gap-2">
-                                    <div className="min-w-0 flex-1">
-                                      <div className="flex items-center gap-1.5 flex-wrap">
-                                        <span className="px-1.5 py-0.5 bg-sky-500/20 text-sky-300 border border-sky-500/30 rounded font-mono font-bold text-xs">
-                                          {it.skuId}
-                                        </span>
-                                        {barcode && (
-                                          <span className="text-[10px] text-slate-400 font-mono">
-                                            ({barcode})
+                          {/* Daftar Deskripsi Isi Produk per Basket */}
+                          <div className="space-y-1.5">
+                            <div className="flex items-center justify-between text-xs font-bold text-slate-700">
+                              <span className="flex items-center gap-1.5">
+                                <Package className="w-3.5 h-3.5 text-sky-600" />
+                                <span>Isi Produk ({new Set(activeSlot.order.items.map(i=>i.skuId)).size} SKU &middot; {activeSlot.order.items.length} baris)</span>
+                              </span>
+                            </div>
+
+                            <div className="space-y-1.5 max-h-[300px] overflow-y-auto pr-0.5 scrollbar-thin">
+                              {activeSlot.order.items.map((it, idx) => {
+                                const scanned = activeSlot.itemsDecomposed[it.id] || 0;
+                                const isItemDone = scanned >= it.qty;
+                                const barcode = getBarcodeForSku(it.skuId);
+
+                                return (
+                                  <div
+                                    key={it.id || idx}
+                                    className={`p-2 rounded border text-xs transition-all ${
+                                      isItemDone
+                                        ? 'bg-emerald-50 border-emerald-300 text-slate-800'
+                                        : 'bg-white border-slate-200 text-slate-700'
+                                    }`}
+                                  >
+                                    <div className="flex items-start justify-between gap-2">
+                                      <div className="min-w-0 flex-1">
+                                        <div className="flex items-center gap-1 flex-wrap">
+                                          <span className="inline-flex items-center gap-1 px-1.5 py-0.5 bg-sky-50 text-sky-800 border border-sky-200 rounded font-mono font-bold text-[11px]">
+                                            <span>{it.skuId}</span>
+                                            <button
+                                              type="button"
+                                              onClick={(e) => handleCopyText(it.skuId, `sort-${activeSlot.slotNumber}-${it.id || idx}`, e)}
+                                              title="Salin SKU ID"
+                                              aria-label={`Salin SKU ${it.skuId}`}
+                                              className="p-0.5 hover:bg-sky-200/60 text-sky-700 rounded transition-colors cursor-pointer inline-flex items-center justify-center"
+                                            >
+                                              {copiedKey === `sort-${activeSlot.slotNumber}-${it.id || idx}` ? (
+                                                <Check className="w-3 h-3 text-emerald-600" />
+                                              ) : (
+                                                <Copy className="w-3 h-3 text-sky-600" />
+                                              )}
+                                            </button>
                                           </span>
-                                        )}
-                                      </div>
-                                      <p className="text-xs font-semibold text-white mt-1 leading-snug break-words">
-                                        {it.skuName}
-                                      </p>
-                                      {it.location && (
-                                        <div className="text-[10px] text-amber-400 mt-1 font-mono">
-                                          Rak: {it.location} {it.expiredDate ? `• Exp: ${it.expiredDate}` : ''}
+                                          {barcode && (
+                                            <span className="text-[10px] text-slate-500 font-mono">
+                                              ({barcode})
+                                            </span>
+                                          )}
                                         </div>
-                                      )}
-                                    </div>
-
-                                    {/* Kolom Kuantitas Per SKU */}
-                                    <div className="text-right shrink-0">
-                                      <div className={`font-mono text-sm font-black px-2 py-1 rounded-md ${
-                                        isItemDone
-                                          ? 'bg-emerald-500/20 text-emerald-400 border border-emerald-500/30'
-                                          : 'bg-amber-500/20 text-amber-300 border border-amber-500/30'
-                                      }`}>
-                                        {scanned} / {it.qty} <span className="text-[9px] font-normal">pcs</span>
-                                      </div>
-                                      <div className="text-[9px] mt-1 font-bold">
-                                        {isItemDone ? (
-                                          <span className="text-emerald-400">✓ Lengkap</span>
-                                        ) : (
-                                          <span className="text-amber-400">Kurang {it.qty - scanned}</span>
+                                        <p className="text-[11px] font-semibold text-slate-900 mt-1 leading-snug line-clamp-2 hover:line-clamp-none break-words" title={it.skuName}>
+                                          {it.skuName}
+                                        </p>
+                                        {it.location && (
+                                          <div className="text-[10px] text-amber-700 mt-0.5 font-mono">
+                                            Rak: {it.location} {it.expiredDate ? `• Exp: ${it.expiredDate}` : ''}
+                                          </div>
                                         )}
+                                      </div>
+
+                                      <div className="text-right shrink-0">
+                                        <div className={`font-mono text-xs font-black px-1.5 py-0.5 rounded border ${
+                                          isItemDone
+                                            ? 'bg-emerald-100 text-emerald-800 border-emerald-300'
+                                            : 'bg-amber-50 text-amber-800 border-amber-300'
+                                        }`}>
+                                          {scanned}/{it.qty} <span className="text-[9px] font-normal">pcs</span>
+                                        </div>
+                                        <div className="text-[10px] mt-0.5 font-bold">
+                                          {isItemDone ? (
+                                            <span className="text-emerald-700">✓ Lengkap</span>
+                                          ) : (
+                                            <span className="text-amber-700">Kurang {it.qty - scanned}</span>
+                                          )}
+                                        </div>
                                       </div>
                                     </div>
                                   </div>
-                                </div>
-                              );
-                            })}
+                                );
+                              })}
+                            </div>
+                          </div>
+
+                          {/* Guarded Disabled Manual Validation Info */}
+                          <div className="pt-2 border-t border-slate-200">
+                            <button
+                              type="button"
+                              disabled
+                              title="Validasi manual dinonaktifkan."
+                              className="w-full py-1.5 text-[11px] font-bold rounded bg-slate-100 text-slate-400 border border-slate-200 flex items-center justify-center gap-1.5 cursor-not-allowed"
+                            >
+                              <Check className="w-3.5 h-3.5" />
+                              <span>{activeSlot.isComplete ? 'Keranjang Ini Sudah Lengkap' : 'Wajib Scan Barcode (Manual Dinonaktifkan)'}</span>
+                            </button>
                           </div>
                         </div>
-
-                        {/* Quick Manual Put 1x Button (Memudahkan jika tanpa scanner barcode) */}
-                        <div className="pt-2 border-t border-slate-800">
-                          <button
-                            type="button"
-                            disabled
-                            title="Validasi manual dinonaktifkan."
-                            className={`w-full py-2 text-xs font-bold rounded-lg flex items-center justify-center gap-1.5 transition-all cursor-pointer ${
-                              activeSlot.isComplete
-                                ? 'bg-slate-800 text-slate-500 cursor-not-allowed'
-                                : 'bg-emerald-600 hover:bg-emerald-500 text-white shadow-sm active:scale-98'
-                            }`}
-                          >
-                            <Check className="w-3.5 h-3.5" />
-                            <span>{activeSlot.isComplete ? 'Keranjang Ini Sudah Lengkap' : '+ Masukkan 1 Pcs ke Keranjang Ini'}</span>
-                          </button>
-                        </div>
-
-                      </div>
-                    );
-                  })()}
+                      );
+                    })()}
+                  </div>
                 </div>
-
               </div>
             )}
           </div>
         </div>
-      )}
+        );
+      })()}
 
       {/* ========================================================================= */}
       {/* SCREEN 3: M DELIVERY UI (PACKER STATION, WEIGHING & AUTO-PRINT)           */}
@@ -2839,17 +4193,38 @@ export default function MabangWmsOutbound({
             </form>
 
             {/* Weight Input (g) */}
-            <div className="flex items-center text-xs border border-slate-300 rounded-md overflow-hidden bg-white">
-              <span className="px-2.5 py-1.5 bg-slate-100 text-slate-600 border-r border-slate-300">Berat paket</span>
+            <form onSubmit={handleWeightSubmit} className="flex items-center text-xs border border-slate-300 rounded-md overflow-hidden bg-white focus-within:ring-2 focus-within:ring-amber-500 focus-within:border-amber-500 shadow-xs">
+              <span className="px-2.5 py-1.5 bg-slate-100 text-slate-700 font-bold border-r border-slate-300 select-none">Berat paket</span>
               <input
+                ref={deliveryWeightInputRef}
                 type="number"
+                min="1"
+                step="any"
                 placeholder="0"
                 value={deliveryWeight}
+                disabled={deliveryBusy || !deliveryReady}
                 onChange={e => setDeliveryWeight(e.target.value)}
-                className="px-2 py-1.5 text-xs outline-none w-20 text-slate-800 text-center font-bold"
+                onKeyDown={e => {
+                  if (e.key === 'Enter') {
+                    e.preventDefault();
+                    // Cegah enter sisa/bocor dari scanner barcode saat baru saja fokus (< 350ms)
+                    if (Date.now() - lastWeightFocusTimeRef.current < 350) {
+                      return;
+                    }
+                    handleWeightSubmit();
+                  }
+                }}
+                className="px-2 py-1.5 text-xs outline-none w-20 text-slate-800 text-center font-bold font-mono focus:bg-amber-50"
               />
-              <span className="px-2.5 py-1.5 bg-sky-500 text-white font-bold">/g</span>
-            </div>
+              <button 
+                type="submit" 
+                title="Simpan berat & cetak resi (Enter)" 
+                disabled={deliveryBusy || !deliveryReady}
+                className="px-2.5 py-1.5 bg-sky-500 hover:bg-sky-600 text-white font-bold select-none cursor-pointer transition-colors"
+              >
+                /g
+              </button>
+            </form>
 
             {/* Scan Product Barcode Inspection */}
             <form onSubmit={handleDeliveryScanProduct} className="wms-scan-field flex items-center text-xs border border-emerald-400 rounded-md overflow-hidden bg-white shadow-sm ring-1 ring-emerald-200">
@@ -2867,6 +4242,25 @@ export default function MabangWmsOutbound({
 
             {/* Action buttons & Auto-Print Toggle */}
             <div className="flex flex-wrap items-center gap-2.5 ml-auto">
+              <button
+                type="button"
+                onClick={handlePrintAgain}
+                disabled={!lastPackedReceipt}
+                className={`px-3 py-1.5 text-xs font-bold rounded-md border flex items-center gap-1.5 shadow-xs transition-all cursor-pointer ${
+                  lastPackedReceipt
+                    ? 'bg-amber-50 border-amber-300 text-amber-800 hover:bg-amber-100 active:scale-95'
+                    : 'bg-slate-100 border-slate-200 text-slate-400 cursor-not-allowed opacity-60'
+                }`}
+                title={lastPackedReceipt ? `Cetak ulang resi pesanan terakhir (${lastPackedReceipt.orderId || lastPackedReceipt.referenceNumber})` : 'Belum ada order yang diselesaikan'}
+              >
+                <Printer className="w-3.5 h-3.5 text-amber-600" />
+                <span>Print Again</span>
+                {lastPackedReceipt && (
+                  <span className="max-w-[80px] truncate text-[10px] font-mono font-normal opacity-75 hidden md:inline">
+                    ({lastPackedReceipt.orderId || lastPackedReceipt.referenceNumber})
+                  </span>
+                )}
+              </button>
               <label className="flex items-center gap-1.5 text-xs font-bold text-emerald-800 bg-emerald-50 hover:bg-emerald-100 border border-emerald-300 px-2.5 py-1.5 rounded-md cursor-pointer select-none transition-colors">
                 <input
                   type="checkbox"
@@ -2884,11 +4278,22 @@ export default function MabangWmsOutbound({
                   Pulihkan sesi packing
                 </button>
               )}
+              {deliveryActiveOrder && (
+                <button
+                  type="button"
+                  onClick={handleCancelDelivery}
+                  className="px-3 py-1.5 text-xs font-bold rounded-md border border-slate-300 bg-slate-100 hover:bg-slate-200 text-slate-700 transition-colors cursor-pointer flex items-center gap-1.5 shadow-xs"
+                  title="Batalkan atau ganti keranjang yang sedang dibuka"
+                >
+                  <X className="w-3.5 h-3.5" />
+                  <span>Ganti Keranjang</span>
+                </button>
+              )}
               <button
                 onClick={() => handleCompleteDelivery()}
-                disabled={deliveryBusy || !deliveryReady || !deliveryActiveOrder}
+                disabled={deliveryBusy || !deliveryReady || !deliveryActiveOrder || !deliveryActiveOrder.isSorted}
                 className={`px-4 py-1.5 text-xs font-bold rounded-md flex items-center gap-1.5 shadow-sm transition-all cursor-pointer ${
-                  deliveryActiveOrder
+                  deliveryActiveOrder && deliveryActiveOrder.isSorted
                     ? 'bg-emerald-600 hover:bg-emerald-700 text-white active:scale-95'
                     : 'bg-slate-200 text-slate-400 cursor-not-allowed'
                 }`}
@@ -2901,40 +4306,46 @@ export default function MabangWmsOutbound({
             {/* Notification alert (DIPERBESAR JIKA ERROR KARENA TANPA SPEAKER) */}
             {deliveryNotification && (
               deliveryNotification.type === 'error' ? (
-                <div className="w-full bg-gradient-to-r from-rose-600 via-red-600 to-rose-700 text-white border-4 border-rose-950 rounded-xl p-3.5 sm:p-4 shadow-2xl animate-bounce flex items-center justify-between gap-3">
+                <div
+                  role="alert"
+                  className="wms-scan-error-alert w-full bg-rose-600 bg-gradient-to-r from-rose-600 via-red-600 to-rose-700 text-white border-4 border-rose-950 rounded-xl p-3.5 sm:p-4 shadow-2xl animate-bounce flex items-center justify-between gap-3"
+                >
                   <div className="flex items-center gap-3">
-                    <div className="w-10 h-10 rounded-full bg-white text-rose-600 flex items-center justify-center font-black text-xl shrink-0 shadow-lg ring-4 ring-rose-300">
+                    <div className="wms-scan-error-badge w-10 h-10 rounded-full bg-white text-rose-600 flex items-center justify-center font-black text-xl shrink-0 shadow-lg ring-4 ring-rose-300">
                       ✕
                     </div>
                     <div>
-                      <div className="text-[11px] font-black uppercase tracking-wider text-rose-100 flex items-center gap-1.5">
-                        <span className="w-2 h-2 rounded-full bg-white animate-ping"></span>
+                      <div className="wms-scan-error-title text-[11px] font-black uppercase tracking-wider text-rose-100 flex items-center gap-1.5">
+                        <span className="wms-scan-error-dot w-2 h-2 rounded-full bg-white animate-ping"></span>
                         PERINGATAN SALAH SCAN PACKING (CEK VISUAL):
                       </div>
-                      <div className="text-sm sm:text-base md:text-lg font-black text-white leading-tight drop-shadow-sm mt-0.5">
+                      <div className="wms-scan-error-message text-sm sm:text-base md:text-lg font-black text-white leading-tight drop-shadow-sm mt-0.5">
                         {deliveryNotification.message}
                       </div>
                     </div>
                   </div>
-                  <button 
-                    onClick={() => setDeliveryNotification(null)} 
-                    className="px-3 py-1.5 bg-black/40 hover:bg-black/60 text-white font-bold rounded-lg text-xs cursor-pointer shrink-0 transition-colors border border-white/20"
+                  <button
+                    type="button"
+                    onClick={() => setDeliveryNotification(null)}
+                    className="wms-scan-error-close px-3 py-1.5 bg-black/40 hover:bg-black/60 text-white font-bold rounded-lg text-xs cursor-pointer shrink-0 transition-colors border border-white/20"
                     title="Tutup Peringatan"
                   >
                     TUTUP (✕)
                   </button>
                 </div>
               ) : (
-                <div className={`w-full text-xs sm:text-sm font-bold px-3.5 py-2.5 rounded-lg flex items-center justify-between shadow-sm ${
-                  deliveryNotification.type === 'success' 
-                    ? 'bg-emerald-500 text-white border-2 border-emerald-600' 
-                    : 'bg-blue-600 text-white border-2 border-blue-700'
-                }`}>
+                <div
+                  className={`wms-scan-status-banner w-full text-xs sm:text-sm font-bold px-3.5 py-2.5 rounded-lg flex items-center justify-between shadow-sm ${
+                    deliveryNotification.type === 'success'
+                      ? 'is-success bg-emerald-500 text-white border-2 border-emerald-600'
+                      : 'is-info bg-blue-600 text-white border-2 border-blue-700'
+                  }`}
+                >
                   <div className="flex items-center gap-2">
                     <span className="text-base">{deliveryNotification.type === 'success' ? '✓' : 'ℹ'}</span>
                     <span>{deliveryNotification.message}</span>
                   </div>
-                  <button onClick={() => setDeliveryNotification(null)} className="text-white hover:text-slate-200 cursor-pointer p-1">
+                  <button type="button" onClick={() => setDeliveryNotification(null)} className="text-white hover:text-slate-200 cursor-pointer p-1">
                     <X className="w-4 h-4" />
                   </button>
                 </div>
@@ -2947,11 +4358,31 @@ export default function MabangWmsOutbound({
             <div className="flex flex-wrap items-center gap-4">
               <span>Baris barang: <b className="text-sky-600">{deliveryActiveOrder ? deliveryActiveOrder.items.length : 0}</b> baris;</span>
               <span>Jumlah total: <b className="text-sky-600">{deliveryActiveOrder ? deliveryActiveOrder.totalQty : 0}</b> pcs;</span>
-              <span>Keranjang sortir: <b className="text-emerald-600 font-mono">{deliveryActiveOrder?.basketNumber || '--'}</b> ;</span>
-              <span>Picker: <b className="text-slate-900">{deliveryActiveOrder?.pickedBy || '--'}</b> ;</span>
+              <span>Keranjang sortir: <b className={`font-mono ${deliveryActiveOrder?.isSorted ? 'text-emerald-600' : 'text-rose-600 font-black'}`}>{deliveryActiveOrder?.basketNumber || '--'}{deliveryActiveOrder && !deliveryActiveOrder.isSorted ? ' ⚠ (KERANJANG INDUK / BELUM DISORTIR)' : ''}</b> ;</span>
+              <span>Picker: <b className="text-slate-900">{deliveryActiveOrder?.pickingBy || deliveryActiveOrder?.pickedBy || '--'}</b> ;</span>
               <span>Toko: <b className="text-slate-900">{deliveryActiveOrder?.shopName || '--'}</b> ;</span>
             </div>
           </div>
+
+          {/* Warning Banner if keranjang induk is loaded */}
+          {deliveryActiveOrder && !deliveryActiveOrder.isSorted && (
+            <div role="alert" className="wms-inline-danger-banner bg-rose-50 border-2 border-rose-400 p-3.5 rounded-lg flex items-center justify-between gap-3 text-rose-900 animate-pulse">
+              <div className="flex items-center gap-2.5">
+                <AlertTriangle className="w-5 h-5 text-rose-600 shrink-0" />
+                <div className="text-xs sm:text-sm">
+                  <strong>PERINGATAN: Keranjang "{deliveryActiveOrder.basketNumber}" adalah Keranjang Induk Picker!</strong>
+                  <p className="text-xs text-rose-700 mt-0.5">Pesanan ini belum melalui Meja Sortir (Tahap 2). Silakan keluarkan keranjang ini dan bawa ke Meja Sortir terlebih dahulu.</p>
+                </div>
+              </div>
+              <button
+                type="button"
+                onClick={handleCancelDelivery}
+                className="wms-inline-danger-btn px-3 py-1.5 bg-rose-600 hover:bg-rose-700 text-white font-bold rounded-md text-xs cursor-pointer shrink-0 transition-colors"
+              >
+                Keluarkan Keranjang
+              </button>
+            </div>
+          )}
 
           {/* Red Bold Order Note (Exact Mabang Catatan order:) */}
           <div className="bg-rose-50 border border-rose-200 p-3 rounded-lg flex items-start gap-2">
@@ -2998,7 +4429,22 @@ export default function MabangWmsOutbound({
                           </td>
                           <td className="p-3 space-y-0.5">
                             <div className="font-bold text-slate-900 text-sm flex items-center gap-2">
-                              <span>{item.skuId}</span>
+                              <span className="inline-flex items-center gap-1 font-mono">
+                                <span>{item.skuId}</span>
+                                <button
+                                  type="button"
+                                  onClick={(e) => handleCopyText(item.skuId, `pack-${item.id}`, e)}
+                                  title="Salin SKU ID"
+                                  aria-label={`Salin SKU ${item.skuId}`}
+                                  className="p-1 hover:bg-slate-200 text-slate-400 hover:text-slate-700 rounded transition-colors cursor-pointer inline-flex items-center justify-center"
+                                >
+                                  {copiedKey === `pack-${item.id}` ? (
+                                    <Check className="w-3.5 h-3.5 text-emerald-600" />
+                                  ) : (
+                                    <Copy className="w-3.5 h-3.5" />
+                                  )}
+                                </button>
+                              </span>
                               {barcode && (
                                 <span className="px-1.5 py-0.5 bg-slate-100 text-slate-600 rounded text-[10px] font-mono">
                                   {barcode}
@@ -3033,7 +4479,7 @@ export default function MabangWmsOutbound({
                             <button
                               type="button"
                               disabled={isComplete}
-                              onClick={async () => {
+                              onClick={() => {
                                 if (isComplete || !deliveryActiveOrder || deliveryBusyRef.current) return;
                                 const nextCounts = { ...deliveryScannedCounts, [item.id]: (deliveryScannedCounts[item.id] || 0) + 1 };
                                 setDeliveryScannedCounts(nextCounts);
@@ -3041,9 +4487,18 @@ export default function MabangWmsOutbound({
                                 speakVoice(`Validasi ${item.skuId}`);
                                 const allPacked = deliveryActiveOrder.items.every(it => (nextCounts[it.id] || 0) >= it.qty);
                                 if (allPacked) {
-                                  setDeliveryNotification({ type: 'success', message: '✓ Seluruh barang lengkap (100%)! Menyelesaikan packing dan mencetak resi...' });
-                                  speakVoice('Semua barang lengkap. Menyelesaikan packing.');
-                                  await executeCompleteDelivery(deliveryActiveOrder, nextCounts);
+                                  setDeliveryNotification({ 
+                                    type: 'success', 
+                                    message: '✓ Seluruh barang lengkap (100%)! Silakan masukkan berat paket, lalu tekan Enter untuk cetak resi.' 
+                                  });
+                                  speakVoice('Semua barang lengkap. Masukkan berat paket lalu tekan Enter.');
+                                  setTimeout(() => {
+                                    lastWeightFocusTimeRef.current = Date.now();
+                                    deliveryWeightInputRef.current?.focus();
+                                    deliveryWeightInputRef.current?.select();
+                                  }, 150);
+                                } else {
+                                  setDeliveryNotification({ type: 'success', message: `✓ Validasi ${item.skuId}: ${nextCounts[item.id]}/${item.qty} pcs.` });
                                 }
                               }}
                               className={`px-2.5 py-1 rounded text-xs font-bold transition-all cursor-pointer ${
@@ -3125,11 +4580,69 @@ export default function MabangWmsOutbound({
         />
       )}
 
+      {isAdminRole && isMasterBasketMonitorOpen && (
+        <MasterBasketMonitorModal
+          isOpen={isMasterBasketMonitorOpen}
+          onClose={() => setIsMasterBasketMonitorOpen(false)}
+          orderHistory={orderHistory}
+          onUpdateOrderSession={onUpdateOrderSession}
+          onAfterRenameMasterBasket={(refs, newBasketCode) => {
+            const refSet = new Set(refs);
+            setDistActiveBatchOrders(prev => {
+              const hasAny = prev.some(o => refSet.has(o.referenceNumber));
+              const allMoved = hasAny && prev.every(o => refSet.has(o.referenceNumber));
+              if (allMoved) {
+                setDistBoundBasket(newBasketCode);
+              }
+              return prev.map(o =>
+                refSet.has(o.referenceNumber)
+                  ? { ...o, basketNumber: newBasketCode, masterBasketNumber: newBasketCode }
+                  : o
+              );
+            });
+            if (!sortStarted) {
+              setSortSlots(prev => {
+                if (prev.length === 0) return prev;
+                const hasAny = prev.some(slot => refSet.has(slot.order.referenceNumber));
+                if (!hasAny) return prev;
+                const allMoved = prev.every(slot => refSet.has(slot.order.referenceNumber));
+                if (allMoved) {
+                  setSortActiveMasterBasket(newBasketCode);
+                  setSortTaskInput(newBasketCode);
+                  return prev.map(slot => ({
+                    ...slot,
+                    order: {
+                      ...slot.order,
+                      basketNumber: newBasketCode,
+                      masterBasketNumber: newBasketCode,
+                    },
+                  }));
+                }
+                return prev.filter(slot => !refSet.has(slot.order.referenceNumber));
+              });
+            }
+          }}
+          onSelectBasketForSortir={(basketCode) => {
+            setIsMasterBasketMonitorOpen(false);
+            switchScreen('sorting');
+            if (sortSaveBusy.current || sortStarted) {
+              setSortNotification({
+                type: 'error',
+                message: `Selesaikan sesi sortir aktif terlebih dahulu sebelum membuka keranjang "${basketCode}".`,
+              });
+              return;
+            }
+            void handleLoadSortTask(null, basketCode);
+          }}
+        />
+      )}
+
       {receiptOrder && (
         <ShippingReceiptModal
           isOpen={true}
           onClose={() => {
             setReceiptOrder(null);
+            setDeliveryWeight('');
             setTimeout(() => {
               deliveryBasketInputRef.current?.focus();
             }, 100);
@@ -3139,6 +4652,15 @@ export default function MabangWmsOutbound({
           autoPrint={autoPrintReceipt}
         />
       )}
+
+      <OrderIssueModal
+        open={issueModalOpen}
+        references={activeIssueReferences}
+        stage={activeIssueStage}
+        reporterName={currentUser?.fullName || currentUser?.username || 'Operator'}
+        onClose={() => setIssueModalOpen(false)}
+        onSubmit={handleReportOrderIssue}
+      />
     </div>
   );
 }

@@ -23,18 +23,19 @@ import {
   Filter,
   FileText,
   Tag,
-  ShieldAlert
+  ShieldAlert,
+  ShieldCheck
 } from 'lucide-react';
 import { StockItem, CatalogItem, ReturnItem, UserAccount } from '../types';
+import { getActiveBranch } from '../supabase';
 
 interface ReturnManagerProps {
   stock: StockItem[];
   catalog: CatalogItem[];
   returnHistory: ReturnItem[];
   currentUser: UserAccount | null;
-  onAddStockItem: (newItem: Omit<StockItem, 'id' | 'totalQtySku'>) => Promise<boolean> | void;
-  onAddStockItemsBatch?: (newItems: Omit<StockItem, 'id' | 'totalQtySku'>[]) => Promise<boolean> | void;
   onSaveReturnHistory: (newHistory: ReturnItem[]) => void;
+  onProcessQc: (caseId:string,decision:'ACCEPT'|'QUARANTINE'|'REJECT',notes:string) => Promise<boolean>;
 }
 
 export default function ReturnManager({
@@ -42,9 +43,8 @@ export default function ReturnManager({
   catalog,
   returnHistory,
   currentUser,
-  onAddStockItem,
-  onAddStockItemsBatch,
-  onSaveReturnHistory
+  onSaveReturnHistory,
+  onProcessQc
 }: ReturnManagerProps) {
   // Active Tab: 'single' (Manual / Scan), 'import' (Excel Import), 'history' (Daftar & Export)
   const [activeSubTab, setActiveSubTab] = useState<'single' | 'import' | 'history'>('single');
@@ -82,6 +82,7 @@ export default function ReturnManager({
   const [selectedCustomerFilter, setSelectedCustomerFilter] = useState<string>('ALL');
   const [searchQuery, setSearchQuery] = useState('');
   const [dateRangeFilter, setDateRangeFilter] = useState<'ALL' | 'TODAY' | 'WEEK'>('ALL');
+  const [qcBusyCaseId, setQcBusyCaseId] = useState<string | null>(null);
 
   // List of existing customers for dropdown suggestions
   const customerList = useMemo(() => {
@@ -157,35 +158,18 @@ export default function ReturnManager({
     const skuName = selectedSku ? selectedSku.skuName : (stock.find(s => s.skuId.toUpperCase() === skuId)?.skuName || `SKU ${skuId}`);
     const operatorName = currentUser?.fullName || currentUser?.username || 'Operator WMS';
 
-    // Route to KARANTINA if condition is RUSAK or reason indicates defect/damage
-    const isDamaged = itemCondition === 'RUSAK' || 
-      finalReason.toLowerCase().includes('rusak') || 
-      finalReason.toLowerCase().includes('defect') || 
-      finalReason.toLowerCase().includes('cacat') || 
-      finalReason.toLowerCase().includes('kadaluarsa');
+    // Recording a return must not mutate saleable stock. QC posts stock later.
+    const branchId = getActiveBranch() || 'CENTER';
+    const now = new Date();
+    const caseId = `ret_${now.getTime()}_${Math.floor(Math.random() * 1000)}`;
+    const returnNumber = `RET-${branchId}-${now.toISOString().slice(0, 10).replace(/-/g, '')}-${String(now.getTime()).slice(-6)}`;
 
-    const allocatedLocation = isDamaged ? 'KARANTINA' : 'TRANSIT';
-    const allocatedStatus = isDamaged ? 'Damage' : 'AMAN';
-
-    // 1. Add to stock with allocated location
-    onAddStockItem({
-      skuId,
-      skuName,
-      expiredDate: ed,
-      location: allocatedLocation,
-      qty,
-      qtyCtnSize: (selectedSku as any)?.qtyCtnSize || 144,
-      qtyCtn: 0,
-      qtyInnerSize: (selectedSku as any)?.qtyInnerSize || 12,
-      qtyInner: 0,
-      qtyLoose: 0,
-      status: allocatedStatus
-    });
-
-    // 2. Add to Return History
     const newReturnRecord: ReturnItem = {
-      id: `ret_${Date.now()}_${Math.floor(Math.random() * 1000)}`,
-      timestamp: new Date().toISOString(),
+      id: caseId,
+      caseId,
+      returnNumber,
+      branchId,
+      timestamp: now.toISOString(),
       skuId,
       skuName,
       expiredDate: ed,
@@ -193,16 +177,20 @@ export default function ReturnManager({
       customerName: customer,
       batchNumber: batch,
       reason: finalReason,
-      location: allocatedLocation,
+      location: 'RETURN-QC',
       operator: operatorName,
-      status: isDamaged ? 'KARANTINA' : 'TRANSIT'
+      status: 'READY_FOR_QC',
+      claimedCondition: itemCondition,
+      evidenceStatus: 'READY',
+      qtyCtnSize: (selectedSku as any)?.qtyCtnSize || 144,
+      qtyInnerSize: (selectedSku as any)?.qtyInnerSize || 12
     };
 
     onSaveReturnHistory([newReturnRecord, ...returnHistory]);
 
     // Show success feedback
     setSuccessToast(
-      `Berhasil! Retur ${skuId} (${qty} pcs) dialokasikan ke lokasi ${allocatedLocation} (${isDamaged ? 'Isolasi Karantina (Tidak Masuk Stok Jual)' : 'Staging Transit'}).`
+      `${returnNumber} berhasil dicatat dan siap diproses QC.`
     );
 
     // Reset inputs
@@ -340,7 +328,7 @@ export default function ReturnManager({
     if (e.target) e.target.value = '';
   };
 
-  // Submit Mass Import to Stock & Return History
+  // Submit mass import as a return case. Stock is posted only after QC.
   const handleCommitMassImport = async () => {
     const validRows = importPreviewRows.filter(r => r.isValid);
     if (validRows.length === 0) {
@@ -350,9 +338,11 @@ export default function ReturnManager({
 
     const operatorName = currentUser?.fullName || currentUser?.username || 'Operator WMS';
     const newRecords: ReturnItem[] = [];
-    const stockItemsToCreate: Omit<StockItem, 'id' | 'totalQtySku'>[] = [];
     const nowIso = new Date().toISOString();
     const nowMs = Date.now();
+    const branchId = getActiveBranch() || 'CENTER';
+    const caseId = `ret_imp_${nowMs}`;
+    const returnNumber = `RET-${branchId}-${nowIso.slice(0, 10).replace(/-/g, '')}-${String(nowMs).slice(-6)}`;
 
     validRows.forEach((item, index) => {
       const reasonLower = (item.reason || '').toLowerCase();
@@ -361,28 +351,12 @@ export default function ReturnManager({
         reasonLower.includes('defect') ||
         reasonLower.includes('cacat') ||
         reasonLower.includes('kadaluarsa');
-      const allocatedLocation = isDamaged ? 'KARANTINA' : 'TRANSIT';
-      const allocatedStatus = isDamaged ? 'Damage' : 'AMAN';
       const catMatch = catalog.find(c => c.skuId.toUpperCase() === item.skuId.toUpperCase());
-
-      // 1. Collect stock item for atomic batch write
-      stockItemsToCreate.push({
-        skuId: item.skuId,
-        skuName: item.skuName,
-        expiredDate: item.expiredDate,
-        location: allocatedLocation,
-        qty: item.qty,
-        qtyCtnSize: (catMatch as any)?.qtyCtnSize || 144,
-        qtyCtn: 0,
-        qtyInnerSize: (catMatch as any)?.qtyInnerSize || 12,
-        qtyInner: 0,
-        qtyLoose: 0,
-        status: allocatedStatus
-      });
-
-      // 2. Build history record
       newRecords.push({
         id: `ret_imp_${nowMs}_${index}`,
+        caseId,
+        returnNumber,
+        branchId,
         timestamp: nowIso,
         skuId: item.skuId,
         skuName: item.skuName,
@@ -391,31 +365,21 @@ export default function ReturnManager({
         customerName: item.customerName,
         batchNumber: item.batchNumber,
         reason: item.reason,
-        location: allocatedLocation,
+        location: 'RETURN-QC',
         operator: operatorName,
-        status: isDamaged ? 'KARANTINA' : 'TRANSIT'
+        status: 'READY_FOR_QC',
+        claimedCondition: isDamaged ? 'RUSAK' : 'BAGUS',
+        evidenceStatus: 'READY',
+        qtyCtnSize: (catMatch as any)?.qtyCtnSize || 144,
+        qtyInnerSize: (catMatch as any)?.qtyInnerSize || 12
       });
     });
-
-    try {
-      if (onAddStockItemsBatch) {
-        await onAddStockItemsBatch(stockItemsToCreate);
-      } else {
-        for (const stockItem of stockItemsToCreate) {
-          await onAddStockItem(stockItem);
-        }
-      }
-    } catch (err: any) {
-      setErrorToast(err?.message || 'Gagal menyimpan stok retur massal.');
-      return;
-    }
 
     onSaveReturnHistory([...newRecords, ...returnHistory]);
 
     const totalPcs = validRows.reduce((acc, r) => acc + r.qty, 0);
-    const quarantineCount = newRecords.filter(r => r.status === 'KARANTINA').length;
     setSuccessToast(
-      `Sukses! ${validRows.length} baris barang retur (${totalPcs} pcs) dari import Excel telah dimasukkan (${validRows.length - quarantineCount} TRANSIT, ${quarantineCount} KARANTINA).`
+      `${returnNumber} berhasil dicatat: ${validRows.length} baris, ${totalPcs} pcs. Kasus siap diproses QC.`
     );
 
     // Clear state
@@ -514,6 +478,55 @@ export default function ReturnManager({
     const uniqueCustomers = new Set(filteredHistory.map(i => i.customerName)).size;
     return { totalRecords, totalPcs, uniqueSkus, uniqueCustomers };
   }, [filteredHistory]);
+
+  const returnCases = useMemo(() => {
+    const grouped = new Map<string, ReturnItem[]>();
+    returnHistory.forEach(item => {
+      const caseId = item.caseId || item.id;
+      grouped.set(caseId, [...(grouped.get(caseId) || []), item]);
+    });
+
+    return Array.from(grouped.entries())
+      .map(([caseId, items]) => ({
+        caseId,
+        items,
+        first: items[0],
+        totalQty: items.reduce((sum, item) => sum + item.qty, 0),
+        evidenceReady: true,
+        final: items.every(item => ['RESTOCKED', 'KARANTINA', 'QC_REJECTED'].includes(item.status || ''))
+      }))
+      .sort((a, b) => b.first.timestamp.localeCompare(a.first.timestamp));
+  }, [returnHistory]);
+
+  const pendingReturnCases = returnCases.filter(item => !item.final);
+  const visiblePendingReturnCases = pendingReturnCases.filter(item => {
+    const query = searchQuery.trim().toLowerCase();
+    if (!query) return true;
+    return [item.caseId,item.first.returnNumber,item.first.customerName,...item.items.flatMap(row => [row.skuId,row.skuName,row.batchNumber])].some(value => String(value || '').toLowerCase().includes(query));
+  });
+  const caseStats = {
+    readyQc: pendingReturnCases.filter(item => item.evidenceReady).length,
+    overdue: pendingReturnCases.filter(item => Date.now() - new Date(item.first.timestamp).getTime() > 24 * 60 * 60 * 1000).length,
+    completed: returnCases.filter(item => item.final).length
+  };
+
+  const handleQcDecision = async (caseId: string, decision: 'ACCEPT' | 'QUARANTINE' | 'REJECT') => {
+    const returnCase = returnCases.find(item => item.caseId === caseId);
+    const labels = { ACCEPT: 'terima ke stok Transit', QUARANTINE: 'pindahkan ke Karantina', REJECT: 'tolak retur' };
+    const notes = window.prompt(`Catatan QC untuk ${labels[decision]}${decision === 'ACCEPT' ? ' (opsional)' : ''}:`);
+    if (notes === null) return;
+    if (decision !== 'ACCEPT' && !notes.trim()) {
+      setErrorToast('Catatan QC wajib diisi untuk karantina atau penolakan.');
+      return;
+    }
+    if (!window.confirm(`Konfirmasi: ${labels[decision]}? Keputusan ini akan dicatat di audit log.`)) return;
+
+    setQcBusyCaseId(caseId);
+    setErrorToast(null);
+    const success = await onProcessQc(caseId, decision, notes.trim());
+    setQcBusyCaseId(null);
+    if (success) setSuccessToast(`QC selesai: retur berhasil diproses untuk ${labels[decision]}.`);
+  };
 
   // EXPORT MASSAL EXCEL (Multi-sheet or Per Customer)
   const handleExportExcelRetur = () => {
@@ -620,7 +633,7 @@ export default function ReturnManager({
                 </span>
               </div>
               <p className="text-xs text-slate-400 mt-1 max-w-2xl">
-                Penerimaan barang retur dari customer, input manual / scan barcode, import massal via Excel, otomatis dialokasikan ke lokasi <strong className="text-emerald-400">TRANSIT</strong>, serta laporan export massal per customer.
+                Catat barang return dari customer melalui input manual, scan barcode, atau import Excel. Proses QC sebelum stok masuk ke Transit atau Karantina.
               </p>
             </div>
           </div>
@@ -714,7 +727,7 @@ export default function ReturnManager({
                 </p>
               </div>
               <span className="bg-slate-800 text-slate-300 text-xs px-2.5 py-1 rounded-lg border border-slate-700 font-mono font-bold">
-                Lokasi: TRANSIT
+                Area pemeriksaan: RETURN-QC
               </span>
             </div>
 
@@ -839,10 +852,10 @@ export default function ReturnManager({
                     }`}
                   >
                     <option value="RUSAK" className="bg-slate-950 text-rose-400">
-                      🚨 RUSAK / CACAT (Masuk Lokasi KARANTINA)
+                      🚨 RUSAK / CACAT (Klaim awal, diverifikasi QC)
                     </option>
                     <option value="BAGUS" className="bg-slate-950 text-emerald-400">
-                      ✅ BAGUS / UTUH (Masuk Lokasi TRANSIT)
+                      ✅ BAGUS / UTUH (Klaim awal, diverifikasi QC)
                     </option>
                   </select>
                 </div>
@@ -882,7 +895,7 @@ export default function ReturnManager({
                 className="w-full py-3.5 bg-emerald-500 hover:bg-emerald-400 text-slate-950 font-black text-sm rounded-xl transition-all cursor-pointer flex items-center justify-center gap-2 shadow-lg shadow-emerald-500/20 active:scale-[0.99]"
               >
                 <CheckCircle2 className="w-5 h-5" />
-                <span>Proses Retur (Masuk Ke Lokasi TRANSIT)</span>
+                <span>Catat Kasus Return</span>
               </button>
             </form>
           </div>
@@ -925,9 +938,9 @@ export default function ReturnManager({
                     3
                   </div>
                   <div>
-                    <p className="text-xs font-bold text-white">Otomatis Dialokasikan ke "TRANSIT"</p>
+                    <p className="text-xs font-bold text-white">Stok Aman Sampai QC Selesai</p>
                     <p className="text-[11px] text-slate-400 mt-0.5">
-                      Stok retur langsung masuk area staging <span className="text-amber-400 font-bold">TRANSIT</span> untuk di-inspeksi tim QC.
+                      Pencatatan return tidak menambah stok jual sebelum keputusan QC diselesaikan.
                     </p>
                   </div>
                 </div>
@@ -1295,6 +1308,52 @@ export default function ReturnManager({
             )}
           </div>
 
+          {/* SLA RETURN */}
+          <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+            <div className="bg-slate-900/90 border border-emerald-500/20 rounded-2xl p-4"><p className="text-[10px] uppercase font-bold text-slate-400">Siap QC</p><p className="text-2xl font-black text-emerald-300 mt-1">{caseStats.readyQc}</p></div>
+            <div className="bg-slate-900/90 border border-rose-500/20 rounded-2xl p-4"><p className="text-[10px] uppercase font-bold text-slate-400">Lewat SLA 24 jam</p><p className="text-2xl font-black text-rose-300 mt-1">{caseStats.overdue}</p></div>
+            <div className="bg-slate-900/90 border border-sky-500/20 rounded-2xl p-4"><p className="text-[10px] uppercase font-bold text-slate-400">Kasus selesai</p><p className="text-2xl font-black text-sky-300 mt-1">{caseStats.completed}</p></div>
+          </div>
+
+          {/* ANTREAN QC RETUR */}
+          <div className="bg-slate-900/90 border border-slate-800 rounded-2xl shadow-xl overflow-hidden">
+            <div className="p-4 border-b border-slate-800 flex flex-col sm:flex-row sm:items-center justify-between gap-2">
+              <div>
+                <h3 className="text-sm font-black text-white flex items-center gap-2">
+                  <ShieldCheck className="w-4 h-4 text-emerald-400" />
+                  Antrean QC Return ({visiblePendingReturnCases.length})
+                </h3>
+                <p className="text-[11px] text-slate-400 mt-1">Pilih keputusan QC untuk memposting stok ke Transit, Karantina, atau Tolak retur.</p>
+              </div>
+              <span className="text-[10px] font-bold text-amber-300 bg-amber-500/10 border border-amber-500/20 px-3 py-1.5 rounded-full">Posting stok terlindungi dari duplikasi</span>
+            </div>
+            {visiblePendingReturnCases.length === 0 ? (
+              <div className="p-8 text-center text-sm text-slate-400">Tidak ada return yang menunggu QC sesuai pencarian.</div>
+            ) : (
+              <div className="divide-y divide-slate-800/70">
+                {visiblePendingReturnCases.map(returnCase => (
+                  <div key={returnCase.caseId} className="p-4 flex flex-col xl:flex-row xl:items-center gap-4">
+                    <div className="min-w-0 flex-1">
+                      <div className="flex flex-wrap items-center gap-2">
+                        <span className="text-sm font-black text-white">{returnCase.first.returnNumber || returnCase.caseId}</span>
+                        <span className="text-[10px] font-black px-2 py-1 rounded-full border text-emerald-300 bg-emerald-500/10 border-emerald-500/20">
+                          SIAP QC
+                        </span>
+                      </div>
+                      <p className="text-xs text-slate-300 mt-1 truncate">{returnCase.first.customerName} · {returnCase.items.length} SKU · {returnCase.totalQty.toLocaleString('id-ID')} pcs</p>
+                      <p className="text-[10px] text-slate-500 mt-1 font-mono">{returnCase.caseId}</p>
+                    </div>
+                    <div className="flex flex-wrap items-center gap-2">
+                      <button disabled={qcBusyCaseId === returnCase.caseId} onClick={() => handleQcDecision(returnCase.caseId, 'ACCEPT')} className="px-3 py-2 rounded-xl bg-emerald-500 text-slate-950 disabled:opacity-40 disabled:cursor-not-allowed text-xs font-black">Terima ke Transit</button>
+                      <button disabled={qcBusyCaseId === returnCase.caseId} onClick={() => handleQcDecision(returnCase.caseId, 'QUARANTINE')} className="px-3 py-2 rounded-xl bg-amber-500 text-slate-950 disabled:opacity-40 disabled:cursor-not-allowed text-xs font-black">Karantina</button>
+                      <button disabled={qcBusyCaseId === returnCase.caseId} onClick={() => handleQcDecision(returnCase.caseId, 'REJECT')} className="px-3 py-2 rounded-xl border border-rose-500/40 text-rose-300 hover:bg-rose-500/10 disabled:opacity-40 disabled:cursor-not-allowed text-xs font-black">Tolak</button>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+
           {/* TABLE RIWAYAT RETUR */}
           <div className="bg-slate-900/90 border border-slate-800 rounded-2xl shadow-xl overflow-hidden">
             <div className="p-4 border-b border-slate-800 flex items-center justify-between">
@@ -1303,7 +1362,7 @@ export default function ReturnManager({
                 Daftar Transaksi Retur Masuk ({filteredHistory.length})
               </h3>
               <span className="text-xs text-slate-400 font-mono">
-                Lokasi Default: <strong className="text-emerald-400">TRANSIT</strong>
+                Area Pemeriksaan: <strong className="text-emerald-400">RETURN-QC</strong>
               </span>
             </div>
 

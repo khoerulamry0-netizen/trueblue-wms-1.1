@@ -1,10 +1,11 @@
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { execSync } from 'node:child_process';
 
 const srcDir = process.cwd();
-const scratchDir = 'C:\\Users\\khoer\\.gemini\\antigravity\\brain\\f90326e9-3a58-4add-9ba7-611b7b3a5242\\scratch\\clean-staging';
-const destZipArtifact = 'C:\\Users\\khoer\\.gemini\\antigravity\\brain\\f90326e9-3a58-4add-9ba7-611b7b3a5242\\trueblue-wms-clean-template.zip';
+const scratchDir = path.join(os.tmpdir(), 'trueblue-wms-clean-staging');
+const destZipArtifact = path.join(os.tmpdir(), 'trueblue-wms-clean-template.zip');
 const destZipPublic = path.join(srcDir, 'public', 'trueblue-wms-clean-template.zip');
 
 const excludeList = new Set([
@@ -32,6 +33,8 @@ function copyRecursive(src, dest) {
       copyRecursive(path.join(src, item), path.join(dest, item));
     }
   } else {
+    const base = path.basename(src);
+    if (base === '.env' || (base.startsWith('.env.') && base !== '.env.example')) return;
     const ext = path.extname(src).toLowerCase();
     if (ext === '.zip') return;
     fs.copyFileSync(src, dest);

@@ -46,12 +46,15 @@ export default function BackupRecovery({ onClose }: { onClose: () => void }) {
   const [listBusy, setListBusy] = useState(false);
   const loadSequence = useRef(0);
 
-  // Google Cloud & Google Drive state
+  // Google Cloud & Google Drive state (token kept in memory only for shared-PC safety)
   const [googleToken, setGoogleToken] = useState<string>(() => {
-    return (window as any).__googleAccessToken || localStorage.getItem('blues_google_access_token') || '';
+    try {
+      localStorage.removeItem('blues_google_access_token');
+    } catch {}
+    return (window as any).__googleAccessToken || '';
   });
   const [googleEmail, setGoogleEmail] = useState<string>(() => {
-    return localStorage.getItem('blues_google_user_email') || '';
+    return (window as any).__googleUserEmail || '';
   });
   const [showGoogleTokenInput, setShowGoogleTokenInput] = useState(false);
   const [manualTokenVal, setManualTokenVal] = useState('');
@@ -112,10 +115,9 @@ export default function BackupRecovery({ onClose }: { onClose: () => void }) {
       const uData = await res.json();
       setGoogleToken(cleanToken);
       (window as any).__googleAccessToken = cleanToken;
-      localStorage.setItem('blues_google_access_token', cleanToken);
       if (uData.email) {
         setGoogleEmail(uData.email);
-        localStorage.setItem('blues_google_user_email', uData.email);
+        (window as any).__googleUserEmail = uData.email;
       }
       setShowGoogleTokenInput(false);
       setNotice(`✓ Berhasil terhubung ke akun Google Cloud: ${uData.email || 'Terverifikasi'}`);
@@ -130,8 +132,11 @@ export default function BackupRecovery({ onClose }: { onClose: () => void }) {
     setGoogleToken('');
     setGoogleEmail('');
     (window as any).__googleAccessToken = '';
-    localStorage.removeItem('blues_google_access_token');
-    localStorage.removeItem('blues_google_user_email');
+    (window as any).__googleUserEmail = '';
+    try {
+      localStorage.removeItem('blues_google_access_token');
+      localStorage.removeItem('blues_google_user_email');
+    } catch {}
     setNotice('Koneksi Google Cloud / Google Drive diputuskan.');
   };
 

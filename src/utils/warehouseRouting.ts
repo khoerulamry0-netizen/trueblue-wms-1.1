@@ -25,20 +25,32 @@ export const DEFAULT_CENTRAL_WAREHOUSE: Warehouse = {
   updatedAt: '2026-01-01T00:00:00.000Z'
 };
 
+export function isCentralWarehouse(w?: Warehouse | { id?: string; code?: string; name?: string; isCentral?: boolean; isMain?: boolean }): boolean {
+  if (!w) return false;
+  if (w.isCentral === true || w.isMain === true) return true;
+  const idUpper = (w.id || '').toUpperCase();
+  const codeUpper = (w.code || '').toUpperCase();
+  if (idUpper === 'WH-CENTRAL' || idUpper === 'CENTRAL' || codeUpper === 'WH-CENTRAL' || codeUpper === 'CENTRAL') return true;
+  const nameLower = (w.name || '').toLowerCase();
+  const codeLower = (w.code || '').toLowerCase();
+  return nameLower.includes('pusat') || nameLower.includes('central') || codeLower.includes('central') || codeLower.includes('pusat');
+}
+
 export function ensureCentralWarehouse(warehouses: Warehouse[] = []): Warehouse[] {
   const list = Array.isArray(warehouses) ? [...warehouses] : [];
-  const centralIndex = list.findIndex(w => w.isCentral || (w.id || '').toUpperCase() === 'WH-CENTRAL');
+  const centralIndex = list.findIndex(isCentralWarehouse);
   if (centralIndex === -1) {
     return [DEFAULT_CENTRAL_WAREHOUSE, ...list];
   }
-  const central = list[centralIndex];
-  list[centralIndex] = {
-    ...central,
-    id: 'WH-CENTRAL',
-    code: central.code || 'WH-CENTRAL',
-    isCentral: true
+  const centralItem = list[centralIndex];
+  const central: Warehouse = {
+    ...centralItem,
+    isCentral: true,
+    isMain: true
   };
-  return list;
+  const rest = list.filter((_, idx) => idx !== centralIndex);
+  // Pastikan Gudang Central / Pusat selalu di urutan paling awal (index 0)
+  return [central, ...rest];
 }
 
 export interface RoutePresetOption {

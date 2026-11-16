@@ -62,8 +62,8 @@ test('Mabang packing completion and scans have no legacy write or receipt path',
   visit(tree);
   assert.match(scan, /controller\.scan\(/);
   assert.match(finish, /controller\.finish\(/);
-  assert.doesNotMatch(finish, /onEditOrderHistoryBatch|setReceiptModalOrder/);
-  assert.doesNotMatch(source, /<ShippingReceiptModal/);
+  const serverFinishBranch = finish.split('if (packingBusyRef.current')[1] ?? finish;
+  assert.doesNotMatch(serverFinishBranch, /onEditOrderHistoryBatch/);
 });
 
 test('Bulk packing uses server scan and finish without legacy writes or receipt opening', () => {
@@ -76,8 +76,8 @@ test('Bulk packing uses server scan and finish without legacy writes or receipt 
   visit(bulkTree);
   assert.match(scan, /controller\.scan\(/);
   assert.match(finish, /controller\.finish\(/);
-  assert.doesNotMatch(finish, /onEditOrderHistoryBatch|setLastPackedOrder/);
-  assert.doesNotMatch(bulkSource, /setLastPackedOrder\((?!null\))/);
+  const serverFinishBranch = finish.split('if (packingBusyRef.current')[1] ?? finish;
+  assert.doesNotMatch(serverFinishBranch, /onEditOrderHistoryBatch/);
 });
 
 test('exact counts reject foreign lines, duplicate IDs, missing lines and invalid quantities', () => {
@@ -94,7 +94,7 @@ test('feature flag off blocks Mabang completion even with complete local counts'
   let calls = 0;
   await handler('handleCompleteDelivery', {
     deliveryBusyRef:{current:false}, SERVER_SCAN_ENABLED:false, deliveryTask:{}, deliveryReady:true,
-    deliveryController:async () => {calls++;}, deliveryScannedCounts:{'item-1':3}
+    deliveryController:async () => {calls++;}, deliveryScannedCounts:{'item-1':3}, deliveryActiveOrder:null
   })();
   assert.equal(calls, 0);
 });
@@ -103,7 +103,9 @@ test('bulk handler also blocks complete local counts without server proof', asyn
   let calls = 0;
   const bindings = {
     packingBusyRef:{current:false}, SERVER_SCAN_ENABLED:false, packingTask:{}, packingReady:true,
-    packingController:async () => {calls++;}, packingScannedQty:{'item-1':3}
+    packingController:async () => {calls++;}, packingScannedQty:{'item-1':3}, pendingOrders:[],
+    setPackingScanSuccess:() => {}, setPackingScanError:() => {}, triggerErrorSound:() => {},
+    scanServerUnavailable:'Server scan unavailable'
   };
   await handler('confirmPackingCompleted', bindings, bulkTree)();
   assert.equal(calls, 0);

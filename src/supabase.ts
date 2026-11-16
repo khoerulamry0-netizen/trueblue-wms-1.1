@@ -1,7 +1,8 @@
 import {readAllRows} from './utils/readAllRows';
 import {applyRevisionSnapshot, createLatestReadCoordinator, publishSnapshotWithRevisions, runReadRequest, StaleReadError, type ReadRequest} from './utils/readRequestSafety';
 import { displayAccountId } from './accountId';
-import {isStockItem} from './types';
+import {isStockItem, type BranchOperationType, type CatalogItem} from './types';
+import { normalizeBranchOperationType } from './utils/orderType';
 import { createClient, type SupabaseClient } from '@supabase/supabase-js';
 import { createServerScanRpc } from './utils/serverScanRpc';
 import { isServerScanEnabled } from './utils/serverScanFeature';
@@ -11,16 +12,30 @@ const supabaseAnonKey = import.meta.env.VITE_SUPABASE_ANON_KEY?.trim();
 
 if (import.meta.env.DEV) {
   if (!supabaseUrl || !supabaseAnonKey) {
-    throw new Error('Supabase belum dikonfigurasi. Isi VITE_SUPABASE_URL dan VITE_SUPABASE_ANON_KEY.');
+    throw new Error('Development Supabase belum dikonfigurasi. Isi VITE_SUPABASE_URL dan VITE_SUPABASE_ANON_KEY dari Supabase lokal.');
   }
   if (supabaseAnonKey.startsWith('REPLACE_')) {
-    throw new Error('VITE_SUPABASE_ANON_KEY masih berisi placeholder.');
+    throw new Error('VITE_SUPABASE_ANON_KEY masih berisi placeholder. Ganti dengan anon/publishable key dari Supabase lokal.');
   }
 
+  let localUrl: URL;
   try {
-    new URL(supabaseUrl);
+    localUrl = new URL(supabaseUrl);
   } catch {
-    throw new Error('VITE_SUPABASE_URL tidak valid.');
+    throw new Error('VITE_SUPABASE_URL tidak valid. Development hanya menerima Supabase lokal di http://127.0.0.1:54321.');
+  }
+
+  if (
+    localUrl.protocol !== 'http:' ||
+    !['127.0.0.1', 'localhost', '[::1]'].includes(localUrl.hostname) ||
+    localUrl.port !== '54321' ||
+    localUrl.username ||
+    localUrl.password ||
+    localUrl.pathname !== '/' ||
+    localUrl.search ||
+    localUrl.hash
+  ) {
+    throw new Error('Development menolak Supabase non-lokal. Gunakan http://127.0.0.1:54321.');
   }
 }
 
@@ -39,7 +54,7 @@ export const supabase: SupabaseClient | null = isSupabaseConfigured
 // WMS data access layer keeps the existing workflows on one
 // Supabase/Postgres source of truth while clients listen for database changes.
 export const db = supabase;
-export const SERVER_SCAN_ENABLED = isServerScanEnabled(import.meta.env.VITE_SERVER_SCAN_ENABLED);
+export const SERVER_SCAN_ENABLED = isServerScanEnabled(import.meta.env.VITE_SERVER_SCAN_RPC_ENABLED);
 export const DEV_BASELINE_SORTING = import.meta.env.DEV && import.meta.env.VITE_DEV_BASELINE_SORTING === 'true';
 if (DEV_BASELINE_SORTING && SERVER_SCAN_ENABLED) {
   throw new Error('VITE_DEV_BASELINE_SORTING dan VITE_SERVER_SCAN_ENABLED tidak dapat diaktifkan bersamaan.');
@@ -394,6 +409,91 @@ export function writeBatch(_database: unknown) {
    finally{clearTimeout(deadline);pendingWrites--;signalWrites();for(const name of new Set([...upserts.values(),...deletes.values()].map(x=>x.collection_name))) scheduleCollectionRefresh(name);}
   }
  };
+}
+
+export async function processReturnQc(branchId:string,caseId:string,decision:'ACCEPT'|'QUARANTINE'|'REJECT',notes:string) {
+ const requestId=crypto.randomUUID();
+ const {data,error}=await requireClient().rpc('process_return_qc',{
+  p_request_id:requestId,p_branch_id:branchId,p_case_id:caseId,p_decision:decision,p_notes:notes
+ });
+ if(error)throw error;
+ return data;
+}
+
+export async function fetchAccessibleBranches(): Promise<Array<{ id: string; name: string; operation_type: BranchOperationType }>> {
+  const client = requireClient();
+  const { data, error } = await client.from('branches').select('id,name,operation_type').order('id');
+  if (error) {
+    const fallback = await client.from('branches').select('id,name').order('id');
+    if (fallback.error) throw new Error(fallback.error.message || 'Gagal memuat daftar cabang.');
+    return Array.isArray(fallback.data)
+      ? fallback.data
+          .filter((row) => Boolean(row?.id))
+          .map((row) => ({
+            id: String(row.id).trim(),
+            name: String(row.name || row.id).trim(),
+            operation_type: 'HYBRID' as BranchOperationType,
+          }))
+      : [];
+  }
+  return Array.isArray(data)
+    ? data
+        .filter((row) => Boolean(row?.id))
+        .map((row) => ({
+          id: String(row.id).trim(),
+          name: String(row.name || row.id).trim(),
+          operation_type: normalizeBranchOperationType((row as any).operation_type, 'HYBRID'),
+        }))
+    : [];
+}
+
+export async function fetchBranchOperationType(branchId: string): Promise<BranchOperationType> {
+  const cleanId = String(branchId || '').trim();
+  if (!cleanId || !supabase) return 'HYBRID';
+  try {
+    const { data, error } = await supabase
+      .from('branches')
+      .select('operation_type')
+      .eq('id', cleanId)
+      .maybeSingle();
+    if (error || !data) return 'HYBRID';
+    return normalizeBranchOperationType((data as any).operation_type, 'HYBRID');
+  } catch {
+    return 'HYBRID';
+  }
+}
+
+export async function fetchBranchCatalog(branchId: string): Promise<CatalogItem[]> {
+  const cleanBranchId = String(branchId || '').trim();
+  if (!cleanBranchId) throw new Error('Cabang sumber tidak valid.');
+  const client = requireClient();
+  const rows = await readAllRows<{ document_id: string; payload: Record<string, unknown> }>(
+    () =>
+      client
+        .from('wms_documents')
+        .select('document_id,payload')
+        .eq('collection_name', 'catalog')
+        .eq('branch_id', cleanBranchId),
+    'document_id',
+    () => true,
+    500
+  );
+  return rows
+    .filter(row => row.payload && typeof row.payload === 'object' && !Array.isArray(row.payload))
+    .map(row => {
+      const p = row.payload as Record<string, unknown>;
+      const rawSkuId = String(p.skuId || p.sku || row.document_id || '').trim().toUpperCase();
+      return {
+        id: rawSkuId,
+        skuId: rawSkuId,
+        skuName: String(p.skuName || p.name || '').trim(),
+        brand: typeof p.brand === 'string' ? p.brand.trim() : undefined,
+        barcode: typeof p.barcode === 'string' ? p.barcode.trim() : undefined,
+        qtyCtnSize: Number(p.qtyCtnSize) > 0 ? Math.floor(Number(p.qtyCtnSize)) : 0,
+        qtyInnerSize: Number(p.qtyInnerSize) > 0 ? Math.floor(Number(p.qtyInnerSize)) : 0,
+      } satisfies CatalogItem;
+    })
+    .filter(item => Boolean(item.skuId));
 }
 
 export function handleSupabaseError(error: unknown, operationType: OperationType, path: string | null) {

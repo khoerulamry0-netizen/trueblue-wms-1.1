@@ -1,9 +1,12 @@
 import ModalFrame from './ModalFrame';
+import { useLanguage } from '../i18n/LanguageContext';
 import React, { useState, useEffect, useRef } from 'react';
 import { collection, onSnapshot, doc, setDoc, deleteDoc, writeBatch } from '../supabase';
 import { db, handleSupabaseError, OperationType } from '../supabase';
-import { StockItem, DccLog, CatalogItem, InboundReceiptItem, isInboundReceiptItem } from '../types';
-import { getProductPackSizes, calculatePackQuantities, formatNumber, getExpiredStatus, normalizeDateToDmy, getCanonicalStockId, findStockIndex, getStockStatus, isNoExpiryDate } from '../utils/calculations';
+import { StockItem, DccLog, CatalogItem, InboundReceiptItem, isInboundReceiptItem, Warehouse } from '../types';
+import { getProductPackSizes, calculatePackQuantities, formatNumber, getExpiredStatus, normalizeDateToDmy, getCanonicalStockId, findStockIndex, getStockStatus, isNoExpiryDate, updateDynamicCatalogRegistry } from '../utils/calculations';
+import { resolvePreferredSkuName } from '../utils/catalogSync';
+import { ensureCentralWarehouse } from '../utils/warehouseRouting';
 import { findSkuId } from '../data/barcodeMap';
 import * as XLSX from 'xlsx';
 import { 
@@ -42,6 +45,7 @@ interface InboundManagerProps {
   onAddLog: (log: Omit<DccLog, 'id' | 'timestamp'>) => void;
   onAddBatchLogs?: (logs: Omit<DccLog, 'id' | 'timestamp'>[]) => void;
   currentUser: any;
+  warehouses?: Warehouse[];
 }
 
 interface ParsedInboundRow {
@@ -57,6 +61,7 @@ interface ParsedInboundRow {
   notes?: string;
   originalText: string;
   isValid: boolean;
+  isNewCatalogSku?: boolean;
   error?: string;
 }
 
@@ -66,10 +71,22 @@ export default function InboundManager({
   onUpdateStock,
   onAddLog,
   onAddBatchLogs,
-  currentUser
+  currentUser,
+  warehouses = []
 }: InboundManagerProps) {
+  const { t, language } = useLanguage();
   // Inbound History State
   const [inboundHistory, setInboundHistory] = useState<InboundReceiptItem[]>([]);
+
+  // Warehouse context
+  const availableWarehouses = React.useMemo(() => ensureCentralWarehouse(warehouses), [warehouses]);
+  const [selectedWarehouseId, setSelectedWarehouseId] = useState<string>(() => availableWarehouses[0]?.id || 'WH-CENTRAL');
+
+  useEffect(() => {
+    if (availableWarehouses.length > 0 && (!selectedWarehouseId || !availableWarehouses.some(w => w.id === selectedWarehouseId))) {
+      setSelectedWarehouseId(availableWarehouses[0]?.id || 'WH-CENTRAL');
+    }
+  }, [availableWarehouses, selectedWarehouseId]);
 
   // Supabase Realtime Listener
   useEffect(() => {
@@ -117,7 +134,32 @@ export default function InboundManager({
     }
     for(const log of logItems){const id='inbound_log_'+crypto.randomUUID();batch.set(doc(db,'logs',id),{...log,id,timestamp:new Date().toISOString()});}
     for(const row of receipts) batch.set(doc(db,'inbound',row.id),row);
+
+    // Auto-register any new SKU outside catalog into Master Catalog
+    const knownSkus = new Set(catalog.map(c => c.skuId.trim().toUpperCase()));
+    const newCatalogItems: CatalogItem[] = [];
+    for (const row of receipts) {
+      const cleanSku = (row.skuId || '').trim().toUpperCase();
+      if (!cleanSku || knownSkus.has(cleanSku)) continue;
+      knownSkus.add(cleanSku);
+      const packSpec = getProductPackSizes(cleanSku);
+      const newCat: CatalogItem = {
+        id: cleanSku,
+        skuId: cleanSku,
+        skuName: (row.skuName || '').trim() || `${cleanSku} Product`,
+        sku: cleanSku,
+        name: (row.skuName || '').trim() || `${cleanSku} Product`,
+        qtyCtnSize: packSpec.qtyCtnSize,
+        qtyInnerSize: packSpec.qtyInnerSize
+      };
+      newCatalogItems.push(newCat);
+      batch.set(doc(db, 'catalog', cleanSku), newCat);
+    }
+
     await batch.commit();
+    if (newCatalogItems.length > 0) {
+      updateDynamicCatalogRegistry([...catalog, ...newCatalogItems]);
+    }
   };
   const saveInboundHistory = async (items:InboundReceiptItem[]) => {
     const changed=items.filter(row=>JSON.stringify(inboundHistory.find(old=>old.id===row.id))!==JSON.stringify(row));
@@ -213,6 +255,7 @@ export default function InboundManager({
       }
 
       let rowSku = '';
+      let rowName = '';
       let rowQtyStr = '';
       let rowLoc = '';
       let rowExp = '';
@@ -226,14 +269,16 @@ export default function InboundManager({
         rowPo = parts[0] || '';
         rowSupplier = parts[1] || '';
         rowSku = parts[2] || '';
+        rowName = parts[3] || '';
         rowQtyStr = parts[4] || '';
         rowLoc = parts[5] || '';
         rowExp = parts[6] || '';
         rowNotes = parts[7] || '';
       } 
       // Pattern B: 5 columns: SKU, Nama, Qty, Lokasi, Exp Date
-      else if (parts.length >= 5 && isNaN(Number(parts[1].replace(/[^\d]/g, '')))) {
+      else if (parts.length >= 5 && !/^\d+$/.test((parts[1] || '').trim())) {
         rowSku = parts[0] || '';
+        rowName = parts[1] || '';
         rowQtyStr = parts[2] || '';
         rowLoc = parts[3] || '';
         rowExp = parts[4] || '';
@@ -286,10 +331,10 @@ export default function InboundManager({
         return;
       }
 
-      // Find Name in Catalog or Stock
+      // Find Name in Catalog or Stock (preferring real non-placeholder names)
       const catalogMatch = catalog.find(c => c.skuId.toUpperCase() === cleanSkuId || c.skuId.toUpperCase() === rowSku.toUpperCase());
       const stockMatch = stock.find(s => s.skuId.toUpperCase() === cleanSkuId || s.skuId.toUpperCase() === rowSku.toUpperCase());
-      const skuName = catalogMatch?.skuName || stockMatch?.skuName || `${cleanSkuId} Product`;
+      const skuName = resolvePreferredSkuName(cleanSkuId, catalogMatch?.skuName, rowName, stockMatch?.skuName);
 
       results.push({
         id: `line-${idx}`,
@@ -303,7 +348,8 @@ export default function InboundManager({
         supplierName: rowSupplier,
         notes: rowNotes,
         originalText: trimmed,
-        isValid: true
+        isValid: true,
+        isNewCatalogSku: !catalogMatch
       });
     });
 
@@ -480,7 +526,9 @@ export default function InboundManager({
           if (skuId) {
             const loc = rawLocation || defaultLocation || 'RAK-A01';
             const exp = normalizeDateToDmy(rawExpiredDate) || normalizeDateToDmy(defaultExpDate) || '31/12/2028';
-            lines.push(`${skuId}\t${Number.isSafeInteger(cleanQty) && cleanQty > 0 ? cleanQty : `INVALID:${rawQty}`}\t${loc}\t${exp}`);
+            const qtyStr = Number.isSafeInteger(cleanQty) && cleanQty > 0 ? String(cleanQty) : `INVALID:${rawQty}`;
+            const cleanName = rawName ? rawName.replace(/\t/g, ' ').trim() : '';
+            lines.push(cleanName ? `${skuId}\t${cleanName}\t${qtyStr}\t${loc}\t${exp}` : `${skuId}\t${qtyStr}\t${loc}\t${exp}`);
           }
         });
 
@@ -576,6 +624,8 @@ export default function InboundManager({
       const cleanLoc = newLoc.toUpperCase();
       if (targetRow.poNumber || targetRow.supplierName) {
         rawLines[targetRow.lineIndex] = `${targetRow.poNumber || poNumber}\t${targetRow.supplierName || supplierName}\t${targetRow.skuId}\t${targetRow.skuName}\t${targetRow.qty}\t${cleanLoc}\t${targetRow.expiredDate}\t${targetRow.notes || ''}`;
+      } else if (targetRow.skuName && targetRow.skuName !== `${targetRow.skuId} Product`) {
+        rawLines[targetRow.lineIndex] = `${targetRow.skuId}\t${targetRow.skuName}\t${targetRow.qty}\t${cleanLoc}\t${targetRow.expiredDate}`;
       } else {
         rawLines[targetRow.lineIndex] = `${targetRow.skuId}\t${targetRow.qty}\t${cleanLoc}\t${targetRow.expiredDate}`;
       }
@@ -651,6 +701,7 @@ export default function InboundManager({
           };
         } else {
           const packs = calculatePackQuantities(row.qty, packSpec.qtyCtnSize, packSpec.qtyInnerSize);
+          const activeWh = availableWarehouses.find(w => w.id === selectedWarehouseId) || availableWarehouses[0];
           updatedStock.push({
             id: targetId,
             skuId: row.skuId,
@@ -664,7 +715,9 @@ export default function InboundManager({
             qtyInnerSize: packSpec.qtyInnerSize,
             qtyInner: packs.qtyInner,
             qtyLoose: packs.qtyLoose,
-            status: getExpiredStatus(normEd)
+            status: getExpiredStatus(normEd),
+            warehouseId: activeWh?.id || 'WH-CENTRAL',
+            warehouseName: activeWh?.name || 'Gudang Pusat'
           });
         }
 
@@ -678,7 +731,8 @@ export default function InboundManager({
           qty: row.qty,
           description: `Inbound Massal PO: ${activePo} [${activeSupplier}]`,
           user: operatorName,
-          expiredDate: normEd
+          expiredDate: normEd,
+          warehouseId: selectedWarehouseId || 'WH-CENTRAL'
         });
       });
 
@@ -795,6 +849,7 @@ export default function InboundManager({
       };
     } else {
       const packs = calculatePackQuantities(receipt.receivedQty, packSpec.qtyCtnSize, packSpec.qtyInnerSize);
+      const activeWh = availableWarehouses.find(w => w.id === selectedWarehouseId) || availableWarehouses[0];
       updatedStock.push({
         id: targetId,
         skuId: receipt.skuId,
@@ -808,7 +863,9 @@ export default function InboundManager({
         qtyInnerSize: packSpec.qtyInnerSize,
         qtyInner: packs.qtyInner,
         qtyLoose: packs.qtyLoose,
-        status: getExpiredStatus(normEd)
+        status: getExpiredStatus(normEd),
+        warehouseId: activeWh?.id || 'WH-CENTRAL',
+        warehouseName: activeWh?.name || 'Gudang Pusat'
       });
     }
 
@@ -821,7 +878,8 @@ export default function InboundManager({
       qty: receipt.receivedQty,
       description: `Putaway Inbound PO: ${receipt.poNumber} [${receipt.supplierName}]`,
       user: currentUser?.fullName || 'WMS Inbound Staff',
-      expiredDate: normEd
+      expiredDate: normEd,
+      warehouseId: selectedWarehouseId || 'WH-CENTRAL'
     };
 
     const updatedHistory = inboundHistory.map(item => 
@@ -889,6 +947,7 @@ export default function InboundManager({
         };
       } else {
         const packs = calculatePackQuantities(receipt.receivedQty, packSpec.qtyCtnSize, packSpec.qtyInnerSize);
+        const activeWh = availableWarehouses.find(w => w.id === selectedWarehouseId) || availableWarehouses[0];
         updatedStock.push({
           id: targetId,
           skuId: receipt.skuId,
@@ -902,7 +961,9 @@ export default function InboundManager({
           qtyInnerSize: packSpec.qtyInnerSize,
           qtyInner: packs.qtyInner,
           qtyLoose: packs.qtyLoose,
-          status: getExpiredStatus(normEd)
+          status: getExpiredStatus(normEd),
+          warehouseId: activeWh?.id || 'WH-CENTRAL',
+          warehouseName: activeWh?.name || 'Gudang Pusat'
         });
       }
 
@@ -915,7 +976,8 @@ export default function InboundManager({
         qty: receipt.receivedQty,
         description: `Batch Putaway Inbound PO: ${receipt.poNumber} [${receipt.supplierName}]`,
         user: currentUser?.fullName || 'WMS Inbound Staff',
-        expiredDate: normEd
+        expiredDate: normEd,
+        warehouseId: selectedWarehouseId || 'WH-CENTRAL'
       });
     });
 
@@ -1016,13 +1078,13 @@ export default function InboundManager({
           <div>
             <div className="inline-flex items-center gap-2 px-3 py-1 rounded-full bg-emerald-500/15 border border-emerald-500/30 text-emerald-400 text-xs font-semibold mb-2">
               <Truck className="w-3.5 h-3.5" />
-              <span>INBOUND</span>
+              <span>{t('inbound.badge')}</span>
             </div>
             <h2 className="text-xl md:text-2xl font-black text-slate-100 tracking-tight flex items-center gap-2">
-              Penerimaan barang
+              {t('inbound.title')}
             </h2>
             <p className="text-slate-400 text-xs md:text-sm mt-1 max-w-2xl leading-relaxed">
-              Catat barang masuk, periksa QC, dan tempatkan stok ke rak tujuan.
+              {t('inbound.subtitle')}
             </p>
           </div>
 
@@ -1035,7 +1097,7 @@ export default function InboundManager({
               title="Download Template Excel (.xlsx)"
             >
               <Download className="w-3.5 h-3.5 text-amber-400" />
-              <span>Download Template Excel</span>
+              <span>{t('inbound.downloadTemplate')}</span>
             </button>
 
             {/* Import Massal Inbound Button */}
@@ -1047,7 +1109,7 @@ export default function InboundManager({
               className="px-4 py-2.5 bg-emerald-500 hover:bg-emerald-400 text-slate-950 font-black text-xs md:text-sm rounded-xl shadow-lg shadow-emerald-500/20 transition-all cursor-pointer flex items-center gap-2"
             >
               <Upload className="w-4 h-4 stroke-[3]" />
-              <span>Import Massal Inbound</span>
+              <span>{t('inbound.bulkImport')}</span>
             </button>
           </div>
         </div>
@@ -1055,37 +1117,37 @@ export default function InboundManager({
         {/* Metric Summary Cards */}
         <div className="grid grid-cols-2 md:grid-cols-4 gap-3 mt-6 pt-5 border-t border-slate-800/80">
           <div className="bg-slate-950/60 border border-slate-800/60 p-3.5 rounded-xl">
-            <span className="text-[11px] font-medium text-slate-400 block">Total Qty Inbound Masuk</span>
+            <span className="text-[11px] font-medium text-slate-400 block">{t('inbound.totalReceivedQty')}</span>
             <span className="text-lg font-bold text-emerald-400 mt-1 block font-mono">
-              {formatNumber(totalReceivedQty)} <span className="text-xs text-slate-400 font-normal">Pcs</span>
+              {formatNumber(totalReceivedQty)} <span className="text-xs text-slate-400 font-normal">{t('inbound.pcs')}</span>
             </span>
           </div>
 
           <div className="bg-slate-950/60 border border-slate-800/60 p-3.5 rounded-xl">
             <div className="flex items-center justify-between">
-              <span className="text-[11px] font-medium text-slate-400 block">Antrean Siap Putaway</span>
+              <span className="text-[11px] font-medium text-slate-400 block">{t('inbound.readyPutaway')}</span>
               {pendingPutawayCount > 0 && (
                 <span className="px-1.5 py-0.5 rounded text-[10px] font-bold bg-amber-500/20 text-amber-300">
-                  Perlu Aksi
+                  {t('inbound.actionNeeded')}
                 </span>
               )}
             </div>
             <span className="text-lg font-bold text-amber-400 mt-1 block font-mono">
-              {pendingPutawayCount} <span className="text-xs text-slate-400 font-normal">Item SKU</span>
+              {pendingPutawayCount} <span className="text-xs text-slate-400 font-normal">{t('inbound.skuItems')}</span>
             </span>
           </div>
 
           <div className="bg-slate-950/60 border border-slate-800/60 p-3.5 rounded-xl">
-            <span className="text-[11px] font-medium text-slate-400 block">Selesai Putaway ke Rak</span>
+            <span className="text-[11px] font-medium text-slate-400 block">{t('inbound.putawayDone')}</span>
             <span className="text-lg font-bold text-teal-400 mt-1 block font-mono">
-              {putawayDoneCount} <span className="text-xs text-slate-400 font-normal">Item SKU</span>
+              {putawayDoneCount} <span className="text-xs text-slate-400 font-normal">{t('inbound.skuItems')}</span>
             </span>
           </div>
 
           <div className="bg-slate-950/60 border border-slate-800/60 p-3.5 rounded-xl">
-            <span className="text-[11px] font-medium text-slate-400 block">Karantina / QC Hold</span>
+            <span className="text-[11px] font-medium text-slate-400 block">{t('inbound.qcHold')}</span>
             <span className="text-lg font-bold text-rose-400 mt-1 block font-mono">
-              {qcHoldCount} <span className="text-xs text-slate-400 font-normal">Item SKU</span>
+              {qcHoldCount} <span className="text-xs text-slate-400 font-normal">{t('inbound.skuItems')}</span>
             </span>
           </div>
         </div>
@@ -1098,7 +1160,7 @@ export default function InboundManager({
           <Search className="w-4 h-4 text-slate-400 absolute left-3 top-1/2 -translate-y-1/2" />
           <input
             type="text"
-            placeholder="Cari PO, Supplier, SKU, Rak, Tanggal..."
+            placeholder={t('inbound.searchPlaceholder')}
             value={searchTerm}
             onChange={(e) => setSearchTerm(e.target.value)}
             className="w-full bg-slate-950 border border-slate-800 rounded-xl pl-9 pr-3 py-2 text-xs text-slate-200 placeholder-slate-500 focus:outline-none focus:border-emerald-500/50"
@@ -1115,7 +1177,7 @@ export default function InboundManager({
                 : 'text-slate-400 border-transparent hover:text-slate-200'
             }`}
           >
-            Semua ({inboundHistory.length})
+            {t('inbound.filterAll')} ({inboundHistory.length})
           </button>
 
           <button
@@ -1126,7 +1188,7 @@ export default function InboundManager({
                 : 'text-slate-400 border-transparent hover:text-slate-200'
             }`}
           >
-            Siap Putaway ({pendingPutawayCount})
+            {t('inbound.filterReady')} ({pendingPutawayCount})
           </button>
 
           <button
@@ -1137,7 +1199,7 @@ export default function InboundManager({
                 : 'text-slate-400 border-transparent hover:text-slate-200'
             }`}
           >
-            Sudah Putaway ({putawayDoneCount})
+            {t('inbound.filterDone')} ({putawayDoneCount})
           </button>
 
           <button
@@ -1148,7 +1210,7 @@ export default function InboundManager({
                 : 'text-slate-400 border-transparent hover:text-slate-200'
             }`}
           >
-            QC Hold ({qcHoldCount})
+            {t('inbound.filterHold')} ({qcHoldCount})
           </button>
 
           {/* Right Action Buttons */}
@@ -1160,7 +1222,7 @@ export default function InboundManager({
               title="Ekspor Riwayat ke Excel"
             >
               <FileSpreadsheet className="w-3.5 h-3.5 text-emerald-400" />
-              <span>Ekspor (.xlsx)</span>
+              <span>{t('inbound.exportHistory')}</span>
             </button>
 
             {/* Clear All Inbound Button */}
@@ -1171,7 +1233,7 @@ export default function InboundManager({
                 title="Hapus Semua Riwayat Inbound Permanen"
               >
                 <Trash2 className="w-3.5 h-3.5 text-rose-400" />
-                <span>Hapus Semua</span>
+                <span>{t('inbound.clearHistory')}</span>
               </button>
             )}
           </div>
@@ -1219,14 +1281,14 @@ export default function InboundManager({
           <table className="w-full text-left text-xs">
             <thead className="bg-slate-950/80 text-slate-400 uppercase tracking-wider font-semibold border-b border-slate-800/80">
               <tr>
-                <th className="p-3.5">No PO / Tanggal</th>
-                <th className="p-3.5">Supplier / Principal</th>
-                <th className="p-3.5">Kode SKU & Nama Barang</th>
-                <th className="p-3.5 text-center">Expired Date</th>
-                <th className="p-3.5 text-center">Jumlah Diterima</th>
-                <th className="p-3.5 text-center">Lokasi Target</th>
-                <th className="p-3.5 text-center">Status QC</th>
-                <th className="p-3.5 text-right">Aksi SOP Putaway</th>
+                <th className="p-3.5">{language === 'en' ? 'PO No / Date' : 'No PO / Tanggal'}</th>
+                <th className="p-3.5">{language === 'en' ? 'Supplier / Principal' : 'Supplier / Principal'}</th>
+                <th className="p-3.5">{language === 'en' ? 'SKU Code & Product' : 'Kode SKU & Nama Barang'}</th>
+                <th className="p-3.5 text-center">{language === 'en' ? 'Expiry Date' : 'Expired Date'}</th>
+                <th className="p-3.5 text-center">{language === 'en' ? 'Received Qty' : 'Jumlah Diterima'}</th>
+                <th className="p-3.5 text-center">{language === 'en' ? 'Target Location' : 'Lokasi Target'}</th>
+                <th className="p-3.5 text-center">{language === 'en' ? 'QC Status' : 'Status QC'}</th>
+                <th className="p-3.5 text-right">{language === 'en' ? 'Putaway Action' : 'Aksi SOP Putaway'}</th>
               </tr>
             </thead>
             <tbody className="divide-y divide-slate-800/50 text-slate-300">
@@ -1658,6 +1720,18 @@ export default function InboundManager({
                   </div>
                 </div>
 
+                {parsedRows.some(r => r.isValid && r.isNewCatalogSku) && (
+                  <div className="mb-3 rounded-xl border border-amber-500/30 bg-amber-500/10 p-3 text-xs text-amber-200 flex items-start gap-2.5">
+                    <AlertTriangle className="w-4 h-4 text-amber-400 shrink-0 mt-0.5" />
+                    <div>
+                      <strong className="text-amber-300">
+                        Terdeteksi {new Set(parsedRows.filter(r => r.isValid && r.isNewCatalogSku).map(r => r.skuId)).size} SKU baru di luar katalog.
+                      </strong>{' '}
+                      SKU bertanda <span className="font-bold text-amber-300">SKU BARU</span> akan otomatis didaftarkan ke Master Katalog Produk saat Inbound disimpan (default isi kemasan mengikuti standar katalog/720 Pcs/Ctn, 12 Pcs/Inner dan dapat diubah kapan saja di menu Product Catalog).
+                    </div>
+                  </div>
+                )}
+
                 <div className="border border-slate-800 rounded-xl overflow-hidden bg-slate-950">
                   <table className="w-full text-left text-xs">
                     <thead className="bg-slate-900 text-slate-400 uppercase tracking-wider font-semibold border-b border-slate-800">
@@ -1682,9 +1756,19 @@ export default function InboundManager({
                         parsedRows.map((row, idx) => (
                           <tr key={row.id} className={row.isValid ? 'hover:bg-slate-900/50' : 'bg-rose-950/20 text-rose-300'}>
                             <td className="p-3 font-mono text-slate-500">{idx + 1}</td>
-                            <td className="p-3 font-bold font-mono text-emerald-400">{row.skuId}</td>
+                            <td className="p-3 font-bold font-mono text-emerald-400">
+                              <div>{row.skuId}</div>
+                              {row.isValid && row.isNewCatalogSku && (
+                                <span className="inline-block mt-1 px-1.5 py-0.5 rounded bg-amber-500/20 border border-amber-500/40 text-[9px] font-bold text-amber-300 tracking-wide">
+                                  SKU BARU
+                                </span>
+                              )}
+                            </td>
                             <td className="p-3">
                               <div className="font-semibold text-slate-200">{row.skuName}</div>
+                              {row.isValid && row.isNewCatalogSku && (
+                                <div className="text-[10px] text-amber-300/90 mt-0.5">Auto-daftar ke Master Katalog saat disimpan</div>
+                              )}
                               {!row.isValid && row.error && (
                                 <div className="text-[10px] text-rose-400 mt-0.5">{row.error}</div>
                               )}

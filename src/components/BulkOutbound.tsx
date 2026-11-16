@@ -4,9 +4,12 @@ import { scanServerUnavailable } from '../utils/packingValidation';
 import { getActiveBranch, SERVER_SCAN_ENABLED, serverScanRpc, supabase } from '../supabase';
 import { createScanServerSession } from '../utils/sortingServerSession';
 import type { ScanProgress } from '../utils/serverScanRpc';
-import type {OrderSessionResult} from '../utils/orderSession';
+import type {OrderIssueReportInput, OrderSessionData, OrderSessionResult} from '../utils/orderSession';
+import { useLanguage } from '../i18n/LanguageContext';
 import React, { useState, useMemo, useRef } from 'react';
-import { StockItem, OutboundItem, Warehouse } from '../types';
+import { StockItem, OutboundItem, Warehouse, ChannelOperationType } from '../types';
+import UnassignedOrdersBanner from './UnassignedOrdersBanner';
+import { resolveOrderType } from '../utils/orderType';
 import { 
   formatNumber, 
   getExpiredStatus, 
@@ -47,16 +50,22 @@ import {
   ShieldAlert,
   Unlock,
   Calendar,
-  Boxes
+  Boxes,
+  CheckCheck,
+  Zap,
+  RotateCcw,
+  Edit3,
+  Maximize2,
+  Minimize2
 } from 'lucide-react';
 import { findSkuId, getBarcodeForSku, BARCODE_MAP } from '../data/barcodeMap';
 import HistoryOrder from './HistoryOrder';
 import OrderFileImport from './OrderFileImport';
 import BatchPickingModal from './BatchPickingModal';
-import CourierManifestManager from './CourierManifestManager';
-import { Navigation, Truck } from 'lucide-react';
+import OrderIssueModal from './OrderIssueModal';
+import { Navigation } from 'lucide-react';
 import { WarehousePickingRouteConfig } from '../types';
-import { getWarehouseRouteScore, describeRouteConfig, DEFAULT_TRUEBLUE_ROUTE_CONFIG } from '../utils/warehouseRouting';
+import { getWarehouseRouteScore, describeRouteConfig, DEFAULT_TRUEBLUE_ROUTE_CONFIG, ensureCentralWarehouse, isCentralWarehouse } from '../utils/warehouseRouting';
 
 export const getLocationRank = (loc: string, config?: WarehousePickingRouteConfig): number => {
   return getWarehouseRouteScore(loc, config);
@@ -65,6 +74,8 @@ export const getLocationRank = (loc: string, config?: WarehousePickingRouteConfi
 
 interface BulkOutboundProps {
   initialMode?: OutboundMode;
+  allowedModes?: ('create' | 'pick' | 'validate' | 'history')[];
+  channelMode?: ChannelOperationType;
   stock: StockItem[];
   warehouses?: Warehouse[];
   onProcessOutbound: (items: Omit<OutboundItem, 'id' | 'timestamp'>[]) => Promise<boolean>;
@@ -79,14 +90,10 @@ interface BulkOutboundProps {
   onBatchEditExpiredDate?: (items: OutboundItem[], newRawExpDate: string) => Promise<boolean>;
   onUpdateOrderSession?: (
     refNum: string,
-    sessionData: {
-      pickingBy?: string | null;
-      pickingStartedAt?: string | null;
-      packingBy?: string | null;
-      packingStartedAt?: string | null;
-    }
+    sessionData: OrderSessionData
   ) => Promise<OrderSessionResult | false>;
   onUpdateOrdersShipped?: (orderRefs: string[], manifestInfo: any, isCancelled?: boolean) => Promise<boolean>;
+  onAssignOrderType?: (assignments: Array<{ id?: string; referenceNumber?: string; orderType: ChannelOperationType }>) => Promise<boolean>;
 }
 
 interface ParsedRow {
@@ -117,8 +124,12 @@ export default function BulkOutbound({
   onBatchEditExpiredDate,
   onUpdateOrderSession,
   onUpdateOrdersShipped,
-  initialMode
+  onAssignOrderType,
+  channelMode,
+  initialMode,
+  allowedModes
 }: BulkOutboundProps) {
+  const { t, language } = useLanguage();
   const [inputText, setInputText] = useState('');
   const [refNumber, setRefNumber] = useState(`OUT-BULK-${new Date().toISOString().slice(0, 10).replace(/-/g, '')}-${Math.floor(100 + Math.random() * 900)}`);
   const [orderNumber, setOrderNumber] = useState('');
@@ -129,23 +140,13 @@ export default function BulkOutbound({
   const [showInstructions, setShowInstructions] = useState(true);
   const [requirePacking, setRequirePacking] = useState(true);
   const availableWarehouses: Warehouse[] = useMemo(() => {
-    return warehouses && warehouses.length > 0
-      ? warehouses
-      : [{
-          id: 'WH-CENTRAL',
-          code: 'CENTRAL',
-          name: 'Gudang Pusat',
-          type: 'CENTRAL',
-          address: '-',
-          city: 'Jakarta',
-          picName: 'Staff Logistik',
-          picPhone: '-',
-          status: 'ACTIVE',
-          isCentral: true,
-          createdAt: new Date().toISOString()
-        }];
+    return ensureCentralWarehouse(warehouses);
   }, [warehouses]);
-  const [selectedWarehouseId, setSelectedWarehouseId] = useState<string>(warehouses?.[0]?.id || 'WH-CENTRAL');
+
+  const [selectedWarehouseId, setSelectedWarehouseId] = useState<string>(() => {
+    const list = ensureCentralWarehouse(warehouses);
+    return list[0]?.id || 'WH-CENTRAL';
+  });
 
   const activeWarehouse = useMemo(() => {
     return availableWarehouses.find(w => w.id.toUpperCase() === (selectedWarehouseId || '').toUpperCase()) || availableWarehouses[0];
@@ -154,57 +155,39 @@ export default function BulkOutbound({
   const activeRouteConfig = activeWarehouse?.pickingRouteConfig || DEFAULT_TRUEBLUE_ROUTE_CONFIG;
 
   React.useEffect(() => {
-    if (availableWarehouses.length > 0 && (!selectedWarehouseId || !availableWarehouses.some(w => w.id.toUpperCase() === selectedWarehouseId.toUpperCase()))) {
-      setSelectedWarehouseId(availableWarehouses[0].id);
+    if (availableWarehouses.length > 0) {
+      const centralWh = availableWarehouses.find(isCentralWarehouse) || availableWarehouses[0];
+      if (!selectedWarehouseId || !availableWarehouses.some(w => w.id.toUpperCase() === selectedWarehouseId.toUpperCase())) {
+        setSelectedWarehouseId(centralWh.id);
+      }
     }
   }, [availableWarehouses, selectedWarehouseId]);
 
-  // High-level mode selection tab: 'create', 'pick', 'validate', 'history' or 'manifest'
-  const [activeModeTab, setActiveModeTab] = useState<'create' | 'pick' | 'validate' | 'history' | 'manifest'>(() => {
+  // High-level mode selection tab: 'create', 'pick', 'validate' or 'history'
+  const [activeModeTab, setActiveModeTab] = useState<'create' | 'pick' | 'validate' | 'history'>(() => {
+    if (initialMode && (!allowedModes || allowedModes.includes(initialMode))) {
+      return initialMode as any;
+    }
+    if (allowedModes && allowedModes.length > 0) {
+      return allowedModes[0];
+    }
     return initialOutboundMode(currentUser?.role, initialMode);
   });
 
-  // Enforce mode lock for Packer, Picker, and Shipping roles
   React.useEffect(() => {
-    if (currentUser?.role === 'Shipping' && activeModeTab !== 'manifest') {
-      setActiveModeTab('manifest');
-    } else if (currentUser?.role === 'Packer' && activeModeTab !== 'validate') {
+    if (allowedModes && allowedModes.length > 0 && !allowedModes.includes(activeModeTab)) {
+      setActiveModeTab(allowedModes[0]);
+    }
+  }, [allowedModes]);
+
+  // Enforce mode lock for Packer and Picker roles
+  React.useEffect(() => {
+    if (currentUser?.role === 'Packer' && (!allowedModes || allowedModes.includes('validate')) && activeModeTab !== 'validate') {
       setActiveModeTab('validate');
-    } else if (currentUser?.role === 'Picker' && activeModeTab !== 'pick') {
+    } else if (currentUser?.role === 'Picker' && (!allowedModes || allowedModes.includes('pick')) && activeModeTab !== 'pick') {
       setActiveModeTab('pick');
     }
-  }, [currentUser?.role, activeModeTab]);
-
-  // Listen for manifest updates to keep the tab 5 badge in sync
-  const [manifestVersion, setManifestVersion] = useState(0);
-  React.useEffect(() => {
-    const onManifestUpdated = () => setManifestVersion(v => v + 1);
-    window.addEventListener('blues-manifests-updated', onManifestUpdated);
-    return () => window.removeEventListener('blues-manifests-updated', onManifestUpdated);
-  }, []);
-
-  const unmanifestedCompletedCount = React.useMemo(() => {
-    const manifestedSet = new Set<string>();
-    const activeWh = (selectedWarehouseId || 'WH-CENTRAL').toUpperCase();
-    try {
-      const raw = localStorage.getItem('blues-shipping-manifests');
-      if (raw) {
-        const list = JSON.parse(raw);
-        list
-          .filter((m: any) => (!m.warehouseId || (m.warehouseId || 'WH-CENTRAL').toUpperCase() === activeWh))
-          .forEach((m: any) => (m.orderReferences || []).forEach((r: string) => manifestedSet.add(r)));
-      }
-    } catch {}
-    const pendingRefs = new Set<string>();
-    orderHistory.forEach(i => {
-      const ref = i.referenceNumber || i.orderNumber || i.id;
-      const iWh = (i.warehouseId || 'WH-CENTRAL').toUpperCase();
-      if (i.status === 'Completed' && iWh === activeWh && !i.shipped && !manifestedSet.has(ref)) {
-        pendingRefs.add(ref);
-      }
-    });
-    return pendingRefs.size;
-  }, [orderHistory, manifestVersion, selectedWarehouseId]);
+  }, [currentUser?.role, activeModeTab, allowedModes]);
 
   // Active picking/packing states
   const [activePickerRef, setActivePickerRef] = useState<string | null>(null);
@@ -219,6 +202,32 @@ export default function BulkOutbound({
   const [tempExpDate, setTempExpDate] = useState<string>('');
   const [showMobilePickingSummary, setShowMobilePickingSummary] = useState(false);
   const [hideConfirmedPicker, setHideConfirmedPicker] = useState(true);
+  const [issueModalOpen, setIssueModalOpen] = useState(false);
+  const [operatorFocusMode, setOperatorFocusMode] = useState<boolean>(() => {
+    try {
+      return localStorage.getItem('wms_bulk_focus_mode') === 'true';
+    } catch {
+      return false;
+    }
+  });
+  const toggleOperatorFocusMode = () => {
+    setOperatorFocusMode(prev => {
+      const next = !prev;
+      try { localStorage.setItem('wms_bulk_focus_mode', String(next)); } catch {}
+      return next;
+    });
+  };
+  React.useEffect(() => {
+    if (!operatorFocusMode) return;
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Escape' && !issueModalOpen) {
+        setOperatorFocusMode(false);
+        try { localStorage.setItem('wms_bulk_focus_mode', 'false'); } catch {}
+      }
+    };
+    document.addEventListener('keydown', onKeyDown);
+    return () => document.removeEventListener('keydown', onKeyDown);
+  }, [operatorFocusMode, issueModalOpen]);
 
   // Active packing validation session states
   const [activePackingRef, setActivePackingRef] = useState<string | null>(null);
@@ -227,6 +236,10 @@ export default function BulkOutbound({
   const [packingScanError, setPackingScanError] = useState<string | null>(null);
   const [packingScanSuccess, setPackingScanSuccess] = useState<string | null>(null);
   const [packingManualCode, setPackingManualCode] = useState('');
+  const [packingScanMultiplier, setPackingScanMultiplier] = useState<number>(1);
+  const [packingFilter, setPackingFilter] = useState<'all' | 'pending' | 'completed'>('all');
+  const [outboundChannelFilter, setOutboundChannelFilter] = useState<'all' | 'b2b' | 'online'>('all');
+  const [editingSkuQty, setEditingSkuQty] = useState<{ skuId: string; val: number } | null>(null);
   const [packingTask, setPackingTask] = useState<{branch:string; actor:string; reference:string; basket:string} | null>(null);
   const [packingReady, setPackingReady] = useState(false);
   const [packingFinished, setPackingFinished] = useState(false);
@@ -414,7 +427,8 @@ TOTAL QTY     : ${lastPackedOrder.totalQty} pcs
     }} = {};
 
     (orderHistory || []).forEach(item => {
-      if (item.status === 'Pending') {
+      if (item.status === 'Pending' && !item.isQuickOutbound && item.outboundType !== 'quick' && !item.referenceNumber?.startsWith('OUT-QUICK-')) {
+        if (channelMode && resolveOrderType(item) !== channelMode) return;
         if (!groups[item.referenceNumber]) {
           groups[item.referenceNumber] = {
             referenceNumber: item.referenceNumber,
@@ -454,15 +468,50 @@ TOTAL QTY     : ${lastPackedOrder.totalQty} pcs
     return Object.values(groups).sort((a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime());
   }, [orderHistory]);
 
+  // Riwayat order reguler (mengecualikan transaksi Outbound Cepat agar tidak tercampur & mengikuti kanal aktif)
+  const regularOrderHistory = useMemo(() => {
+    return (orderHistory || []).filter(
+      item =>
+        !item.isQuickOutbound &&
+        item.outboundType !== 'quick' &&
+        !item.referenceNumber?.startsWith('OUT-QUICK-') &&
+        (!channelMode || resolveOrderType(item) === channelMode)
+    );
+  }, [orderHistory, channelMode]);
+
+  const getGroupOrderType = (ord: { items?: OutboundItem[] }) => resolveOrderType(ord.items?.[0]);
+  const isOrderB2b = (ord: { items?: OutboundItem[] }) => getGroupOrderType(ord) === 'B2B';
+  const isOrderOnline = (ord: { items?: OutboundItem[] }) => getGroupOrderType(ord) === 'ONLINE';
+
   // Only orders that need picking (not yet picked) are shown to the Picker
   const pickerPendingOrders = useMemo(() => {
     return pendingOrders.filter(ord => !ord.isPicked);
   }, [pendingOrders]);
 
+  const filteredPickerPendingOrders = useMemo(() => {
+    return pickerPendingOrders.filter(ord => {
+      if (channelMode === 'B2B') return isOrderB2b(ord);
+      if (channelMode === 'ONLINE') return isOrderOnline(ord);
+      if (outboundChannelFilter === 'b2b') return isOrderB2b(ord);
+      if (outboundChannelFilter === 'online') return isOrderOnline(ord);
+      return true;
+    });
+  }, [pickerPendingOrders, outboundChannelFilter, channelMode]);
+
   // Only orders that are ready to pack (fully picked) are shown to the Packer
   const packerPendingOrders = useMemo(() => {
     return pendingOrders.filter(ord => ord.isPicked);
   }, [pendingOrders]);
+
+  const filteredPackerPendingOrders = useMemo(() => {
+    return packerPendingOrders.filter(ord => {
+      if (channelMode === 'B2B') return isOrderB2b(ord);
+      if (channelMode === 'ONLINE') return isOrderOnline(ord);
+      if (outboundChannelFilter === 'b2b') return isOrderB2b(ord);
+      if (outboundChannelFilter === 'online') return isOrderOnline(ord);
+      return true;
+    });
+  }, [packerPendingOrders, outboundChannelFilter, channelMode]);
 
   const handleForceReleaseLock = (refNum: string, type: 'picking' | 'packing') => {
     if (onUpdateOrderSession) {
@@ -613,6 +662,7 @@ TOTAL QTY     : ${lastPackedOrder.totalQty} pcs
         }).catch(() => {});
       }
       setActivePackingRef(ref);
+      setPackingTask({ branch: getActiveBranch(), actor: myName, reference: ref, basket: ord.items[0]?.basketNumber?.trim() || '-' });
       setPackingScannedQty({});
       setPackingScanError(null);
       setPackingScanSuccess(null);
@@ -655,6 +705,7 @@ TOTAL QTY     : ${lastPackedOrder.totalQty} pcs
       }).catch(() => {});
     }
     setActivePackingRef(null);
+    setPackingTask(null);
     setPackingScannedQty({});
     setPackingScanError(null);
     setPackingScanSuccess(null);
@@ -688,7 +739,7 @@ TOTAL QTY     : ${lastPackedOrder.totalQty} pcs
       if(pickingSaveBusy.current)return;
       pickingSaveBusy.current=true;setSavingPicking(true);setPickingFeedback('');
       try{const success=await onEditOrderHistoryBatch(activePickerRef,pickingItems,true);
-       if(success){setActivePickerRef(null);setPickingItems([]);setConfirmedPickingIds({});setActiveModeTab('validate');playFinishSound();}
+       if(success){setActivePickerRef(null);setPickingItems([]);setConfirmedPickingIds({});if(!allowedModes||allowedModes.includes('validate')){setActiveModeTab('validate');}playFinishSound();}
        else setPickingFeedback('Picking belum tersimpan. Periksa pesan kesalahan; jika versi order berubah, kembali dan buka ulang order untuk memuat data terbaru.');
       }catch(e){setPickingFeedback(e instanceof Error?e.message:'Picking belum tersimpan. Periksa data terbaru.');}
       finally{pickingSaveBusy.current=false;setSavingPicking(false);}
@@ -709,7 +760,7 @@ TOTAL QTY     : ${lastPackedOrder.totalQty} pcs
     executeConfirmPicking();
   };
 
-  const handlePackingScan = async (scannedText: string) => {
+  const handlePackingScan = async (scannedText: string, qtyToAdd: number = 1) => {
     if (packingBusyRef.current) return;
     const barcode = scannedText.trim();
     if (!SERVER_SCAN_ENABLED) {
@@ -723,29 +774,47 @@ TOTAL QTY     : ${lastPackedOrder.totalQty} pcs
         triggerErrorSound();
         return;
       }
-      const targetItem = orderItems.find(item => {
-        const currentScanned = packingScannedQty[item.id] || 0;
-        return item.skuId.toLowerCase() === skuId.toLowerCase() && currentScanned < item.qty;
-      });
-      if (targetItem) {
-        setPackingScannedQty(prev => ({
-          ...prev,
-          [targetItem.id]: (prev[targetItem.id] || 0) + 1
-        }));
-        setPackingScanSuccess(`✓ Memindai SKU ${targetItem.skuId} (${targetItem.skuName}) (+1 Pcs)`);
-        setPackingScanError(null);
-        setPackingManualCode('');
-        triggerBeep();
-      } else {
-        const itemWithSku = orderItems.find(item => item.skuId.toLowerCase() === skuId.toLowerCase());
-        if (itemWithSku) {
-          setPackingScanError(`❌ SKU ${skuId} sudah lengkap (${itemWithSku.qty}/${itemWithSku.qty} pcs)!`);
-        } else {
-          setPackingScanError(`❌ SKU ${skuId} tidak terdaftar dalam order ${activePackingRef}!`);
-        }
+      const matchingItems = orderItems.filter(item => item.skuId.toLowerCase() === skuId.toLowerCase());
+      if (matchingItems.length === 0) {
+        setPackingScanError(`❌ SKU ${skuId} tidak terdaftar dalam order ${activePackingRef}!`);
         setPackingScanSuccess(null);
         triggerErrorSound();
+        return;
       }
+
+      const totalItemQty = matchingItems.reduce((sum, item) => sum + item.qty, 0);
+      const currentScannedTotal = matchingItems.reduce((sum, item) => sum + (packingScannedQty[item.id] || 0), 0);
+      const remainingNeeded = totalItemQty - currentScannedTotal;
+
+      if (remainingNeeded <= 0) {
+        setPackingScanError(`❌ SKU ${skuId} sudah lengkap (${totalItemQty}/${totalItemQty} pcs)!`);
+        setPackingScanSuccess(null);
+        triggerErrorSound();
+        return;
+      }
+
+      const actualAdd = Math.min(Math.max(1, qtyToAdd), remainingNeeded);
+      let toDistribute = actualAdd;
+
+      setPackingScannedQty(prev => {
+        const next = { ...prev };
+        for (const item of matchingItems) {
+          if (toDistribute <= 0) break;
+          const current = next[item.id] || 0;
+          const room = item.qty - current;
+          if (room > 0) {
+            const addThis = Math.min(toDistribute, room);
+            next[item.id] = current + addThis;
+            toDistribute -= addThis;
+          }
+        }
+        return next;
+      });
+
+      setPackingScanSuccess(`✓ Validasi SKU ${matchingItems[0].skuId} (${matchingItems[0].skuName}) (+${actualAdd} Pcs)`);
+      setPackingScanError(null);
+      setPackingManualCode('');
+      triggerBeep();
       return;
     }
     if (!SERVER_SCAN_ENABLED || !packingTask || !packingReady || !barcode) {
@@ -764,6 +833,49 @@ TOTAL QTY     : ${lastPackedOrder.totalQty} pcs
       triggerErrorSound();
     } finally { packingBusyRef.current = false; setPackingBusy(false); }
   };
+
+  const handleSetSkuQuantity = (items: OutboundItem[], targetQty: number) => {
+    const totalOrderQty = items.reduce((sum, i) => sum + i.qty, 0);
+    const clampedQty = Math.max(0, Math.min(targetQty, totalOrderQty));
+    let remainingToSet = clampedQty;
+
+    setPackingScannedQty(prev => {
+      const next = { ...prev };
+      for (const item of items) {
+        const take = Math.min(remainingToSet, item.qty);
+        next[item.id] = take;
+        remainingToSet -= take;
+      }
+      return next;
+    });
+
+    const skuId = items[0]?.skuId || 'SKU';
+    setPackingScanSuccess(`✓ Validasi Manual SKU ${skuId}: ${clampedQty} / ${totalOrderQty} pcs.`);
+    setPackingScanError(null);
+    setEditingSkuQty(null);
+    triggerBeep();
+  };
+
+  const handleValidateAllSkus = () => {
+    const activeOrder = pendingOrders.find(ord => ord.referenceNumber === activePackingRef);
+    if (!activeOrder) return;
+
+    const nextScanned: { [id: string]: number } = {};
+    activeOrder.items.forEach(item => {
+      nextScanned[item.id] = item.qty;
+    });
+
+    setPackingScannedQty(nextScanned);
+    setPackingScanSuccess(`✓ Mode B2B: Seluruh SKU order ${activePackingRef} divalidasi 100% (${activeOrder.totalQty} pcs).`);
+    setPackingScanError(null);
+    triggerBeep();
+  };
+
+  const handleResetAllSkus = () => {
+    setPackingScannedQty({});
+    setPackingScanSuccess('Status validasi scan dikosongkan kembali ke 0 pcs.');
+    setPackingScanError(null);
+  };
   const handleRecoverPacking = async () => {
     if (packingBusyRef.current || !SERVER_SCAN_ENABLED || !packingTask) return;
     packingBusyRef.current = true; setPackingBusy(true); setPackingReady(false);
@@ -774,19 +886,25 @@ TOTAL QTY     : ${lastPackedOrder.totalQty} pcs
   };
   const confirmPackingCompleted = async () => {
     if (!SERVER_SCAN_ENABLED) {
-      const activeOrder = pendingOrders.find(ord => ord.referenceNumber === activePackingRef);
-      if (!activeOrder || !onEditOrderHistoryBatch) return;
-
-      const updatedItems = activeOrder.items.map(item => ({
+      const ref = packingTask?.reference;
+      const activeOrder = ref ? pendingOrders.find(ord => ord.referenceNumber === ref) : undefined;
+      if (!activeOrder || !activeOrder.items?.length || !activeOrder.items.every((item: OutboundItem) => (packingScannedQty[item.id] || 0) >= item.qty)) {
+        setPackingScanSuccess(null);
+        setPackingScanError(scanServerUnavailable);
+        triggerErrorSound();
+        return;
+      }
+      if (!onEditOrderHistoryBatch) return;
+      const updatedItems = activeOrder.items.map((item: OutboundItem) => ({
         ...item,
         status: 'Completed' as const,
         scanned: true
       }));
-
-      const success = await onEditOrderHistoryBatch(activePackingRef, updatedItems, false);
+      const success = await onEditOrderHistoryBatch(ref, updatedItems, false);
       if (success) {
         setLastPackedOrder(activeOrder);
         setActivePackingRef(null);
+        setPackingTask(null);
         setPackingScannedQty({});
         setPackingFinished(true);
         setPackingScanSuccess('✓ Validasi Packing & Scan selesai. Status dokumen diubah ke Completed.');
@@ -1249,7 +1367,11 @@ TOTAL QTY     : ${lastPackedOrder.totalQty} pcs
           status: requirePacking ? 'Pending' : 'Completed',
           picked: !requirePacking,
           batchNumber: batchNumberInput.trim() || refNumber,
-          warehouseId: targetWarehouseId
+          warehouseId: targetWarehouseId,
+          ...(channelMode ? {
+            orderType: channelMode,
+            orderSource: channelMode === 'ONLINE' ? 'MANUAL_ONLINE' : 'MANUAL_B2B',
+          } : {}),
         };
         if (orderNumber.trim()) outItem.orderNumber = orderNumber.trim();
         if (noPo.trim()) outItem.noPo = noPo.trim();
@@ -1330,6 +1452,25 @@ TOTAL QTY     : ${lastPackedOrder.totalQty} pcs
   const validCount = parsedRows.filter(r => r.isValid).length;
   const invalidCount = parsedRows.filter(r => !r.isValid).length;
 
+  const bulkIssueStage: 'Picking' | 'Packing' = activeModeTab === 'validate' ? 'Packing' : 'Picking';
+  const bulkIssueRef = activeModeTab === 'validate' ? activePackingRef : activePickerRef;
+
+  const handleReportBulkIssue = async (
+    reference: string,
+    report: Exclude<OrderIssueReportInput, { resolveBy: string }>
+  ) => {
+    if (!onUpdateOrderSession) {
+      throw new Error('Fungsi simpan kendala order belum tersedia.');
+    }
+    const saved = await onUpdateOrderSession(reference, { issueReport: report });
+    if (!saved) {
+      throw new Error('Laporan kendala gagal disimpan. Periksa koneksi dan muat ulang order.');
+    }
+    const msg = `Kendala order ${reference} (${report.type}) tercatat ke Laporan Exception Supervisor.`;
+    if (activeModeTab === 'validate') setPackingScanSuccess(msg);
+    else setPickingFeedback(msg);
+  };
+
   return (
     <div className="space-y-6">
       {pickingFeedback&&<p role="alert" className="rounded-lg border border-red-300 bg-red-50 p-3 text-sm text-red-800">{pickingFeedback}</p>}
@@ -1338,7 +1479,7 @@ TOTAL QTY     : ${lastPackedOrder.totalQty} pcs
       {/* Warehouse Selector */}
       <div className="bg-[#11141B] p-4 rounded-xl border border-slate-800 flex items-center justify-between">
         <div className="flex items-center gap-3">
-          <label className="text-xs font-bold text-slate-400 uppercase">Pilih Gudang Asal:</label>
+          <label className="text-xs font-bold text-slate-400 uppercase">{language === 'en' ? 'Select Source Warehouse:' : 'Pilih Gudang Asal:'}</label>
           <select
             value={selectedWarehouseId}
             onChange={(e) => {
@@ -1362,7 +1503,7 @@ TOTAL QTY     : ${lastPackedOrder.totalQty} pcs
       {/* High-level Role-based Navigation Tabs */}
       <div className="flex flex-col sm:flex-row sm:items-center justify-between border-b border-slate-800 pb-4 gap-4">
         <div className="flex flex-wrap gap-2">
-          {currentUser?.role !== 'Packer' && currentUser?.role !== 'Picker' && currentUser?.role !== 'Shipping' && (
+          {(!allowedModes || allowedModes.includes('create')) && currentUser?.role !== 'Packer' && currentUser?.role !== 'Picker' && currentUser?.role !== 'Shipping' && (
             <button
               onClick={() => setActiveModeTab('create')}
               className={`px-4 py-2 text-xs font-bold rounded-lg transition-all border flex items-center gap-2 cursor-pointer ${
@@ -1372,11 +1513,11 @@ TOTAL QTY     : ${lastPackedOrder.totalQty} pcs
               }`}
             >
               <ClipboardList className="w-4 h-4" />
-              <span>1. Input Order Baru (Admin)</span>
+              <span>{language === 'en' ? '1. New Order Input (Admin)' : '1. Input Order Baru (Admin)'}</span>
             </button>
           )}
 
-          {currentUser?.role !== 'Packer' && currentUser?.role !== 'Shipping' && (
+          {(!allowedModes || allowedModes.includes('pick')) && currentUser?.role !== 'Packer' && currentUser?.role !== 'Shipping' && (
             <button
               onClick={() => setActiveModeTab('pick')}
               className={`px-4 py-2 text-xs font-bold rounded-lg transition-all border flex items-center gap-2 cursor-pointer relative ${
@@ -1386,7 +1527,7 @@ TOTAL QTY     : ${lastPackedOrder.totalQty} pcs
               }`}
             >
               <Layers className="w-4 h-4 text-amber-400" />
-              <span>2. Pengambilan Barang (Picker)</span>
+              <span>{allowedModes && !allowedModes.includes('create') ? (language === 'en' ? '1. Order Picking (Picker)' : '1. Pengambilan Barang (Picker)') : (language === 'en' ? '2. Order Picking (Picker)' : '2. Pengambilan Barang (Picker)')}</span>
               {pendingOrders.filter(o => !o.isPicked).length > 0 && (
                 <span className="absolute -top-1.5 -right-1.5 flex h-4 w-4 items-center justify-center rounded-full bg-amber-500 text-[10px] font-bold text-slate-950 shadow-sm animate-pulse">
                   {pendingOrders.filter(o => !o.isPicked).length}
@@ -1395,7 +1536,7 @@ TOTAL QTY     : ${lastPackedOrder.totalQty} pcs
             </button>
           )}
 
-          {currentUser?.role !== 'Picker' && currentUser?.role !== 'Shipping' && (
+          {(!allowedModes || allowedModes.includes('validate')) && currentUser?.role !== 'Picker' && currentUser?.role !== 'Shipping' && (
             <button
               onClick={() => setActiveModeTab('validate')}
               className={`px-4 py-2 text-xs font-bold rounded-lg transition-all border flex items-center gap-2 cursor-pointer relative ${
@@ -1405,7 +1546,7 @@ TOTAL QTY     : ${lastPackedOrder.totalQty} pcs
               }`}
             >
               <Scan className="w-4 h-4 text-emerald-400" />
-              <span>3. Validasi Packing & Scan (Packer)</span>
+              <span>{allowedModes && !allowedModes.includes('pick') ? (language === 'en' ? '1. Packing Validation & Scan (Packer)' : '1. Validasi Packing & Scan (Packer)') : (allowedModes && !allowedModes.includes('create') ? (language === 'en' ? '2. Packing Validation & Scan (Packer)' : '2. Validasi Packing & Scan (Packer)') : (language === 'en' ? '3. Packing Validation & Scan (Packer)' : '3. Validasi Packing & Scan (Packer)'))}</span>
               {pendingOrders.filter(o => o.isPicked).length > 0 && (
                 <span className="absolute -top-1.5 -right-1.5 flex h-4 w-4 items-center justify-center rounded-full bg-emerald-500 text-[10px] font-bold text-slate-950 shadow-sm animate-pulse">
                   {pendingOrders.filter(o => o.isPicked).length}
@@ -1414,7 +1555,7 @@ TOTAL QTY     : ${lastPackedOrder.totalQty} pcs
             </button>
           )}
 
-          {currentUser?.role !== 'Packer' && currentUser?.role !== 'Picker' && (
+          {(!allowedModes || allowedModes.includes('history')) && currentUser?.role !== 'Packer' && currentUser?.role !== 'Picker' && currentUser?.role !== 'Shipping' && (
             <button
               onClick={() => setActiveModeTab('history')}
               className={`px-4 py-2 text-xs font-bold rounded-lg transition-all border flex items-center gap-2 cursor-pointer relative ${
@@ -1424,26 +1565,7 @@ TOTAL QTY     : ${lastPackedOrder.totalQty} pcs
               }`}
             >
               <History className="w-4 h-4 text-emerald-450" />
-              <span>4. Riwayat Order</span>
-            </button>
-          )}
-
-          {currentUser?.role !== 'Picker' && (
-            <button
-              onClick={() => setActiveModeTab('manifest')}
-              className={`px-4 py-2 text-xs font-bold rounded-lg transition-all border flex items-center gap-2 cursor-pointer relative ${
-                activeModeTab === 'manifest'
-                  ? 'bg-emerald-500 text-slate-950 border-emerald-500 shadow-md'
-                  : 'text-slate-400 hover:text-white bg-[#11141B] border-slate-800/80'
-              }`}
-            >
-              <Truck className="w-4 h-4 text-amber-400" />
-              <span>5. Manifest Ekspedisi</span>
-              {unmanifestedCompletedCount > 0 && (
-                <span className="absolute -top-1.5 -right-1.5 flex h-4 w-4 items-center justify-center rounded-full bg-emerald-500 text-[10px] font-bold text-slate-950 shadow-sm">
-                  {unmanifestedCompletedCount}
-                </span>
-              )}
+              <span>{allowedModes && !allowedModes.includes('pick') ? (language === 'en' ? '2. Order History' : '2. Riwayat Order') : (language === 'en' ? '4. Order History' : '4. Riwayat Order')}</span>
             </button>
           )}
         </div>
@@ -1461,7 +1583,7 @@ TOTAL QTY     : ${lastPackedOrder.totalQty} pcs
           {/* Dynamic Header */}
       <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
         <div>
-          <h2 className="text-xl font-extrabold text-white tracking-tight">Penginputan Outbound Massal</h2>
+          <h2 className="text-xl font-extrabold text-white tracking-tight">{language === 'en' ? 'Bulk Outbound Input' : 'Penginputan Outbound Massal'}</h2>
           <p className="text-xs text-slate-400 mt-1">
             Salin & tempel baris dari Microsoft Excel/Google Sheets untuk penulisan data outbound dan otomatisasi alokasi lokasi rute picker.
           </p>
@@ -1474,7 +1596,22 @@ TOTAL QTY     : ${lastPackedOrder.totalQty} pcs
         </div>
       </div>
 
-      {['Administrator', 'Admin'].includes(currentUser?.role || '') && <OrderFileImport stock={stock} orderHistory={orderHistory} warehouseId={selectedWarehouseId || 'WH-CENTRAL'} />}
+      {['Administrator', 'Admin'].includes(currentUser?.role || '') && onAssignOrderType && (
+        <UnassignedOrdersBanner
+          orderHistory={orderHistory}
+          currentUser={currentUser || null}
+          onAssignOrderType={onAssignOrderType}
+        />
+      )}
+
+      {['Administrator', 'Admin'].includes(currentUser?.role || '') && (
+        <OrderFileImport
+          stock={stock}
+          orderHistory={orderHistory}
+          warehouseId={selectedWarehouseId || 'WH-CENTRAL'}
+          defaultOrderType={channelMode}
+        />
+      )}
 
       {/* Instructions Panel */}
       {showInstructions && (
@@ -1521,7 +1658,7 @@ TOTAL QTY     : ${lastPackedOrder.totalQty} pcs
                 <div>
                   <label className="block text-[10px] font-bold text-indigo-400 uppercase mb-1 flex items-center gap-1">
                     <Boxes className="w-3 h-3" />
-                    <span>Nomor Batch</span>
+                    <span>{language === 'en' ? 'Batch Number' : 'Nomor Batch'}</span>
                   </label>
                   <input
                     type="text"
@@ -1566,8 +1703,8 @@ TOTAL QTY     : ${lastPackedOrder.totalQty} pcs
                     className="rounded border-slate-800 text-emerald-500 focus:ring-emerald-500 bg-[#161B25] w-4 h-4 cursor-pointer"
                   />
                   <div>
-                    <span className="text-xs font-bold text-slate-300">Draft · menunggu pengambilan (picking) dan pengemasan (packing)</span>
-                    <p className="text-[10px] text-slate-400 leading-none mt-0.5">Stok belum terpotong. Stok akan terpotong setelah Picker menyelesaikan proses picking.</p>
+                    <span className="text-xs font-bold text-slate-300">{language === 'en' ? 'Draft · waiting for picking and packing' : 'Draft · menunggu pengambilan (picking) dan pengemasan (packing)'}</span>
+                    <p className="text-[10px] text-slate-400 leading-none mt-0.5">{language === 'en' ? 'Stock is not deducted yet. It will be deducted after the Picker completes picking.' : 'Stok belum terpotong. Stok akan terpotong setelah Picker menyelesaikan proses picking.'}</p>
                   </div>
                 </label>
               </div>
@@ -2016,19 +2153,57 @@ TOTAL QTY     : ${lastPackedOrder.totalQty} pcs
                 </div>
               </div>
 
-              {pickerPendingOrders.length === 0 ? (
+              {!channelMode && (
+              <div className="flex items-center justify-between gap-3 flex-wrap bg-[#161B25] p-2.5 rounded-xl border border-slate-800 text-xs">
+                <div className="flex items-center gap-1.5 flex-wrap">
+                  <span className="text-[11px] font-bold text-slate-400 px-1">Kanal:</span>
+                  <button
+                    type="button"
+                    onClick={() => setOutboundChannelFilter('all')}
+                    className={`px-3 py-1 rounded-lg font-bold transition-all cursor-pointer ${outboundChannelFilter === 'all' ? 'bg-emerald-500 text-slate-950 shadow-sm' : 'text-slate-400 hover:text-white'}`}
+                  >
+                    Semua ({pickerPendingOrders.length})
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setOutboundChannelFilter('b2b')}
+                    className={`px-3 py-1 rounded-lg font-bold transition-all cursor-pointer ${outboundChannelFilter === 'b2b' ? 'bg-indigo-600 text-white shadow-sm' : 'text-slate-400 hover:text-white'}`}
+                  >
+                    Khusus B2B ({pickerPendingOrders.filter(isOrderB2b).length})
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setOutboundChannelFilter('online')}
+                    className={`px-3 py-1 rounded-lg font-bold transition-all cursor-pointer ${outboundChannelFilter === 'online' ? 'bg-slate-700 text-slate-200 shadow-sm' : 'text-slate-400 hover:text-white'}`}
+                  >
+                    Online ({pickerPendingOrders.filter(isOrderOnline).length})
+                  </button>
+                </div>
+                {outboundChannelFilter === 'b2b' && (
+                  <span className="text-[11px] text-indigo-300 font-semibold px-2">
+                    ✓ Menampilkan order dengan klasifikasi B2B terverifikasi
+                  </span>
+                )}
+              </div>
+              )}
+
+              {filteredPickerPendingOrders.length === 0 ? (
                 <div className="bg-[#11141B] border border-slate-800/60 rounded-xl p-12 text-center shadow-lg">
                   <div className="inline-flex p-4 rounded-full bg-emerald-500/10 border border-emerald-500/20 text-emerald-400 mb-4">
                     <PackageCheck className="w-10 h-10" />
                   </div>
-                  <h4 className="text-sm font-bold text-slate-200">Semua Order Berhasil Dipick!</h4>
+                  <h4 className="text-sm font-bold text-slate-200">
+                    {channelMode === 'B2B' || outboundChannelFilter === 'b2b' ? 'Tidak Ada Antrean Order B2B yang Perlu Dipick' : 'Semua Order Berhasil Dipick!'}
+                  </h4>
                   <p className="text-xs text-slate-500 mt-1 max-w-md mx-auto">
-                    Tidak ada antrean picking pending saat ini. Silakan berkoordinasi dengan tim packer.
+                    {channelMode === 'B2B' || outboundChannelFilter === 'b2b'
+                      ? 'Seluruh order berstatus B2B telah selesai dipick atau belum ada order B2B baru.'
+                      : 'Tidak ada antrean picking pending saat ini. Silakan berkoordinasi dengan tim packer.'}
                   </p>
                 </div>
               ) : (
                 <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                  {pickerPendingOrders.map((ord) => {
+                  {filteredPickerPendingOrders.map((ord) => {
                     const myName = currentUser?.fullName || currentUser?.username || 'User';
                     const isBeingPickedByOther = ord.pickingBy && ord.pickingBy !== myName && activePickerRef !== ord.referenceNumber;
 
@@ -2039,9 +2214,16 @@ TOTAL QTY     : ${lastPackedOrder.totalQty} pcs
                       >
                         <div className="space-y-3">
                           <div className="flex items-center justify-between gap-2 flex-wrap">
-                            <span className="font-mono text-xs font-black text-emerald-400 bg-emerald-500/10 px-2.5 py-1 rounded-md border border-emerald-500/20">
-                              {ord.referenceNumber}
-                            </span>
+                            <div className="flex items-center gap-2">
+                              <span className="font-mono text-xs font-black text-emerald-400 bg-emerald-500/10 px-2.5 py-1 rounded-md border border-emerald-500/20">
+                                {ord.referenceNumber}
+                              </span>
+                              {isOrderB2b(ord) && (
+                                <span className="px-2 py-0.5 rounded-full text-[9px] font-black uppercase bg-indigo-500/20 text-indigo-300 border border-indigo-500/40">
+                                  B2B{ord.noPo ? ` · PO: ${ord.noPo}` : ''}
+                                </span>
+                              )}
+                            </div>
                             <div className="flex items-center gap-1.5 flex-wrap">
                               {ord.pickingBy && (
                                 <span className="px-2.5 py-0.5 rounded-full text-[9px] font-extrabold uppercase bg-sky-500/15 text-sky-400 border border-sky-500/30 flex items-center gap-1 animate-pulse">
@@ -2155,19 +2337,51 @@ TOTAL QTY     : ${lastPackedOrder.totalQty} pcs
               });
 
               return (
-                <div className="relative pb-24 lg:pb-0">
+                <div
+                  className={
+                    operatorFocusMode
+                      ? 'fixed inset-0 z-[70] bg-[#0A0C10] p-4 sm:p-6 overflow-y-auto pb-28 wms-focus-mode'
+                      : 'relative pb-24 lg:pb-0'
+                  }
+                >
                   <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 animate-in fade-in duration-200">
                   {/* Left Column: List of items to pick */}
                   <div className="lg:col-span-8 space-y-4">
                     <div className="bg-[#11141B] rounded-xl border border-slate-800 p-4 sm:p-5 space-y-4">
-                      <div className="flex items-center justify-between border-b border-slate-800 pb-3">
-                        <button
-                          onClick={handleCancelPicking}
-                          className="px-3 py-1.5 bg-slate-800 hover:bg-slate-750 text-slate-300 text-xs font-bold rounded-lg transition-colors flex items-center gap-1.5 cursor-pointer"
-                        >
-                          <ArrowLeft className="w-4 h-4" />
-                          Kembali
-                        </button>
+                      <div className="flex flex-wrap items-center justify-between gap-2 border-b border-slate-800 pb-3">
+                        <div className="flex items-center gap-2 flex-wrap">
+                          <button
+                            onClick={handleCancelPicking}
+                            className="px-3 py-1.5 bg-slate-800 hover:bg-slate-750 text-slate-300 text-xs font-bold rounded-lg transition-colors flex items-center gap-1.5 cursor-pointer"
+                          >
+                            <ArrowLeft className="w-4 h-4" />
+                            Kembali
+                          </button>
+                          {onUpdateOrderSession && (
+                            <button
+                              type="button"
+                              onClick={() => setIssueModalOpen(true)}
+                              className="px-3 py-1.5 bg-rose-500/15 hover:bg-rose-500/25 text-rose-300 border border-rose-500/30 text-xs font-bold rounded-lg transition-colors flex items-center gap-1.5 cursor-pointer"
+                              title="Laporkan stok kurang atau barang rusak ke Supervisor"
+                            >
+                              <AlertTriangle className="w-3.5 h-3.5" />
+                              Lapor Kendala
+                            </button>
+                          )}
+                          <button
+                            type="button"
+                            onClick={toggleOperatorFocusMode}
+                            className={`px-3 py-1.5 text-xs font-bold rounded-lg border flex items-center gap-1.5 cursor-pointer transition-colors ${
+                              operatorFocusMode
+                                ? 'bg-emerald-500 text-slate-950 border-emerald-400'
+                                : 'bg-slate-800 hover:bg-slate-750 text-slate-300 border-slate-700'
+                            }`}
+                            title={operatorFocusMode ? 'Keluar Mode Fokus (Esc)' : 'Aktifkan Mode Fokus Operator'}
+                          >
+                            {operatorFocusMode ? <Minimize2 className="w-3.5 h-3.5" /> : <Maximize2 className="w-3.5 h-3.5 text-emerald-400" />}
+                            <span>{operatorFocusMode ? 'Keluar Fokus (Esc)' : 'Mode Fokus'}</span>
+                          </button>
+                        </div>
 
                         {/* Hide Confirmed Toggle */}
                         <label className="flex items-center gap-2 cursor-pointer select-none text-xs text-slate-400 hover:text-white font-medium bg-[#161B25] px-3 py-1.5 rounded-lg border border-slate-850">
@@ -2630,19 +2844,57 @@ TOTAL QTY     : ${lastPackedOrder.totalQty} pcs
                 </div>
               </div>
 
-              {packerPendingOrders.length === 0 ? (
+              {!channelMode && (
+              <div className="flex items-center justify-between gap-3 flex-wrap bg-[#161B25] p-2.5 rounded-xl border border-slate-800 text-xs">
+                <div className="flex items-center gap-1.5 flex-wrap">
+                  <span className="text-[11px] font-bold text-slate-400 px-1">Kanal:</span>
+                  <button
+                    type="button"
+                    onClick={() => setOutboundChannelFilter('all')}
+                    className={`px-3 py-1 rounded-lg font-bold transition-all cursor-pointer ${outboundChannelFilter === 'all' ? 'bg-emerald-500 text-slate-950 shadow-sm' : 'text-slate-400 hover:text-white'}`}
+                  >
+                    Semua ({packerPendingOrders.length})
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setOutboundChannelFilter('b2b')}
+                    className={`px-3 py-1 rounded-lg font-bold transition-all cursor-pointer ${outboundChannelFilter === 'b2b' ? 'bg-indigo-600 text-white shadow-sm' : 'text-slate-400 hover:text-white'}`}
+                  >
+                    Khusus B2B ({packerPendingOrders.filter(isOrderB2b).length})
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setOutboundChannelFilter('online')}
+                    className={`px-3 py-1 rounded-lg font-bold transition-all cursor-pointer ${outboundChannelFilter === 'online' ? 'bg-slate-700 text-slate-200 shadow-sm' : 'text-slate-400 hover:text-white'}`}
+                  >
+                    Online ({packerPendingOrders.filter(isOrderOnline).length})
+                  </button>
+                </div>
+                {outboundChannelFilter === 'b2b' && (
+                  <span className="text-[11px] text-indigo-300 font-semibold px-2">
+                    ✓ Menampilkan order dengan klasifikasi B2B terverifikasi
+                  </span>
+                )}
+              </div>
+              )}
+
+              {filteredPackerPendingOrders.length === 0 ? (
                 <div className="bg-[#11141B] border border-slate-800/60 rounded-xl p-12 text-center shadow-lg">
                   <div className="inline-flex p-4 rounded-full bg-emerald-500/10 border border-emerald-500/20 text-emerald-400 mb-4">
                     <PackageCheck className="w-10 h-10" />
                   </div>
-                  <h4 className="text-sm font-bold text-slate-200">Luar Biasa! Semua Order Telah Selesai Dikemas</h4>
+                  <h4 className="text-sm font-bold text-slate-200">
+                    {channelMode === 'B2B' || outboundChannelFilter === 'b2b' ? 'Tidak Ada Antrean Order B2B yang Siap Dikemas' : 'Luar Biasa! Semua Order Telah Selesai Dikemas'}
+                  </h4>
                   <p className="text-xs text-slate-500 mt-1 max-w-md mx-auto">
-                    Tidak ada antrean order outbound berstatus Siap dikemas saat ini. Pekerjaan Anda terselesaikan dengan rapi!
+                    {channelMode === 'B2B' || outboundChannelFilter === 'b2b'
+                      ? 'Seluruh order berstatus B2B telah selesai dikemas atau belum ada order yang selesai dipick.'
+                      : 'Tidak ada antrean order outbound berstatus Siap dikemas saat ini. Pekerjaan Anda terselesaikan dengan rapi!'}
                   </p>
                 </div>
               ) : (
                 <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                  {packerPendingOrders.map((ord) => {
+                  {filteredPackerPendingOrders.map((ord) => {
                     return (
                       <div 
                         key={ord.referenceNumber}
@@ -2650,9 +2902,16 @@ TOTAL QTY     : ${lastPackedOrder.totalQty} pcs
                       >
                         <div className="space-y-3">
                           <div className="flex items-center justify-between gap-2 flex-wrap">
-                            <span className="font-mono text-xs font-black text-emerald-400 bg-emerald-500/10 px-2.5 py-1 rounded-md border border-emerald-500/20">
-                              {ord.referenceNumber}
-                            </span>
+                            <div className="flex items-center gap-2">
+                              <span className="font-mono text-xs font-black text-emerald-400 bg-emerald-500/10 px-2.5 py-1 rounded-md border border-emerald-500/20">
+                                {ord.referenceNumber}
+                              </span>
+                              {isOrderB2b(ord) && (
+                                <span className="px-2 py-0.5 rounded-full text-[9px] font-black uppercase bg-indigo-500/20 text-indigo-300 border border-indigo-500/40">
+                                  B2B{ord.noPo ? ` · PO: ${ord.noPo}` : ''}
+                                </span>
+                              )}
+                            </div>
                             <div className="flex items-center gap-1.5 flex-wrap">
                               {ord.packingBy && (
                                 <span className="px-2.5 py-0.5 rounded-full text-[9px] font-extrabold uppercase bg-purple-500/15 text-purple-300 border border-purple-500/30 flex items-center gap-1 animate-pulse">
@@ -2807,26 +3066,90 @@ TOTAL QTY     : ${lastPackedOrder.totalQty} pcs
               const isFullyPacked = completedSkuCount === totalOrderLines;
 
               return (
+                <div
+                  className={
+                    operatorFocusMode
+                      ? 'fixed inset-0 z-[70] bg-[#0A0C10] p-4 sm:p-6 overflow-y-auto wms-focus-mode'
+                      : ''
+                  }
+                >
                 <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 animate-in zoom-in-95 duration-150">
-                  <div className="lg:col-span-12 rounded-xl bg-slate-900 border border-slate-800 p-3 text-xs font-bold text-slate-300 flex items-center justify-between">
-                    <span className="flex items-center gap-1.5 text-emerald-400">
-                      <CheckCircle className="w-4 h-4" />
-                      Stasiun Packing Aktif — Validasi barcode fisik 100% sebelum serah terima kurir.
-                    </span>
-                    <span className="font-mono text-amber-400 text-[11px] hidden sm:inline">
-                      Alur Rak Gudang: {describeRouteConfig(activeRouteConfig)} ({activeWarehouse?.name})
-                    </span>
+                  <div className="lg:col-span-12 rounded-xl bg-slate-900 border border-slate-800 p-4 text-xs text-slate-300 flex flex-col md:flex-row md:items-center justify-between gap-3 shadow-md">
+                    <div className="flex items-center gap-3">
+                      <div className="p-2 bg-amber-500/10 text-amber-400 rounded-xl border border-amber-500/20 shrink-0">
+                        <Zap className="w-5 h-5" />
+                      </div>
+                      <div>
+                        <div className="flex items-center gap-2 flex-wrap">
+                          <span className="font-extrabold text-white text-sm">Validasi Packing Outbound B2B (Grosir)</span>
+                          <span className="px-2 py-0.5 rounded-full text-[9px] font-black uppercase bg-emerald-500/15 text-emerald-300 border border-emerald-500/30">
+                            Validasi Manual & Bulk Aktif
+                          </span>
+                        </div>
+                        <p className="text-[11px] text-slate-400 mt-0.5">
+                          Order B2B dengan kuantitas besar dapat divalidasi langsung per SKU atau seluruh order sekaligus tanpa harus scan satu per satu.
+                        </p>
+                      </div>
+                    </div>
+                    <div className="flex items-center gap-2 shrink-0 flex-wrap">
+                      <button
+                        type="button"
+                        onClick={handleValidateAllSkus}
+                        className="px-4 py-2 bg-gradient-to-r from-emerald-500 to-teal-500 hover:from-emerald-400 hover:to-teal-400 text-slate-950 text-xs font-black rounded-xl flex items-center gap-1.5 shadow-md shadow-emerald-500/20 transition-all cursor-pointer"
+                        title="Validasi semua kuantitas SKU sesuai order sekaligus"
+                      >
+                        <CheckCheck className="w-4 h-4 stroke-[2.5]" />
+                        Validasi Semua Sesuai (B2B)
+                      </button>
+                      {totalScannedPcs > 0 && (
+                        <button
+                          type="button"
+                          onClick={handleResetAllSkus}
+                          className="px-3.5 py-2 bg-slate-800 hover:bg-slate-700 text-slate-300 text-xs font-bold rounded-xl flex items-center gap-1.5 transition-colors cursor-pointer border border-slate-700"
+                          title="Kosongkan hitungan validasi"
+                        >
+                          <RotateCcw className="w-3.5 h-3.5" />
+                          Reset Semua
+                        </button>
+                      )}
+                    </div>
                   </div>
                   {/* Left Column: Items Checklist */}
                   <div className="lg:col-span-7 space-y-4">
-                    <div className="bg-[#11141B] rounded-xl p-5 border border-slate-800/60 shadow-md flex items-center justify-between">
-                      <button
-                        onClick={cancelPacking}
-                        className="px-3 py-1.5 bg-slate-800 hover:bg-slate-700 text-slate-300 rounded-lg text-xs font-bold flex items-center gap-1.5 transition-colors cursor-pointer"
-                      >
-                        <ArrowLeft className="w-3.5 h-3.5" />
-                        Kembali
-                      </button>
+                    <div className="bg-[#11141B] rounded-xl p-5 border border-slate-800/60 shadow-md flex flex-wrap items-center justify-between gap-2">
+                      <div className="flex items-center gap-2 flex-wrap">
+                        <button
+                          onClick={cancelPacking}
+                          className="px-3 py-1.5 bg-slate-800 hover:bg-slate-700 text-slate-300 rounded-lg text-xs font-bold flex items-center gap-1.5 transition-colors cursor-pointer"
+                        >
+                          <ArrowLeft className="w-3.5 h-3.5" />
+                          Kembali
+                        </button>
+                        {onUpdateOrderSession && (
+                          <button
+                            type="button"
+                            onClick={() => setIssueModalOpen(true)}
+                            className="px-3 py-1.5 bg-rose-500/15 hover:bg-rose-500/25 text-rose-300 border border-rose-500/30 rounded-lg text-xs font-bold flex items-center gap-1.5 cursor-pointer"
+                            title="Laporkan stok kurang atau barang rusak ke Supervisor"
+                          >
+                            <AlertTriangle className="w-3.5 h-3.5" />
+                            Lapor Kendala
+                          </button>
+                        )}
+                        <button
+                          type="button"
+                          onClick={toggleOperatorFocusMode}
+                          className={`px-3 py-1.5 text-xs font-bold rounded-lg border flex items-center gap-1.5 cursor-pointer transition-colors ${
+                            operatorFocusMode
+                              ? 'bg-emerald-500 text-slate-950 border-emerald-400'
+                              : 'bg-slate-800 hover:bg-slate-700 text-slate-300 border-slate-700'
+                          }`}
+                          title={operatorFocusMode ? 'Keluar Mode Fokus (Esc)' : 'Aktifkan Mode Fokus Operator'}
+                        >
+                          {operatorFocusMode ? <Minimize2 className="w-3.5 h-3.5" /> : <Maximize2 className="w-3.5 h-3.5 text-emerald-400" />}
+                          <span>{operatorFocusMode ? 'Keluar Fokus (Esc)' : 'Mode Fokus'}</span>
+                        </button>
+                      </div>
                       <div className="text-right">
                         <span className="text-[10px] font-bold text-slate-550 uppercase">PACKING STATION ORDER</span>
                         <h4 className="font-mono text-sm font-black text-emerald-400">{activePackingRef}</h4>
@@ -2834,8 +3157,33 @@ TOTAL QTY     : ${lastPackedOrder.totalQty} pcs
                     </div>
 
                     <div className="bg-[#11141B] rounded-xl border border-slate-800/60 overflow-hidden shadow-md">
-                      <div className="bg-[#151922] px-5 py-3 border-b border-slate-800/80 flex justify-between items-center">
-                        <h3 className="text-xs font-bold text-slate-300 uppercase tracking-wider">SKU yang Harus Dikemas</h3>
+                      <div className="bg-[#151922] px-5 py-3 border-b border-slate-800/80 flex flex-wrap justify-between items-center gap-2">
+                        <div className="flex items-center gap-2.5 flex-wrap">
+                          <h3 className="text-xs font-bold text-slate-300 uppercase tracking-wider">SKU yang Harus Dikemas</h3>
+                          <div className="flex items-center bg-slate-900 border border-slate-800 rounded-lg p-0.5 text-[10px] font-bold">
+                            <button
+                              type="button"
+                              onClick={() => setPackingFilter('all')}
+                              className={`px-2.5 py-0.5 rounded transition-colors cursor-pointer ${packingFilter === 'all' ? 'bg-slate-800 text-emerald-400 font-black' : 'text-slate-400 hover:text-white'}`}
+                            >
+                              Semua ({totalOrderLines})
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => setPackingFilter('pending')}
+                              className={`px-2.5 py-0.5 rounded transition-colors cursor-pointer ${packingFilter === 'pending' ? 'bg-slate-800 text-amber-400 font-black' : 'text-slate-400 hover:text-white'}`}
+                            >
+                              Belum Selesai ({totalOrderLines - completedSkuCount})
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => setPackingFilter('completed')}
+                              className={`px-2.5 py-0.5 rounded transition-colors cursor-pointer ${packingFilter === 'completed' ? 'bg-slate-800 text-emerald-400 font-black' : 'text-slate-400 hover:text-white'}`}
+                            >
+                              Selesai ({completedSkuCount})
+                            </button>
+                          </div>
+                        </div>
                         <span className="text-xs font-extrabold text-amber-400 font-mono bg-amber-450/5 border border-amber-400/20 px-2.5 py-0.5 rounded">
                           {completedSkuCount} / {totalOrderLines} SKU Terpenuhi
                         </span>
@@ -2843,22 +3191,26 @@ TOTAL QTY     : ${lastPackedOrder.totalQty} pcs
 
                       <div className="p-4 space-y-3.5 max-h-[550px] overflow-y-auto divide-y divide-slate-800/40">
                         {(() => {
-                          const activePackerList = mergedPackerItems.filter(m => {
+                          const displayPackerItems = mergedPackerItems.filter(m => {
                             const sc = m.items.reduce((s, x) => s + (packingScannedQty[x.id] || 0), 0);
-                            return sc < m.totalQty;
+                            if (packingFilter === 'pending') return sc < m.totalQty;
+                            if (packingFilter === 'completed') return sc === m.totalQty;
+                            return true;
                           });
 
-                          if (activePackerList.length === 0) {
+                          if (displayPackerItems.length === 0) {
                             return (
                               <div className="py-12 text-center text-slate-400 flex flex-col items-center justify-center">
                                 <CheckCircle className="w-12 h-12 text-emerald-400 mb-2 animate-bounce" />
-                                <p className="font-bold text-sm text-slate-200">Semua SKU Telah Selesai Dikemas!</p>
+                                <p className="font-bold text-sm text-slate-200">
+                                  {packingFilter === 'pending' ? 'Semua SKU Telah Selesai Dikemas!' : 'Tidak ada item dalam filter ini.'}
+                                </p>
                                 <p className="text-xs text-slate-500 mt-1">Silakan konfirmasi penyelesaian order & cetak resi pada panel sebelah kanan.</p>
                               </div>
                             );
                           }
 
-                          return activePackerList.map((merged) => {
+                          return displayPackerItems.map((merged) => {
                           const scannedVal = merged.items.reduce((sum, sub) => sum + (packingScannedQty[sub.id] || 0), 0);
                           const isDone = scannedVal === merged.totalQty;
                           const percent = Math.min(100, Math.round((scannedVal / merged.totalQty) * 100));
@@ -2966,7 +3318,7 @@ TOTAL QTY     : ${lastPackedOrder.totalQty} pcs
                                 </div>
                               </div>
 
-                              <div className="flex items-center justify-between sm:justify-end gap-4 shrink-0">
+                              <div className="flex flex-col sm:flex-row items-end sm:items-center gap-3 shrink-0">
                                 <div className="text-right space-y-1">
                                   <p className="text-xs font-black font-mono">
                                     <span className={isDone ? "text-emerald-400" : scannedVal > 0 ? "text-amber-400" : "text-slate-400"}>{scannedVal}</span>
@@ -2980,34 +3332,103 @@ TOTAL QTY     : ${lastPackedOrder.totalQty} pcs
                                   </div>
                                 </div>
 
-                                <div className="flex items-center gap-1.5">
-                                  {!isDone && (
+                                {editingSkuQty?.skuId === merged.skuId ? (
+                                  <div className="flex items-center gap-1 bg-slate-900 border border-slate-700 p-1 rounded-lg">
+                                    <input
+                                      type="number"
+                                      min="0"
+                                      max={merged.totalQty}
+                                      value={editingSkuQty.val}
+                                      onChange={(e) => setEditingSkuQty({ skuId: merged.skuId, val: parseInt(e.target.value) || 0 })}
+                                      className="w-16 px-1.5 py-1 bg-slate-950 border border-slate-700 text-white font-mono text-xs font-bold rounded outline-none text-center"
+                                      autoFocus
+                                    />
                                     <button
-                                      disabled
-                                      className="px-2.5 py-1.5 bg-sky-500/10 hover:bg-sky-500 text-sky-400 hover:text-slate-950 border border-sky-500/20 text-[10px] font-bold rounded-lg transition-colors cursor-pointer flex items-center gap-1 shrink-0"
-                                      title="Set kuantitas sesuai order"
+                                      type="button"
+                                      onClick={() => handleSetSkuQuantity(merged.items, editingSkuQty.val)}
+                                      className="p-1 bg-emerald-500 hover:bg-emerald-400 text-slate-950 rounded transition-colors cursor-pointer"
+                                      title="Simpan Kuantitas"
                                     >
-                                      <CheckCircle className="w-3.5 h-3.5" />
-                                      Sesuai
+                                      <Check className="w-3.5 h-3.5 stroke-[2.5]" />
                                     </button>
-                                  )}
+                                    <button
+                                      type="button"
+                                      onClick={() => setEditingSkuQty(null)}
+                                      className="p-1 bg-slate-800 hover:bg-slate-700 text-slate-300 rounded transition-colors cursor-pointer"
+                                      title="Batal"
+                                    >
+                                      <X className="w-3.5 h-3.5" />
+                                    </button>
+                                  </div>
+                                ) : (
+                                  <div className="flex items-center gap-1.5 flex-wrap justify-end">
+                                    {!isDone ? (
+                                      <>
+                                        <button
+                                          type="button"
+                                          onClick={() => handleSetSkuQuantity(merged.items, merged.totalQty)}
+                                          className="px-2.5 py-1.5 bg-emerald-500/15 hover:bg-emerald-500 text-emerald-400 hover:text-slate-950 border border-emerald-500/30 text-[10px] font-black rounded-lg transition-all cursor-pointer flex items-center gap-1 shrink-0 shadow-sm"
+                                          title={`Validasi langsung ${merged.totalQty} pcs (Sesuai Order)`}
+                                        >
+                                          <CheckCircle className="w-3.5 h-3.5" />
+                                          Sesuai ({merged.totalQty})
+                                        </button>
+                                        
+                                        <button
+                                          type="button"
+                                          onClick={() => handlePackingScan(merged.skuId, 1)}
+                                          className="px-2 py-1.5 bg-slate-800 hover:bg-slate-750 text-slate-300 hover:text-white border border-slate-700 text-[10px] font-bold rounded-lg transition-colors cursor-pointer flex items-center gap-0.5 shrink-0"
+                                          title="Tambah +1 pcs"
+                                        >
+                                          +1
+                                        </button>
 
-                                  {!isDone ? (
-                                    <button
-                                      disabled
-                                      className="px-2.5 py-1.5 bg-emerald-500/10 hover:bg-emerald-500 text-emerald-400 hover:text-slate-950 border border-emerald-500/20 text-[10px] font-bold rounded-lg transition-colors cursor-pointer flex items-center gap-1 shrink-0"
-                                      title="Scan +1 SKU"
-                                    >
-                                      <Scan className="w-3.5 h-3.5" />
-                                      Scan +1
-                                    </button>
-                                  ) : (
-                                    <span className="p-1.5 bg-emerald-500/10 border border-emerald-500/20 rounded-lg text-emerald-400 flex items-center justify-center gap-1 text-[10px] font-extrabold shrink-0">
-                                      <Check className="w-3.5 h-3.5 stroke-[3]" />
-                                      Selesai
-                                    </span>
-                                  )}
-                                </div>
+                                        {merged.totalQty >= 10 && (
+                                          <button
+                                            type="button"
+                                            onClick={() => handlePackingScan(merged.skuId, 10)}
+                                            className="px-2 py-1.5 bg-slate-800 hover:bg-slate-750 text-amber-400 hover:text-amber-300 border border-slate-700 text-[10px] font-bold rounded-lg transition-colors cursor-pointer flex items-center gap-0.5 shrink-0"
+                                            title="Tambah +10 pcs"
+                                          >
+                                            +10
+                                          </button>
+                                        )}
+
+                                        <button
+                                          type="button"
+                                          onClick={() => setEditingSkuQty({ skuId: merged.skuId, val: scannedVal || merged.totalQty })}
+                                          className="p-1.5 bg-slate-800 hover:bg-slate-700 text-slate-400 hover:text-white border border-slate-700 rounded-lg transition-colors cursor-pointer shrink-0"
+                                          title="Ketik kuantitas manual"
+                                        >
+                                          <Edit3 className="w-3 h-3" />
+                                        </button>
+                                      </>
+                                    ) : (
+                                      <div className="flex items-center gap-1">
+                                        <span className="px-2.5 py-1 bg-emerald-500/15 border border-emerald-500/30 rounded-lg text-emerald-400 flex items-center justify-center gap-1 text-[10px] font-black shrink-0">
+                                          <Check className="w-3.5 h-3.5 stroke-[3]" />
+                                          Lengkap ({merged.totalQty})
+                                        </span>
+                                        <button
+                                          type="button"
+                                          onClick={() => setEditingSkuQty({ skuId: merged.skuId, val: scannedVal })}
+                                          className="p-1 bg-slate-800 hover:bg-slate-700 text-slate-400 hover:text-white rounded text-[10px] cursor-pointer"
+                                          title="Edit kuantitas"
+                                        >
+                                          <Edit3 className="w-3 h-3" />
+                                        </button>
+                                        <button
+                                          type="button"
+                                          onClick={() => handleSetSkuQuantity(merged.items, 0)}
+                                          className="p-1 bg-rose-500/10 hover:bg-rose-500/20 text-rose-400 rounded text-[10px] cursor-pointer"
+                                          title="Reset SKU ini ke 0"
+                                        >
+                                          <RotateCcw className="w-3 h-3" />
+                                        </button>
+                                      </div>
+                                    )}
+                                  </div>
+                                )}
                               </div>
                             </div>
                           );
@@ -3023,10 +3444,10 @@ TOTAL QTY     : ${lastPackedOrder.totalQty} pcs
                       <div>
                         <h3 className="text-sm font-extrabold text-white flex items-center gap-1.5">
                           <Barcode className="w-4 h-4 text-emerald-400" />
-                          Simulasi Scanner Gun
+                          Simulasi Scanner Gun / Input Cepat
                         </h3>
                         <p className="text-[11px] text-slate-400 mt-1 leading-relaxed">
-                          Arahkan kursor ke input di bawah ini dan tembak barcode barang, atau gunakan tombol pintas untuk simulasi.
+                          Tembak barcode fisik barang atau klik tombol SKU pintasan. Anda juga dapat menentukan jumlah Qty per scan untuk order kartonan/B2B.
                         </p>
                       </div>
 
@@ -3034,7 +3455,7 @@ TOTAL QTY     : ${lastPackedOrder.totalQty} pcs
                       <form 
                         onSubmit={(e) => {
                           e.preventDefault();
-                          void handlePackingScan(packingManualCode);
+                          void handlePackingScan(packingManualCode, packingScanMultiplier);
                         }}
                         className="space-y-3"
                       >
@@ -3043,25 +3464,38 @@ TOTAL QTY     : ${lastPackedOrder.totalQty} pcs
                           <div className="absolute top-1/2 left-0 w-full h-[2px] bg-rose-600/80 shadow-[0_0_10px_#e11d48] animate-pulse z-10"></div>
                           
                           <p className="text-[10px] font-bold text-slate-550 uppercase tracking-widest mb-3 z-0">
-                            LASER BARCODE AKTIF
+                            LASER BARCODE / SCANNER AKTIF
                           </p>
 
-                          <input
-                            type="text"
-                            placeholder="Input SKU / Scan Barcode..."
-                            value={packingManualCode}
-                            disabled={SERVER_SCAN_ENABLED ? (!packingReady || packingBusy) : packingBusy}
-                            onChange={(e) => setPackingManualCode(e.target.value)}
-                            className="relative z-20 w-full px-4 py-3 bg-[#11141B] border border-slate-850 focus:border-emerald-500 focus:ring-1 focus:ring-emerald-500 text-white font-mono text-center text-sm font-bold rounded-lg outline-none placeholder:text-slate-600 shadow-inner"
-                            autoFocus
-                          />
+                          <div className="wms-scan-field relative z-20 w-full flex items-center gap-2">
+                            <input
+                              type="text"
+                              placeholder="Input SKU / Scan Barcode..."
+                              value={packingManualCode}
+                              disabled={SERVER_SCAN_ENABLED ? (!packingReady || packingBusy) : packingBusy}
+                              onChange={(e) => setPackingManualCode(e.target.value)}
+                              className="w-full px-4 py-3 bg-[#11141B] border border-slate-850 focus:border-emerald-500 focus:ring-1 focus:ring-emerald-500 text-white font-mono text-center text-sm font-bold rounded-lg outline-none placeholder:text-slate-600 shadow-inner"
+                              autoFocus
+                            />
+                            <div className="shrink-0 flex items-center gap-1 bg-[#11141B] border border-slate-850 px-2.5 py-2 rounded-lg" title="Jumlah pcs per scan (misal 1 karton/dus)">
+                              <span className="text-[10px] font-bold text-slate-500">Qty:</span>
+                              <input
+                                type="number"
+                                min="1"
+                                value={packingScanMultiplier}
+                                onChange={(e) => setPackingScanMultiplier(Math.max(1, parseInt(e.target.value) || 1))}
+                                className="w-14 bg-transparent text-amber-400 font-mono text-xs font-black text-center outline-none"
+                              />
+                            </div>
+                          </div>
                         </div>
                         <button
                           type="submit"
                           disabled={SERVER_SCAN_ENABLED ? (!packingReady || packingBusy) : packingBusy}
-                          className="w-full py-2 bg-emerald-500 hover:bg-emerald-450 text-slate-950 font-black text-xs rounded-xl tracking-wider uppercase transition-colors cursor-pointer"
+                          className="w-full py-2 bg-emerald-500 hover:bg-emerald-450 text-slate-950 font-black text-xs rounded-xl tracking-wider uppercase transition-colors cursor-pointer flex items-center justify-center gap-1.5"
                         >
-                          Kirim Scan Barcode (Enter)
+                          <Scan className="w-3.5 h-3.5" />
+                          Kirim Scan (+{packingScanMultiplier} Pcs) (Enter)
                         </button>
                       </form>
 
@@ -3096,19 +3530,34 @@ TOTAL QTY     : ${lastPackedOrder.totalQty} pcs
 
                       {/* Cheat sheet buttons of unique SKU codes in order */}
                       <div className="space-y-2 border-t border-slate-800/60 pt-4">
-                        <label className="block text-[10px] font-black text-[#8d9ab3] uppercase tracking-wider">
-                          Daftar SKU Pintasan (Klik untuk Simulasi):
-                        </label>
+                        <div className="flex items-center justify-between">
+                          <label className="block text-[10px] font-black text-[#8d9ab3] uppercase tracking-wider">
+                            Pintasan SKU (Klik untuk Validasi +{packingScanMultiplier}):
+                          </label>
+                        </div>
                         <div className="flex flex-wrap gap-2">
-                          {mergedPackerItems.map(m => m.skuId).map((sku: string) => (
-                            <button
-                              key={sku}
-                              disabled
-                              className="px-3 py-1.5 bg-[#161B25] hover:bg-slate-800 border border-slate-850 hover:border-slate-700 text-slate-300 hover:text-white font-mono text-xs font-bold rounded-lg transition-colors cursor-pointer"
-                            >
-                              {sku}
-                            </button>
-                          ))}
+                          {mergedPackerItems.map(m => m.skuId).map((sku: string) => {
+                            const mItem = mergedPackerItems.find(m => m.skuId === sku);
+                            const sc = mItem?.items.reduce((sum, sub) => sum + (packingScannedQty[sub.id] || 0), 0) || 0;
+                            const isSkuDone = mItem && sc === mItem.totalQty;
+
+                            return (
+                              <button
+                                key={sku}
+                                type="button"
+                                onClick={() => handlePackingScan(sku, packingScanMultiplier)}
+                                className={`px-2.5 py-1.5 border font-mono text-xs font-bold rounded-lg transition-all cursor-pointer flex items-center gap-1 ${
+                                  isSkuDone 
+                                    ? 'bg-emerald-500/10 border-emerald-500/30 text-emerald-400' 
+                                    : 'bg-[#161B25] hover:bg-emerald-500 hover:text-slate-950 border-slate-800 text-slate-300'
+                                }`}
+                                title={`Klik untuk validasi SKU ${sku} (+${packingScanMultiplier} pcs)`}
+                              >
+                                {isSkuDone && <Check className="w-3 h-3 stroke-[2.5]" />}
+                                {sku}
+                              </button>
+                            );
+                          })}
                         </div>
                       </div>
                     </div>
@@ -3149,6 +3598,7 @@ TOTAL QTY     : ${lastPackedOrder.totalQty} pcs
                       )}
                     </div>
                   </div>
+                </div>
                 </div>
               );
             })()
@@ -3421,25 +3871,12 @@ TOTAL QTY     : ${lastPackedOrder.totalQty} pcs
       {activeModeTab === 'history' && (
         <div className="space-y-6 animate-in fade-in duration-200">
           <HistoryOrder
-            orderHistory={orderHistory}
-            currentUser={currentUser}
+            orderHistory={regularOrderHistory}
+            currentUser={currentUser ?? null}
             onEditOrderHistory={onEditOrderHistory}
             onDeleteOrderHistory={onDeleteOrderHistory}
             onDeleteMultipleOrders={onDeleteMultipleOrders}
             onClearAllOrderHistory={onClearAllOrderHistory}
-          />
-        </div>
-      )}
-
-      {activeModeTab === 'manifest' && (
-        <div className="space-y-6 animate-in fade-in duration-200">
-          <CourierManifestManager
-            orderHistory={orderHistory}
-            currentUser={currentUser}
-            onUpdateOrdersShipped={onUpdateOrdersShipped}
-            warehouses={availableWarehouses}
-            selectedWarehouseId={selectedWarehouseId}
-            onSelectWarehouseId={setSelectedWarehouseId}
           />
         </div>
       )}
@@ -3541,7 +3978,11 @@ TOTAL QTY     : ${lastPackedOrder.totalQty} pcs
         <BatchPickingModal
           isOpen={showBatchPickingModal}
           onClose={() => setShowBatchPickingModal(false)}
-          orderHistory={orderHistory}
+          orderHistory={
+            channelMode
+              ? orderHistory.filter((o) => resolveOrderType(o) === channelMode)
+              : orderHistory
+          }
           allStock={stock}
           warehouses={availableWarehouses}
           selectedWarehouseId={selectedWarehouseId}
@@ -3553,6 +3994,15 @@ TOTAL QTY     : ${lastPackedOrder.totalQty} pcs
           }}
         />
       )}
+
+      <OrderIssueModal
+        open={issueModalOpen && Boolean(bulkIssueRef)}
+        references={bulkIssueRef ? [bulkIssueRef] : []}
+        stage={bulkIssueStage}
+        reporterName={currentUser?.fullName || currentUser?.username || 'Operator'}
+        onClose={() => setIssueModalOpen(false)}
+        onSubmit={handleReportBulkIssue}
+      />
     </div>
   );
 }

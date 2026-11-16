@@ -28,7 +28,6 @@ import {
   Area 
 } from 'recharts';
 import { 
-  DCC_SCHEDULE, 
   getDccScheduleByDay, 
   getCurrentDayName, 
   DccDay, 
@@ -47,8 +46,6 @@ import {
   ArrowLeft,
   Calendar,
   Clock,
-  CalendarDays,
-  Zap,
   History,
   Trash2,
   Database,
@@ -60,7 +57,6 @@ import {
   X,
   Sparkles,
   Filter,
-  Info,
   CheckSquare,
   Boxes,
   TrendingUp,
@@ -266,10 +262,10 @@ export default function CekFisik({
   onAdjustStockCountBatch
 }: CekFisikProps) {
   // Main Navigation Sub-Tabs - Persisted to localStorage so returning from other menus stays on same tab
-  const [activeMainTab, setActiveMainTab] = useState<'CONSOLE' | 'CYCLE_COUNT' | 'RECONCILIATION' | 'HISTORY' | 'SCHEDULE' | 'CHARTS' | 'OPNAME_LOKASI'>(() => {
+  const [activeMainTab, setActiveMainTab] = useState<'CONSOLE' | 'CYCLE_COUNT' | 'RECONCILIATION' | 'HISTORY' | 'CHARTS' | 'OPNAME_LOKASI'>(() => {
     try {
       const savedSubtab = localStorage.getItem('wms_dcc_active_subtab');
-      if (savedSubtab && ['CONSOLE', 'CYCLE_COUNT', 'RECONCILIATION', 'HISTORY', 'SCHEDULE', 'CHARTS', 'OPNAME_LOKASI'].includes(savedSubtab)) {
+      if (savedSubtab && ['CONSOLE', 'CYCLE_COUNT', 'RECONCILIATION', 'HISTORY', 'CHARTS', 'OPNAME_LOKASI'].includes(savedSubtab)) {
         return savedSubtab as any;
       }
     } catch (e) {}
@@ -333,10 +329,6 @@ export default function CekFisik({
     }
   });
   const [cycleCountSearchQuery, setCycleCountSearchQuery] = useState('');
-
-  // DCC Schedule States
-  const [selectedScheduleDay, setSelectedScheduleDay] = useState<DccDay | 'ALL'>(getCurrentDayName());
-  const [scheduleSearchQuery, setScheduleSearchQuery] = useState('');
 
   // SKU Picker Modal States
   const [isSkuPickerOpen, setIsSkuPickerOpen] = useState(false);
@@ -538,42 +530,6 @@ export default function CekFisik({
     return counts;
   }, [currentDccSchedule, stock]);
 
-  // Get active scheduled SKUs (with stock > 0) for selected day and search query
-  const scheduledSkuItems = useMemo(() => {
-    let skuEntries: { day: DccDay; skuId: string }[] = [];
-
-    if (selectedScheduleDay === 'ALL') {
-      currentDccSchedule.forEach(item => {
-        item.skus.forEach(skuId => {
-          skuEntries.push({ day: item.day, skuId });
-        });
-      });
-    } else {
-      const dayData = currentDccSchedule.find(d => d.day === selectedScheduleDay);
-      if (dayData) {
-        dayData.skus.forEach(skuId => {
-          skuEntries.push({ day: dayData.day, skuId });
-        });
-      }
-    }
-
-    // Filter 1: CRITICAL RULE - "jangan tampilkan jika stok 0"
-    const activeEntries = skuEntries.filter(entry => getSkuTotalQty(entry.skuId) > 0);
-
-    // Filter 2: Search query
-    if (!scheduleSearchQuery.trim()) {
-      return activeEntries;
-    }
-
-    const q = scheduleSearchQuery.trim().toLowerCase();
-    return activeEntries.filter(entry => {
-      const matchingStock = stock.filter(s => s.skuId.toLowerCase() === entry.skuId.toLowerCase());
-      const skuName = matchingStock[0]?.skuName || '';
-      const brand = matchingStock[0]?.brand || '';
-      return entry.skuId.toLowerCase().includes(q) || skuName.toLowerCase().includes(q) || brand.toLowerCase().includes(q);
-    });
-  }, [selectedScheduleDay, scheduleSearchQuery, currentDccSchedule, stock]);
-
   // Load an entire day's schedule into the Daily Cycle Count batch (filtering out stock 0)
   const loadDccScheduleBatch = (day: DccDay) => {
     const scheduledSkus = getDccScheduleByDay(day, currentDccSchedule);
@@ -587,16 +543,6 @@ export default function CekFisik({
     const newBatch = activeSkusWithStock.map(skuId => createCycleCountSkuItem(skuId));
     setCycleCountBatch(newBatch);
     setActiveMainTab('CYCLE_COUNT');
-  };
-
-  // Add a single SKU from schedule to current batch
-  const handleAddSkuToCycleCountBatch = (skuId: string) => {
-    if (cycleCountBatch.some(item => item.skuId.toLowerCase() === skuId.toLowerCase())) {
-      alert(`SKU ${skuId} sudah ada di dalam batch session count.`);
-      return;
-    }
-    const newItem = createCycleCountSkuItem(skuId);
-    setCycleCountBatch(prev => [newItem, ...prev]);
   };
 
   // Update Carton/Inner/Loose for a specific location inside an SKU
@@ -2557,43 +2503,23 @@ export default function CekFisik({
         )}
 
         {(mode === 'daily-cycle-count' || mode === 'dcc') && (
-          <>
-            <button
-              onClick={() => setActiveMainTab('CYCLE_COUNT')}
-              className={`px-4 py-2.5 rounded-xl text-xs font-bold transition-all cursor-pointer flex items-center gap-2 border ${
-                activeMainTab === 'CYCLE_COUNT'
-                  ? 'bg-purple-600 text-white border-purple-500 shadow-lg shadow-purple-600/10 font-extrabold'
-                  : 'bg-[#11141B] text-slate-400 hover:text-white border-slate-800 hover:bg-slate-800/60'
-              }`}
-              id="daily-cycle-count-tab-btn"
-            >
-              <Calendar className="w-4 h-4 text-purple-300" />
-              <span>Input Daily Cycle Count</span>
-              <span className={`px-2 py-0.5 rounded-full text-[10px] font-mono ${
-                activeMainTab === 'CYCLE_COUNT' ? 'bg-purple-950/40 text-white font-bold' : 'bg-slate-800 text-slate-300'
-              }`}>
-                {cycleCountBatch.length} SKU
-              </span>
-            </button>
-
-            <button
-              onClick={() => setActiveMainTab('SCHEDULE')}
-              className={`px-4 py-2.5 rounded-xl text-xs font-bold transition-all cursor-pointer flex items-center gap-2 border ${
-                activeMainTab === 'SCHEDULE'
-                  ? 'bg-amber-600 text-white border-amber-500 shadow-lg shadow-amber-600/10 font-extrabold'
-                  : 'bg-[#11141B] text-slate-400 hover:text-white border-slate-800 hover:bg-slate-800/60'
-              }`}
-              id="dcc-schedule-tab-btn"
-            >
-              <Clock className="w-4 h-4 text-amber-300" />
-              <span>Jadwal DCC Harian</span>
-              <span className={`px-2 py-0.5 rounded-full text-[10px] font-mono ${
-                activeMainTab === 'SCHEDULE' ? 'bg-amber-950/40 text-white font-bold' : 'bg-slate-800 text-slate-300'
-              }`}>
-                {scheduleCountsByDay[todayDayName]?.activeWithStock || 0} SKU {todayDayName}
-              </span>
-            </button>
-          </>
+          <button
+            onClick={() => setActiveMainTab('CYCLE_COUNT')}
+            className={`px-4 py-2.5 rounded-xl text-xs font-bold transition-all cursor-pointer flex items-center gap-2 border ${
+              activeMainTab === 'CYCLE_COUNT'
+                ? 'bg-purple-600 text-white border-purple-500 shadow-lg shadow-purple-600/10 font-extrabold'
+                : 'bg-[#11141B] text-slate-400 hover:text-white border-slate-800 hover:bg-slate-800/60'
+            }`}
+            id="daily-cycle-count-tab-btn"
+          >
+            <Calendar className="w-4 h-4 text-purple-300" />
+            <span>Input Daily Cycle Count</span>
+            <span className={`px-2 py-0.5 rounded-full text-[10px] font-mono ${
+              activeMainTab === 'CYCLE_COUNT' ? 'bg-purple-950/40 text-white font-bold' : 'bg-slate-800 text-slate-300'
+            }`}>
+              {cycleCountBatch.length} SKU
+            </span>
+          </button>
         )}
 
         {/* Sub-tab: Stock Opname per Lokasi */}
@@ -4226,13 +4152,6 @@ export default function CekFisik({
                     </button>
                   );
                 })}
-                <button
-                  onClick={() => setActiveMainTab('SCHEDULE')}
-                  className="px-3 py-1.5 bg-purple-600/20 hover:bg-purple-600 text-purple-300 hover:text-white font-bold text-xs rounded-xl transition-all cursor-pointer flex items-center gap-1 border border-purple-500/30 ml-1"
-                >
-                  <CalendarDays className="w-3.5 h-3.5 text-purple-400" />
-                  <span>Lihat Detail Jadwal</span>
-                </button>
               </div>
             </div>
 
@@ -4805,249 +4724,6 @@ export default function CekFisik({
               </div>
             </div>
 
-          </div>
-        </div>
-      )}
-
-      {/* ========================================================================= */}
-      {/* MAIN TAB: JADWAL DCC HARIAN (SENIN - JUMAT) */}
-      {/* ========================================================================= */}
-      {activeMainTab === 'SCHEDULE' && (
-        <div className="space-y-6">
-          {/* Header Banner */}
-          <div className="bg-[#11141B] border border-slate-800/80 rounded-2xl p-6 shadow-lg space-y-5">
-            <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-4 border-b border-slate-800 pb-4">
-              <div className="flex items-center gap-3">
-                <div className="p-3 bg-amber-500/10 text-amber-400 rounded-2xl border border-amber-500/20 shrink-0">
-                  <Clock className="w-7 h-7" />
-                </div>
-                <div>
-                  <h3 className="text-base font-extrabold text-white flex items-center gap-2">
-                    Jadwal Daily Cycle Count (DCC) Harian
-                    <span className="px-2.5 py-0.5 bg-amber-500/10 text-amber-400 text-[10px] font-extrabold rounded-full border border-amber-500/20 font-mono">
-                      Senin - Jumat
-                    </span>
-                  </h3>
-                  <p className="text-xs text-slate-400 mt-1">
-                    Daftar pembagian SKU harian untuk audit rutin WMS. Sesuai ketentuan, <strong className="text-amber-400">SKU dengan stok 0 (kosong) disembunyikan secara otomatis</strong>.
-                  </p>
-                </div>
-              </div>
-
-              <div className="flex items-center gap-2 shrink-0">
-                {selectedScheduleDay !== 'ALL' && (
-                  <button
-                    onClick={() => loadDccScheduleBatch(selectedScheduleDay)}
-                    className="px-4 py-2.5 bg-amber-500 hover:bg-amber-400 text-slate-950 font-black text-xs rounded-xl transition-all cursor-pointer flex items-center gap-2 shadow-lg shadow-amber-500/20"
-                  >
-                    <Zap className="w-4 h-4 fill-slate-950" />
-                    Muat Jadwal {selectedScheduleDay} ke Session Count ({scheduleCountsByDay[selectedScheduleDay as DccDay]?.activeWithStock || 0} SKU)
-                  </button>
-                )}
-                <button
-                  onClick={() => setActiveMainTab('CYCLE_COUNT')}
-                  className="px-3.5 py-2.5 bg-slate-800 hover:bg-slate-700 text-slate-200 font-bold text-xs rounded-xl transition-all cursor-pointer flex items-center gap-2 border border-slate-700/60"
-                >
-                  <ArrowLeft className="w-4 h-4" />
-                  Kembali ke Session Count
-                </button>
-              </div>
-            </div>
-
-            {/* Day Navigation Filter Pills */}
-            <div className="flex flex-wrap items-center gap-2">
-              <span className="text-xs font-bold text-slate-400 font-mono mr-1">Pilih Hari:</span>
-              <button
-                onClick={() => setSelectedScheduleDay('ALL')}
-                className={`px-3.5 py-2 rounded-xl text-xs font-bold transition-all cursor-pointer flex items-center gap-2 border ${
-                  selectedScheduleDay === 'ALL'
-                    ? 'bg-indigo-600 text-white border-indigo-500 font-extrabold shadow-md'
-                    : 'bg-[#161B25] text-slate-400 hover:text-white border-slate-800'
-                }`}
-              >
-                <span>Semua Hari</span>
-                <span className="px-2 py-0.5 rounded-full text-[10px] font-mono bg-slate-950/40 text-indigo-300 font-bold">
-                  {Object.values(scheduleCountsByDay).reduce((sum: number, c: { activeWithStock: number }) => sum + c.activeWithStock, 0)} SKU Active
-                </span>
-              </button>
-
-              {currentDccSchedule.map(s => {
-                const isToday = s.day === todayDayName;
-                const activeCount = scheduleCountsByDay[s.day]?.activeWithStock || 0;
-                const totalScheduled = scheduleCountsByDay[s.day]?.totalScheduled || 0;
-                const isSelected = selectedScheduleDay === s.day;
-
-                return (
-                  <button
-                    key={s.day}
-                    onClick={() => setSelectedScheduleDay(s.day)}
-                    className={`px-3.5 py-2 rounded-xl text-xs font-bold transition-all cursor-pointer flex items-center gap-2 border ${
-                      isSelected
-                        ? 'bg-amber-500 text-slate-950 border-amber-400 font-black shadow-md shadow-amber-500/20'
-                        : isToday
-                        ? 'bg-amber-500/10 text-amber-300 border-amber-500/30 hover:bg-amber-500/20'
-                        : 'bg-[#161B25] text-slate-400 hover:text-white border-slate-800'
-                    }`}
-                  >
-                    <span>{s.day}</span>
-                    {isToday && <span className={`text-[9px] font-black px-1.5 py-0.2 rounded ${isSelected ? 'bg-slate-950 text-amber-400' : 'bg-amber-400 text-slate-950'}`}>HARI INI</span>}
-                    <span className={`px-2 py-0.5 rounded-full text-[10px] font-mono font-bold ${
-                      isSelected ? 'bg-slate-950/30 text-slate-950' : 'bg-slate-900 text-amber-400'
-                    }`}>
-                      {activeCount} / {totalScheduled} SKU
-                    </span>
-                  </button>
-                );
-              })}
-            </div>
-
-            {/* Notice info banner */}
-            <div className="bg-amber-500/5 border border-amber-500/20 rounded-xl p-3 text-xs text-amber-300/90 flex items-center justify-between gap-3">
-              <div className="flex items-center gap-2">
-                <Info className="w-4 h-4 text-amber-400 shrink-0" />
-                <span>
-                  Hanya menampilkan SKU yang memiliki <strong className="text-white font-bold">Stok &gt; 0</strong> dalam sistem. SKU jadwal dengan stok 0 disembunyikan secara otomatis.
-                </span>
-              </div>
-              <div className="text-[11px] font-mono text-slate-400 shrink-0">
-                Menampilkan <strong className="text-white">{scheduledSkuItems.length}</strong> SKU Aktif
-              </div>
-            </div>
-          </div>
-
-          {/* Search and Action Bar */}
-          <div className="flex flex-col sm:flex-row items-center justify-between gap-4">
-            <div className="relative w-full sm:w-80">
-              <Search className="absolute left-3 top-2.5 h-4 w-4 text-slate-500" />
-              <input
-                type="text"
-                placeholder="Cari SKU ID, Nama Produk, Brand..."
-                value={scheduleSearchQuery}
-                onChange={(e) => setScheduleSearchQuery(e.target.value)}
-                className="w-full bg-[#11141B] border border-slate-800 rounded-xl pl-9 pr-4 py-2 text-xs text-slate-200 placeholder-slate-500 focus:outline-none focus:border-amber-500 transition-colors"
-              />
-              {scheduleSearchQuery && (
-                <button
-                  onClick={() => setScheduleSearchQuery('')}
-                  className="absolute right-2.5 top-2.5 text-slate-500 hover:text-white"
-                >
-                  <X className="w-3.5 h-3.5" />
-                </button>
-              )}
-            </div>
-
-            {selectedScheduleDay !== 'ALL' && (
-              <button
-                onClick={() => loadDccScheduleBatch(selectedScheduleDay)}
-                className="w-full sm:w-auto px-4 py-2 bg-amber-600 hover:bg-amber-500 text-slate-950 font-black text-xs rounded-xl transition-all cursor-pointer flex items-center justify-center gap-2 shadow-md"
-              >
-                <Zap className="w-3.5 h-3.5 fill-slate-950" />
-                Muat Semua SKU {selectedScheduleDay} ke Session Count ({scheduledSkuItems.length} SKU)
-              </button>
-            )}
-          </div>
-
-          {/* Table of Scheduled SKUs */}
-          <div className="bg-[#11141B] rounded-xl border border-slate-800/80 shadow-lg overflow-hidden">
-            <div className="overflow-x-auto">
-              <table className="w-full text-left border-collapse">
-                <thead>
-                  <tr className="bg-[#161B25] border-b border-slate-800 text-[11px] font-mono text-slate-400 uppercase tracking-wider">
-                    <th className="py-3 px-4 w-12 text-center">No</th>
-                    <th className="py-3 px-4 w-24">Hari</th>
-                    <th className="py-3 px-4 font-bold text-slate-200">SKU ID</th>
-                    <th className="py-3 px-4">Nama Produk</th>
-                    <th className="py-3 px-4">Lokasi Rak Stored</th>
-                    <th className="py-3 px-4 text-right">Stok System</th>
-                    <th className="py-3 px-4 text-center w-40">Aksi</th>
-                  </tr>
-                </thead>
-                <tbody className="divide-y divide-slate-800/60 text-xs">
-                  {scheduledSkuItems.length === 0 ? (
-                    <tr>
-                      <td colSpan={7} className="py-12 text-center text-slate-500">
-                        <div className="flex flex-col items-center justify-center gap-2">
-                          <Calendar className="w-8 h-8 text-slate-600" />
-                          <p className="font-bold text-slate-400">Tidak ada SKU jadwal dengan stok &gt; 0 untuk kriteria ini.</p>
-                          <p className="text-[11px] text-slate-500">SKU dengan stok 0 otomatis disembunyikan sesuai aturan sistem.</p>
-                        </div>
-                      </td>
-                    </tr>
-                  ) : (
-                    scheduledSkuItems.map((item, index) => {
-                      const totalStock = getSkuTotalQty(item.skuId);
-                      const matchingStock = stock.filter(s => s.skuId.toLowerCase() === item.skuId.toLowerCase());
-                      const skuName = matchingStock[0]?.skuName || '-';
-                      const isAlreadyInBatch = cycleCountBatch.some(b => b.skuId.toLowerCase() === item.skuId.toLowerCase());
-
-                      return (
-                        <tr key={`${item.day}_${item.skuId}_${index}`} className="hover:bg-slate-800/30 transition-colors">
-                          <td className="py-3 px-4 text-center font-mono text-slate-500 text-[11px]">
-                            {index + 1}
-                          </td>
-                          <td className="py-3 px-4 font-mono font-bold">
-                            <span className={`px-2 py-0.5 rounded text-[10px] uppercase ${
-                              item.day === 'Senin' ? 'bg-blue-500/10 text-blue-400 border border-blue-500/20' :
-                              item.day === 'Selasa' ? 'bg-emerald-500/10 text-emerald-400 border border-emerald-500/20' :
-                              item.day === 'Rabu' ? 'bg-purple-500/10 text-purple-400 border border-purple-500/20' :
-                              item.day === 'Kamis' ? 'bg-amber-500/10 text-amber-400 border border-amber-500/20' :
-                              'bg-rose-500/10 text-rose-400 border border-rose-500/20'
-                            }`}>
-                              {item.day}
-                            </span>
-                          </td>
-                          <td className="py-3 px-4 font-mono font-bold text-emerald-400">
-                            {item.skuId}
-                          </td>
-                          <td className="py-3 px-4 font-medium text-slate-200">
-                            {skuName}
-                          </td>
-                          <td className="py-3 px-4 text-slate-300 font-mono text-[11px]">
-                            {matchingStock.length > 0 ? (
-                              <div className="flex flex-wrap gap-1">
-                                {matchingStock.map((loc, lIdx) => (
-                                  <span key={lIdx} className="px-2 py-0.5 bg-slate-800 border border-slate-700/80 rounded text-[10px] text-slate-300">
-                                    <strong className="text-white">{loc.location}</strong>: {loc.qty}
-                                  </span>
-                                ))}
-                              </div>
-                            ) : (
-                              <span className="text-slate-500">-</span>
-                            )}
-                          </td>
-                          <td className="py-3 px-4 text-right font-mono font-bold text-emerald-400 text-sm">
-                            {formatNumber(totalStock)} <span className="text-xs font-normal text-slate-400">pcs</span>
-                          </td>
-                          <td className="py-3 px-4 text-center">
-                            <button
-                              onClick={() => handleAddSkuToCycleCountBatch(item.skuId)}
-                              disabled={isAlreadyInBatch}
-                              className={`px-3 py-1.5 rounded-lg text-xs font-bold transition-all cursor-pointer flex items-center justify-center gap-1.5 w-full ${
-                                isAlreadyInBatch
-                                  ? 'bg-slate-800 text-slate-500 cursor-not-allowed border border-slate-700/50'
-                                  : 'bg-purple-600/20 hover:bg-purple-600 text-purple-300 hover:text-white border border-purple-500/30'
-                              }`}
-                            >
-                              {isAlreadyInBatch ? (
-                                <>
-                                  <Check className="w-3.5 h-3.5 text-emerald-400" />
-                                  <span>Sudah di Batch</span>
-                                </>
-                              ) : (
-                                <>
-                                  <Plus className="w-3.5 h-3.5" />
-                                  <span>+ Session Count</span>
-                                </>
-                              )}
-                            </button>
-                          </td>
-                        </tr>
-                      );
-                    }))
-                  }
-                </tbody>
-              </table>
-            </div>
           </div>
         </div>
       )}

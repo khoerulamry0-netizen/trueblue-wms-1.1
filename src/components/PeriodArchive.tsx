@@ -2,8 +2,14 @@ import React, {useRef, useState} from 'react';
 import {supabase, getActiveBranch} from '../supabase';
 
 export async function verifyArchiveFile(file: File, expected?: {backup_id: string; sha256?: string}) {
- if (file.size > 50 * 1024 * 1024) throw new Error('File maksimal 50 MB.');
+ if (file.size > 100 * 1024 * 1024) throw new Error('File maksimal 100 MB.');
  const value = JSON.parse(await file.text());
+ if (value.format === 'BLUES_WMS_MULTI_BACKUP') {
+  if (value.version !== 1 || !value.sha256) throw new Error('Format manifest multi-backup tidak valid.');
+  if (expected?.backup_id && value.backup_id !== expected.backup_id) throw new Error('File manifest berasal dari rencana backup lain.');
+  if (expected?.sha256 && expected.sha256 !== value.sha256) throw new Error('Checksum manifest tidak cocok dengan rencana server.');
+  return {value, payload: value.summary || {}};
+ }
  if (value.format !== 'BLUES_WMS_BACKUP' || value.version !== 1 || typeof value.payload_text !== 'string') throw new Error('Format arsip tidak valid.');
  const hash = Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(value.payload_text))), x => x.toString(16).padStart(2, '0')).join('');
  if (hash !== value.sha256 || (expected && value.backup_id !== expected.backup_id) || (expected?.sha256 && expected.sha256 !== hash)) throw new Error('File rusak, berubah, atau berasal dari backup lain.');

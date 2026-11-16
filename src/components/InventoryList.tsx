@@ -1,15 +1,18 @@
-import {inventoryFocusOptions,matchesInventoryFocus} from '../utils/dashboardView';
+import {inventoryFocusOptions,getInventoryFocusOptions,matchesInventoryFocus} from '../utils/dashboardView';
 import InventoryStockTable from './InventoryStockTable';
 import {getInventorySkuTotals,groupStockBySku,inventoryDateLabel,inventoryStatus,inventoryMovementLabel} from '../utils/inventoryView';
 import StockPurge from './StockPurge';
 import ModalFrame from './ModalFrame';
 import {getActiveBranch} from '../supabase';
 import {getStockStatus,isStockPickable} from '../utils/calculations';
+import { useLanguage } from '../i18n/LanguageContext';
 import React, { useState, useMemo } from 'react';
-import { StockItem, DccLog, OutboundItem, Warehouse } from '../types';
+import { StockItem, DccLog, OutboundItem, Warehouse, CatalogItem } from '../types';
+import { buildCatalogLookupMap, getCatalogItemName, normalizeSkuKey, resolvePreferredSkuName } from '../utils/catalogSync';
 import { 
   calculatePackQuantities, 
   calculateTotalFromPacks, 
+  calculateRemainingExpiry,
   getExpiredStatus, 
   isNearExpiryStatus, 
   getStatusBadgeClass, 
@@ -84,6 +87,8 @@ function QRCodeImage({ text }: { text: string }) {
 
 interface InventoryListProps {
   stock: StockItem[];
+  catalog?: CatalogItem[];
+  onSyncImportedNamesToCatalog?: (items: Array<{ skuId: string; skuName: string; qtyCtnSize: number; qtyInnerSize: number }>) => Promise<void>;
   onUpdateStock: (updated: StockItem[]) => void | Promise<boolean>;
   onEditStockItem?: (newItem: StockItem, oldItem: StockItem) => Promise<boolean> | boolean;
   onAddStockItem: (newItem: Omit<StockItem, 'id' | 'totalQtySku'>) => Promise<boolean>;
@@ -99,7 +104,9 @@ interface InventoryListProps {
 }
 
 export default function InventoryList({ 
-  stock, 
+  stock,
+  catalog = [],
+  onSyncImportedNamesToCatalog,
   onUpdateStock, 
   onEditStockItem,
   onAddStockItem, 
@@ -113,9 +120,11 @@ export default function InventoryList({
   activeWarehouseFilter = 'ALL',
   onSelectWarehouseFilter
 }: InventoryListProps) {
+  const catalogMap = useMemo(() => buildCatalogLookupMap(catalog), [catalog]);
   const isSuperAdmin = currentUser?.role === 'Administrator';
   const isAdmin = isSuperAdmin || currentUser?.role === 'Administrator' || currentUser?.role === 'Admin';
   const isViewer = userRole === 'Viewer' || currentUser?.role === 'Viewer';
+  const { t, language } = useLanguage();
 
   // Stock Locking summary from pending un-deducted orders
   const lockedStockSummary = useMemo(() => getLockedStockSummary(orderHistory), [orderHistory]);
@@ -361,6 +370,8 @@ export default function InventoryList({
 
       // Clean SKU ID (strip leading # or apostrophes)
       rawSkuId = rawSkuId.replace(/^['#]/, '').trim();
+      const normSku = normalizeSkuKey(rawSkuId);
+      const catMatch = catalogMap.get(normSku);
 
       const qty = parseQtyVal(rawQtyStr);
       const expiredDate = parseDateVal(rawExpiredDate);
@@ -369,8 +380,8 @@ export default function InventoryList({
       const rawCtnSize = getColStr(headerIdxs.qtyCtnSize);
       const rawInnerSize = getColStr(headerIdxs.qtyInnerSize);
 
-      const qtyCtnSize = parseQtyVal(rawCtnSize) || spec.qtyCtnSize;
-      const qtyInnerSize = parseQtyVal(rawInnerSize) || spec.qtyInnerSize;
+      const qtyCtnSize = parseQtyVal(rawCtnSize) || catMatch?.qtyCtnSize || spec.qtyCtnSize;
+      const qtyInnerSize = parseQtyVal(rawInnerSize) || catMatch?.qtyInnerSize || spec.qtyInnerSize;
 
       const isValid = !!rawSkuId && !isNaN(qty) && qty >= 0;
       let error = '';
@@ -378,7 +389,7 @@ export default function InventoryList({
 
       result.push({
         skuId: rawSkuId,
-        skuName: rawSkuName || `${rawSkuId} Product`,
+        skuName: resolvePreferredSkuName(normSku, rawSkuName, getCatalogItemName(catMatch)),
         expiredDate: (expiredDate && expiredDate !== '-') ? expiredDate : 'No Expired',
         location: rawLocation || 'STAGE-01',
         qty: isNaN(qty) ? 0 : qty,
@@ -390,7 +401,7 @@ export default function InventoryList({
     });
 
     return result;
-  }, [importText]);
+  }, [importText, catalogMap]);
 
   // Load a small generic import example
   const handleLoadSampleTemplate = () => {
@@ -540,6 +551,13 @@ SKU-002\tProduk Contoh 2\t30/06/2028\tRAK-A02\t120\t12\t1`;
         const existingIdx = currentStockClone.findIndex(s => s.id === targetId);
 
         if (existingIdx > -1) {
+          const catMatch = catalogMap.get(normalizeSkuKey(item.skuId));
+          currentStockClone[existingIdx].skuName = resolvePreferredSkuName(
+            item.skuId,
+            item.skuName,
+            getCatalogItemName(catMatch),
+            currentStockClone[existingIdx].skuName
+          );
           if (importMode === 'merge') {
             currentStockClone[existingIdx].qty += item.qty;
           } else {
@@ -596,6 +614,9 @@ SKU-002\tProduk Contoh 2\t30/06/2028\tRAK-A02\t120\t12\t1`;
     }));
 
     if(await onUpdateStock(finalStockState)===false)throw Error('Stok belum tersimpan. Muat ulang data dan periksa pesan kesalahan.');
+    if (onSyncImportedNamesToCatalog) {
+      await onSyncImportedNamesToCatalog(validRows);
+    }
     setIsImportModalOpen(false);
     setImportText('');
 
@@ -703,22 +724,34 @@ SKU-002\tProduk Contoh 2\t30/06/2028\tRAK-A02\t120\t12\t1`;
 
   ];
 
-  // Handle SKU ID autofill helper
+  // Handle SKU ID autofill helper (prioritizes Catalog Master names & pack sizes)
   const existingSkusMap = useMemo(() => {
     const map: Record<string, { name: string; ctn: number; inner: number }> = {};
+    catalog.forEach(cat => {
+      const normSku = normalizeSkuKey(cat.skuId);
+      if (!normSku) return;
+      map[normSku] = {
+        name: getCatalogItemName(cat),
+        ctn: cat.qtyCtnSize,
+        inner: cat.qtyInnerSize
+      };
+    });
     stock.forEach(item => {
-      map[item.skuId] = { 
-        name: item.skuName, 
-        ctn: item.qtyCtnSize, 
-        inner: item.qtyInnerSize 
+      const normSku = normalizeSkuKey(item.skuId);
+      if (!normSku) return;
+      const existing = map[normSku];
+      map[normSku] = {
+        name: resolvePreferredSkuName(normSku, existing?.name, item.skuName),
+        ctn: existing?.ctn || item.qtyCtnSize,
+        inner: existing?.inner || item.qtyInnerSize
       };
     });
     return map;
-  }, [stock]);
+  }, [catalog, stock]);
 
   const handleSkuIdChange = (val: string) => {
     setFormSkuId(val);
-    const matched = existingSkusMap[val];
+    const matched = existingSkusMap[normalizeSkuKey(val)];
     if (matched) {
       setFormSkuName(matched.name);
       setFormCtnSize(matched.ctn);
@@ -1093,7 +1126,7 @@ SKU-002\tProduk Contoh 2\t30/06/2028\tRAK-A02\t120\t12\t1`;
     return orderHistory.filter(order => order.skuId === selectedHistorySkuId);
   }, [orderHistory, selectedHistorySkuId]);
 
-  // Build a unified chronological feed
+  // Build a unified chronological feed (Deduplicated & Cleaned)
   const unifiedHistoryFeed = useMemo(() => {
     if (!selectedHistorySkuId) return [];
     
@@ -1109,12 +1142,83 @@ SKU-002\tProduk Contoh 2\t30/06/2028\tRAK-A02\t120\t12\t1`;
       user: string;
       status?: string;
       refNo?: string;
+      isQuickOutbound?: boolean;
     }
 
     const feed: UnifiedFeedItem[] = [];
+    const matchedLogIds = new Set<string>();
 
-    // Add logs
+    // 1. Process Orders first (orderHistory contains richer metadata)
+    skuOrders.forEach(order => {
+      const isQuick = order.isQuickOutbound || order.outboundType === 'quick' || order.referenceNumber?.startsWith('OUT-QUICK-');
+      const isCompleted = order.status === 'Completed';
+
+      // Find matching log in skuLogs to deduplicate
+      const matchingLog = skuLogs.find(log => {
+        if (matchedLogIds.has(log.id)) return false;
+        if (log.type !== 'OUTBOUND') return false;
+        if (order.referenceNumber && log.description?.includes(order.referenceNumber)) return true;
+        const timeDiff = Math.abs(new Date(log.timestamp).getTime() - new Date(order.timestamp).getTime());
+        return timeDiff < 60000 && log.qty === order.qty;
+      });
+
+      if (matchingLog) {
+        matchedLogIds.add(matchingLog.id);
+      }
+
+      // Location resolution: prefer location route from log if available (e.g. A5 ➔ DISPATCH / DOCK)
+      let locationText = order.location || '-';
+      if (matchingLog?.locationFrom && matchingLog?.locationTo) {
+        locationText = `${matchingLog.locationFrom} ➜ ${matchingLog.locationTo}`;
+      } else if (matchingLog?.locationFrom) {
+        locationText = matchingLog.locationFrom;
+      }
+
+      // Operator resolution
+      const operatorName = 
+        order.pickedBy || 
+        order.packedBy || 
+        order.createdBy || 
+        matchingLog?.user || 
+        'Operator';
+
+      let typeLabel = 'Pesanan Outbound (Order)';
+      if (isQuick) {
+        typeLabel = 'Outbound Cepat';
+      } else if (isCompleted) {
+        typeLabel = 'Pesanan Outbound (Selesai)';
+      } else if (order.status === 'Pending') {
+        typeLabel = 'Draf Pesanan (Menunggu Picking)';
+      }
+
+      // Compose clean details description
+      const detailParts: string[] = [];
+      if (order.referenceNumber) detailParts.push(`Ref: ${order.referenceNumber}`);
+      if (order.orderNumber) detailParts.push(`No. Order: ${order.orderNumber}`);
+      if (order.noPo && order.noPo !== '-') detailParts.push(`PO: ${order.noPo}`);
+      if (order.customerName && order.customerName !== 'N/A') detailParts.push(`Customer: ${order.customerName}`);
+      if (order.notes) detailParts.push(`Notes: ${order.notes}`);
+
+      feed.push({
+        id: order.id,
+        timestamp: order.completedAt || order.timestamp || matchingLog?.timestamp || new Date().toISOString(),
+        source: 'ORDER',
+        typeLabel,
+        type: isQuick ? 'QUICK_OUTBOUND' : 'ORDER',
+        qty: order.qty,
+        location: locationText,
+        details: detailParts.join(' | ') || (matchingLog?.description || 'Outbound Barang'),
+        user: operatorName,
+        status: order.status,
+        refNo: order.referenceNumber,
+        isQuickOutbound: isQuick
+      });
+    });
+
+    // 2. Add remaining logs (exclude matchedLogIds to prevent visual duplicate entries)
     skuLogs.forEach(log => {
+      if (matchedLogIds.has(log.id)) return;
+
       let typeLabel: string = log.type;
       if (log.type === 'TRANSFER') typeLabel = 'Transfer Antar Lokasi';
       else if (log.type === 'TRANSFER_IN') typeLabel = 'Transfer Masuk';
@@ -1145,23 +1249,6 @@ SKU-002\tProduk Contoh 2\t30/06/2028\tRAK-A02\t120\t12\t1`;
       });
     });
 
-    // Add orders
-    skuOrders.forEach(order => {
-      feed.push({
-        id: order.id,
-        timestamp: order.timestamp,
-        source: 'ORDER',
-        typeLabel: 'Pesanan Outbound (Order)',
-        type: 'ORDER',
-        qty: order.qty,
-        location: order.location,
-        details: `Customer: ${order.customerName || 'N/A'} | Ref: ${order.referenceNumber || 'N/A'} ${order.orderNumber ? `| No. Order: ${order.orderNumber}` : ''} ${order.noPo ? `| PO: ${order.noPo}` : ''} ${order.notes ? `| Notes: ${order.notes}` : ''}`,
-        user: order.scanned ? 'Selesai Scan Barcode' : 'Pending',
-        status: order.status,
-        refNo: order.referenceNumber
-      });
-    });
-
     // Sort by timestamp descending (newest first)
     return feed.sort((a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime());
   }, [skuLogs, skuOrders, selectedHistorySkuId]);
@@ -1179,10 +1266,18 @@ SKU-002\tProduk Contoh 2\t30/06/2028\tRAK-A02\t120\t12\t1`;
       );
     }
     if (activeHistoryTab === 'order') {
-      return unifiedHistoryFeed.filter(item => item.source === 'ORDER' || item.type === 'OUTBOUND');
+      return unifiedHistoryFeed.filter(item => 
+        item.source === 'ORDER' || 
+        item.type === 'ORDER' || 
+        item.type === 'QUICK_OUTBOUND' || 
+        item.type === 'OUTBOUND'
+      );
     }
     if (activeHistoryTab === 'inbound_adjust') {
-      return unifiedHistoryFeed.filter(item => item.type === 'INBOUND' || item.type === 'ADJUSTMENT');
+      return unifiedHistoryFeed.filter(item => 
+        item.type === 'INBOUND' || 
+        item.type === 'ADJUSTMENT'
+      );
     }
     return unifiedHistoryFeed;
   }, [unifiedHistoryFeed, activeHistoryTab]);
@@ -1192,9 +1287,9 @@ SKU-002\tProduk Contoh 2\t30/06/2028\tRAK-A02\t120\t12\t1`;
       {/* Header Panel */}
       <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
         <div>
-          <h2 className="text-xl font-extrabold text-white tracking-tight">Kelola Stok Barang</h2>
+          <h2 className="text-xl font-extrabold text-white tracking-tight">{t('inv.title')}</h2>
           <p className="text-xs text-slate-400 mt-1">
-            {isViewer ? 'Pemantauan kuantitas dan rincian stok gudang (Mode Hanya Lihat).' : 'Lihat, edit, hapus, dan sesuaikan rincian stok gudang beserta kuantitas kemasannya.'}
+            {isViewer ? t('inv.readOnlySubtitle') : t('inv.subtitle')}
           </p>
         </div>
         <div className="flex flex-wrap gap-2">
@@ -1208,21 +1303,11 @@ SKU-002\tProduk Contoh 2\t30/06/2028\tRAK-A02\t120\t12\t1`;
             </button>
           )}
           <button
-            onClick={() => {
-              setThermalInitialItems([]);
-              setIsThermalPrinterOpen(true);
-            }}
-            className="flex items-center gap-2 px-4 py-2.5 bg-gradient-to-r from-emerald-600/30 to-teal-600/30 hover:from-emerald-600/40 hover:to-teal-600/40 text-emerald-300 font-bold rounded-xl text-xs border border-emerald-500/40 transition-all cursor-pointer shadow-sm"
-          >
-            <Printer className="w-4 h-4 text-emerald-400" />
-            Cetak Label Barcode Thermal
-          </button>
-          <button
             onClick={handleExportExcel}
             className="flex items-center gap-2 px-4 py-2.5 bg-[#161B25] hover:bg-slate-800 text-slate-300 font-bold rounded-xl text-xs border border-slate-800 transition-all cursor-pointer shadow-sm"
           >
             <FileSpreadsheet className="w-4 h-4 text-emerald-400" />
-            Ekspor Excel (.xlsx)
+            {t('inv.exportExcel')} (.xlsx)
           </button>
           {(userRole === 'Administrator' || userRole === 'Admin') && (
             <button
@@ -1230,18 +1315,18 @@ SKU-002\tProduk Contoh 2\t30/06/2028\tRAK-A02\t120\t12\t1`;
               className="flex items-center gap-2 px-4 py-2 bg-emerald-500 hover:bg-emerald-450 text-slate-950 font-bold rounded-xl text-xs transition-all shadow-md shadow-emerald-500/10 cursor-pointer"
             >
               <Plus className="w-4 h-4" />
-              Tambah Stok Baru
+              {t('inv.addStock')}
             </button>
           )}
           {userRole === 'Administrator' && (
-            <details className="trueblue-stock-admin"><summary>Administrasi stok</summary>
+          <details className="trueblue-stock-admin"><summary>{t('inv.stockAdministration')}</summary>
               
               <button
                 onClick={handleDeleteAllStock}
                 className="flex items-center gap-2 px-4 py-2 bg-rose-900/30 hover:bg-rose-900/65 text-rose-200 hover:text-white font-semibold rounded-xl text-xs border border-rose-800/40 hover:border-rose-700/60 transition-all cursor-pointer shadow-sm shadow-rose-900/10"
               >
                 <Trash2 className="w-4 h-4 text-rose-400" />
-                Kosongkan stok cabang…
+                {t('inv.clearBranchStock')}
               </button>
             </details>
           )}
@@ -1267,7 +1352,7 @@ SKU-002\tProduk Contoh 2\t30/06/2028\tRAK-A02\t120\t12\t1`;
           <div className="flex items-center gap-1.5 overflow-x-auto scrollbar-none pb-2 border-b border-slate-800/60 -mx-1 px-1">
             <span className="text-[10px] font-extrabold uppercase tracking-wider text-slate-400 flex items-center gap-1 shrink-0 mr-1">
               <Building2 className="w-3.5 h-3.5 text-indigo-400" />
-              Gudang:
+              {t('stock.warehouse')}:
             </span>
             <button
               type="button"
@@ -1278,7 +1363,7 @@ SKU-002\tProduk Contoh 2\t30/06/2028\tRAK-A02\t120\t12\t1`;
                   : 'bg-[#161B25] text-slate-400 hover:text-slate-200 border-slate-800 hover:bg-slate-800/50'
               }`}
             >
-              Semua Gudang ({formatNumber(stock.reduce((a, b) => a + b.qty, 0))} Pcs)
+              {t('stock.allWarehouses')} ({formatNumber(stock.reduce((a, b) => a + b.qty, 0))} Pcs)
             </button>
             {warehouses.map(w => {
               const whStock = stock.filter(s => (s.warehouseId || 'WH-CENTRAL').toUpperCase() === w.id.toUpperCase());
@@ -1307,13 +1392,13 @@ SKU-002\tProduk Contoh 2\t30/06/2028\tRAK-A02\t120\t12\t1`;
 
         <div className="grid grid-cols-1 md:grid-cols-12 gap-3">
           {/* Search Bar */}
-          <div className="relative md:col-span-4 flex items-center">
+          <div className="relative md:col-span-5 flex items-center">
             <span className="absolute inset-y-0 left-0 pl-3 flex items-center pointer-events-none text-slate-500">
               <Search className="w-4 h-4" />
             </span>
             <input
               type="text"
-              aria-label="Cari SKU, nama, barcode atau lokasi" placeholder="Cari SKU ID, Nama Barang, atau Lokasi..."
+              aria-label="Cari SKU, nama, barcode atau lokasi" placeholder={t('inv.searchPlaceholder')}
               value={searchTerm}
               onChange={(e) => setSearchTerm(e.target.value)}
               className="w-full pl-9 pr-10 py-2 text-sm bg-[#161B25] border border-slate-800 rounded-xl focus:ring-2 focus:ring-emerald-500 focus:border-emerald-500 focus:bg-[#1a212f] text-slate-200 outline-none transition-all placeholder:text-slate-500"
@@ -1335,9 +1420,9 @@ SKU-002\tProduk Contoh 2\t30/06/2028\tRAK-A02\t120\t12\t1`;
               onChange={(e) => setSelectedCategory(e.target.value)}
               className="w-full pl-3 pr-8 py-2 text-sm bg-[#161B25] border border-slate-800 rounded-xl focus:ring-2 focus:ring-emerald-500 focus:border-emerald-500 focus:bg-[#1a212f] text-slate-300 outline-none transition-all appearance-none cursor-pointer font-medium"
             >
-              <option value="ALL">💄 Semua Kategori</option>
+              <option value="ALL">💄 {t('inv.allCategories')}</option>
               {categoriesList.map(cat => (
-                <option key={cat} value={cat}>{inventoryMovementLabel(cat)}</option>
+                <option key={cat} value={cat}>{inventoryMovementLabel(cat, language)}</option>
               ))}
             </select>
           </div>
@@ -1349,7 +1434,7 @@ SKU-002\tProduk Contoh 2\t30/06/2028\tRAK-A02\t120\t12\t1`;
               onChange={(e) => setSelectedLocation(e.target.value)}
               className="w-full pl-3 pr-8 py-2 text-sm bg-[#161B25] border border-slate-800 rounded-xl focus:ring-2 focus:ring-emerald-500 focus:border-emerald-500 focus:bg-[#1a212f] text-slate-300 outline-none transition-all appearance-none cursor-pointer font-medium"
             >
-              <option value="ALL">📍 Semua Lokasi</option>
+              <option value="ALL">📍 {t('inv.allLocations')}</option>
               {locationsList.map(loc => (
                 <option key={loc} value={loc}>{loc}</option>
               ))}
@@ -1364,29 +1449,13 @@ SKU-002\tProduk Contoh 2\t30/06/2028\tRAK-A02\t120\t12\t1`;
               onChange={(e) => setSelectedStatus(e.target.value)}
               className="w-full pl-3 pr-8 py-2 text-sm bg-[#161B25] border border-slate-800 rounded-xl focus:ring-2 focus:ring-emerald-500 focus:border-emerald-500 focus:bg-[#1a212f] text-slate-300 outline-none transition-all appearance-none cursor-pointer font-medium"
             >
-              <option value="ALL">🛡️ Semua Status</option>
-              {inventoryFocusOptions.map(option => (
+              <option value="ALL">🛡️ {t('inv.allStatuses')}</option>
+              {getInventoryFocusOptions(language).map(option => (
                 <option key={option.value} value={option.value}>{option.label}</option>
               ))}
             </select>
           </div>
 
-          {/* Clear Button */}
-          <div className="md:col-span-1 flex items-center justify-center">
-            <button
-              onClick={() => {
-                setSearchTerm('');
-                setSelectedLocation('ALL');
-                setSelectedStatus('ALL');
-                setSelectedCategory('ALL');
-                setHideEmptyStock(true);
-              }}
-              className="px-3 py-2 text-xs font-semibold text-slate-400 hover:text-white bg-[#161B25] hover:bg-slate-800 rounded-lg border border-slate-800 w-full transition-all cursor-pointer"
-              title="Reset Filter"
-            >
-              Reset
-            </button>
-          </div>
         </div>
 
         {/* Mini stats banner based on filtered results */}
@@ -1401,7 +1470,7 @@ SKU-002\tProduk Contoh 2\t30/06/2028\tRAK-A02\t120\t12\t1`;
                 onChange={(e) => setHideEmptyStock(e.target.checked)}
                 className="rounded border-slate-800 text-indigo-500 focus:ring-0 focus:ring-offset-0 cursor-pointer w-3.5 h-3.5 bg-[#161B25]"
               />
-              Sembunyikan Stok Kosong (Qty 0)
+              {t('inv.hideEmptyStock')}
             </label>
             <span className="text-slate-800">|</span>
             <label className="flex items-center gap-1.5 text-amber-400 hover:text-amber-300 cursor-pointer select-none transition-colors font-bold">
@@ -1411,7 +1480,7 @@ SKU-002\tProduk Contoh 2\t30/06/2028\tRAK-A02\t120\t12\t1`;
                 onChange={(e) => setOnlyLowStock(e.target.checked)}
                 className="rounded border-amber-500/50 text-amber-500 focus:ring-0 focus:ring-offset-0 cursor-pointer w-3.5 h-3.5 bg-[#161B25]"
               />
-              ⚠️ Reorder Point / Stok Menipis (Qty ≤ 20)
+              {t('inv.reorderPoint')}
             </label>
             {lockedStockSummary.totalLockedQty > 0 && (
               <>
@@ -1591,6 +1660,17 @@ SKU-002\tProduk Contoh 2\t30/06/2028\tRAK-A02\t120\t12\t1`;
                       <span className={`text-[10px] px-2 py-0.5 rounded-full font-bold border ${getStatusBadgeClass(getExpiredStatus(normalizeDateToDmy(formExpiredDate)))}`}>
                         {getExpiredStatus(normalizeDateToDmy(formExpiredDate))}
                       </span>
+                      {(() => {
+                        const rem = calculateRemainingExpiry(normalizeDateToDmy(formExpiredDate));
+                        if (rem.label && rem.label !== 'Tanpa ED' && rem.label !== 'Rusak' && rem.label !== 'Karantina') {
+                          return (
+                            <span className="text-[10px] px-2 py-0.5 rounded-full font-bold bg-[#1e293b] text-amber-400 border border-amber-500/30">
+                              Sisa ED: {rem.label}
+                            </span>
+                          );
+                        }
+                        return null;
+                      })()}
                     </div>
                   )}
                 </div>
@@ -1892,6 +1972,17 @@ SKU-002\tProduk Contoh 2\t30/06/2028\tRAK-A02\t120\t12\t1`;
                       <span className={`text-[10px] px-2 py-0.5 rounded-full font-bold border ${getStatusBadgeClass(getExpiredStatus(normalizeDateToDmy(formExpiredDate)))}`}>
                         {getExpiredStatus(normalizeDateToDmy(formExpiredDate))}
                       </span>
+                      {(() => {
+                        const rem = calculateRemainingExpiry(normalizeDateToDmy(formExpiredDate));
+                        if (rem.label && rem.label !== 'Tanpa ED' && rem.label !== 'Rusak' && rem.label !== 'Karantina') {
+                          return (
+                            <span className="text-[10px] px-2 py-0.5 rounded-full font-bold bg-[#1e293b] text-amber-400 border border-amber-500/30">
+                              Sisa ED: {rem.label}
+                            </span>
+                          );
+                        }
+                        return null;
+                      })()}
                     </div>
                   )}
                 </div>
@@ -2404,11 +2495,11 @@ SKU-002\tProduk Contoh 2\t30/06/2028\tRAK-A02\t120\t12\t1`;
                     ) : (
                       skuStockItems.map(item => (
                         <div key={item.id} className="flex justify-between items-center bg-[#1B212D] border border-slate-800/40 px-2.5 py-1.5 rounded-lg text-xs">
-                          <div className="flex items-center gap-1.5 text-indigo-400 font-mono font-bold">
-                            <MapPin className="w-3.5 h-3.5 text-indigo-400" />
-                            <span>{item.location}</span>
+                          <div className="flex items-center gap-1.5 text-indigo-400 font-mono font-bold truncate">
+                            <MapPin className="w-3.5 h-3.5 text-indigo-400 shrink-0" />
+                            <span className="truncate">{item.location?.trim() || '-'}</span>
                           </div>
-                          <div className="text-right">
+                          <div className="text-right shrink-0 ml-2">
                             <span className="font-extrabold text-white font-mono">{formatNumber(item.qty)}</span>
                             <span className="text-[9px] text-slate-500 font-normal ml-0.5"> pcs</span>
                           </div>
@@ -2467,7 +2558,7 @@ SKU-002\tProduk Contoh 2\t30/06/2028\tRAK-A02\t120\t12\t1`;
                         : 'text-slate-400 hover:text-white'
                     }`}
                   >
-                    Order Outbound ({unifiedHistoryFeed.filter(i => i.source === 'ORDER' || i.type === 'OUTBOUND').length})
+                    Order Outbound ({unifiedHistoryFeed.filter(i => i.source === 'ORDER' || i.type === 'ORDER' || i.type === 'QUICK_OUTBOUND' || i.type === 'OUTBOUND').length})
                   </button>
                   <button
                     onClick={() => setActiveHistoryTab('inbound_adjust')}
@@ -2498,12 +2589,15 @@ SKU-002\tProduk Contoh 2\t30/06/2028\tRAK-A02\t120\t12\t1`;
                         if (item.type === 'TRANSFER' || item.type === 'TRANSFER_IN' || item.type === 'TRANSFER_OUT') {
                           dotColor = 'bg-indigo-500 ring-2 ring-indigo-500/20';
                           badgeColor = 'bg-indigo-550/10 text-indigo-400 border border-indigo-500/20';
+                        } else if (item.type === 'QUICK_OUTBOUND' || item.isQuickOutbound) {
+                          dotColor = 'bg-emerald-500 ring-2 ring-emerald-500/20';
+                          badgeColor = 'bg-emerald-500/10 text-emerald-400 border border-emerald-500/25';
                         } else if (item.type === 'ORDER' || item.type === 'OUTBOUND') {
                           dotColor = 'bg-rose-500 ring-2 ring-rose-500/20';
                           badgeColor = 'bg-rose-500/10 text-rose-455 border border-rose-500/20';
                         } else if (item.type === 'INBOUND') {
-                          dotColor = 'bg-emerald-500 ring-2 ring-emerald-500/20';
-                          badgeColor = 'bg-emerald-500/10 text-emerald-400 border border-emerald-500/25';
+                          dotColor = 'bg-sky-500 ring-2 ring-sky-500/20';
+                          badgeColor = 'bg-sky-500/10 text-sky-400 border border-sky-500/25';
                         } else if (item.type === 'ADJUSTMENT') {
                           dotColor = 'bg-amber-500 ring-2 ring-amber-500/20';
                           badgeColor = 'bg-amber-500/10 text-amber-400 border border-amber-500/20';
@@ -2534,13 +2628,15 @@ SKU-002\tProduk Contoh 2\t30/06/2028\tRAK-A02\t120\t12\t1`;
 
                               {/* Row 2: Qty and Locations */}
                               <div className="flex items-center justify-between gap-4 py-0.5">
-                                <div className="text-sm font-extrabold text-white font-mono">
-                                  {item.type === 'ORDER' || item.type === 'OUTBOUND' || item.type === 'TRANSFER_OUT' ? '-' : '+'}
-                                  {formatNumber(item.qty)}
-                                  <span className="text-[10px] text-slate-500 font-normal ml-0.5"> pcs</span>
+                                <div className="text-sm font-extrabold text-white font-mono flex items-center gap-1">
+                                  <span className={item.type === 'ORDER' || item.type === 'OUTBOUND' || item.type === 'QUICK_OUTBOUND' || item.type === 'TRANSFER_OUT' ? 'text-rose-400' : 'text-emerald-400'}>
+                                    {item.type === 'ORDER' || item.type === 'OUTBOUND' || item.type === 'QUICK_OUTBOUND' || item.type === 'TRANSFER_OUT' ? '-' : '+'}
+                                    {formatNumber(item.qty)}
+                                  </span>
+                                  <span className="text-[10px] text-slate-500 font-normal"> pcs</span>
                                 </div>
                                 <div className="text-xs text-indigo-400 font-mono font-bold bg-[#1B212D] border border-slate-800/50 px-2 py-0.5 rounded flex items-center gap-1">
-                                  <MapPin className="w-3 h-3 text-slate-500" />
+                                  <MapPin className="w-3 h-3 text-slate-500 shrink-0" />
                                   <span>{item.location || '-'}</span>
                                 </div>
                               </div>
@@ -2553,7 +2649,7 @@ SKU-002\tProduk Contoh 2\t30/06/2028\tRAK-A02\t120\t12\t1`;
                               {/* Row 4: Operator Name */}
                               <div className="flex items-center justify-between border-t border-slate-800/40 pt-2 text-[10px] text-slate-500 font-semibold uppercase">
                                 <span className="flex items-center gap-1 font-medium">
-                                  Operator: <strong className="text-slate-400 uppercase font-extrabold ml-0.5">{item.user || 'Sistem'}</strong>
+                                  Operator: <strong className="text-slate-300 uppercase font-extrabold ml-0.5">{item.user || 'Sistem'}</strong>
                                 </span>
                                 {item.status && (
                                   <span className={`px-1.5 py-0.5 rounded text-[9px] font-extrabold border ${
@@ -2563,7 +2659,7 @@ SKU-002\tProduk Contoh 2\t30/06/2028\tRAK-A02\t120\t12\t1`;
                                       ? 'bg-rose-500/10 text-rose-455 border-rose-500/20'
                                       : 'bg-amber-500/10 text-amber-455 border-amber-500/20'
                                   }`}>
-                                    {item.status}
+                                    {item.status === 'Completed' ? '✓ SELESAI' : item.status === 'Pending' ? '⏳ MENUNGGU' : item.status}
                                   </span>
                                 )}
                               </div>

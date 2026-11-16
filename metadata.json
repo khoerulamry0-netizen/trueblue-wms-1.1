@@ -2,10 +2,6 @@
   "name": "BLUES WMS",
   "description": "Sistem pengelolaan stok, penerimaan, pengiriman, audit, dan mutasi gudang secara real-time.",
   "requestFramePermissions": [
-    "camera",
-    "microphone"
-  ],
-  "majorCapabilities": [
-    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+    "camera"
   ]
 }

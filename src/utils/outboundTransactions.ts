@@ -26,7 +26,7 @@ export function prepareOrderEdits(stock:StockItem[],history:OutboundItem[],edits
  return edits.map(({updated,original})=>{
   const live=history.find(o=>o.id===original.id);
   if(!live||(live as any).__wms_revision!==(original as any).__wms_revision)throw new Error('Order berubah di perangkat lain. Buka ulang order.');
-  if(live.status==='Cancelled'||live.shipped)throw new Error('Order dibatalkan atau sudah dikirim tidak dapat diedit.');
+  if(live.status==='Cancelled')throw new Error('Order dibatalkan tidak dapat diedit.');
   if(updated.id!==live.id||updated.status!==live.status||updated.skuId!==live.skuId||(updated.warehouseId||'WH-CENTRAL')!==(live.warehouseId||'WH-CENTRAL'))throw new Error('Identitas, gudang, SKU, dan status order tidak dapat diganti lewat edit.');
   const next={...live,...updated,expiredDate:normalizeDateToDmy(updated.expiredDate),warehouseId:live.warehouseId||'WH-CENTRAL',pickedAt:live.pickedAt,stockDeducted:live.stockDeducted,picked:live.picked,isPicked:live.isPicked};
   if(!Number.isSafeInteger(next.qty)||next.qty<=0)throw new Error('Qty harus bilangan bulat positif.');

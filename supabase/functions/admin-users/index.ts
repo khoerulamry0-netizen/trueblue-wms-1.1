@@ -48,9 +48,17 @@ Deno.serve(async (request) => {
     return response(400, { error: 'Format permintaan tidak valid.' });
   }
 
-  const branchId = typeof body.branchId === 'string' ? body.branchId.trim() : actor.branch_id;
-  const { data: branch } = await serviceClient.from('branches').select('id').eq('id', branchId).maybeSingle();
-  if (!branch || (actor.role !== 'Administrator' && branchId !== actor.branch_id)) return response(403, { error: 'Akses cabang ditolak.' });
+  const branchId = typeof body.branchId === 'string' && body.branchId.trim() ? body.branchId.trim() : (actor.branch_id || 'CENTER');
+  let { data: branch } = await serviceClient.from('branches').select('id').eq('id', branchId).maybeSingle();
+  if (!branch && actor.role === 'Administrator') {
+    const { data: createdBranch } = await serviceClient
+      .from('branches')
+      .upsert({ id: branchId, name: branchId }, { onConflict: 'id' })
+      .select('id')
+      .maybeSingle();
+    if (createdBranch) branch = createdBranch;
+  }
+  if (!branch || (actor.role !== 'Administrator' && branchId !== actor.branch_id)) return response(403, { error: 'Akses cabang ditolak: Cabang "' + branchId + '" tidak terdaftar.' });
   if (actor.role !== 'Administrator' && body.role === 'Administrator') return response(403, { error: 'Hanya kantor pusat dapat memberikan akses Administrator.' });
   const auditAccount = async (action: string, userId: string, details: Record<string, unknown>) => {
     await serviceClient.from('activity_events').insert({ branch_id: branchId, entity_type: 'accounts', entity_id: userId, action,
@@ -75,12 +83,20 @@ Deno.serve(async (request) => {
       email: accountEmail, password, email_confirm: true,
       user_metadata: { full_name: fullName }
     });
-    if (error || !data.user) return response(400, { error: 'ID sudah terdaftar atau akun tidak dapat dibuat.' });
-    const { error: profileError } = await serviceClient.from('profiles')
-      .update({ email: accountEmail, full_name: fullName, role, branch_id: branchId, is_active: true }).eq('id', data.user.id);
+    if (error || !data.user) {
+      return response(400, { error: error?.message || 'ID sudah terdaftar atau akun tidak dapat dibuat.' });
+    }
+    const { error: profileError } = await serviceClient.from('profiles').upsert({
+      id: data.user.id,
+      email: accountEmail,
+      full_name: fullName,
+      role,
+      branch_id: branchId,
+      is_active: true
+    }, { onConflict: 'id' });
     if (profileError) {
       await serviceClient.auth.admin.deleteUser(data.user.id);
-      return response(500, { error: 'Profil gagal disimpan. Silakan coba lagi.' });
+      return response(500, { error: 'Profil gagal disimpan (' + profileError.message + '). Silakan coba lagi.' });
     }
     await auditAccount('ACCOUNT_CREATE',data.user.id,{username,fullName,role,branch_id:branchId});
     return response(200, { success: true, userId: data.user.id, username });

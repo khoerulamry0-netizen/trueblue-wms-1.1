@@ -3,16 +3,23 @@
   <head>
     <meta charset="UTF-8" />
     <script>
-      try { document.documentElement.dataset.theme = localStorage.getItem('trueblue_wms_theme') === 'dark' ? 'dark' : 'citrus'; }
-      catch { document.documentElement.dataset.theme = 'citrus'; }
+      try {
+        document.documentElement.dataset.theme = localStorage.getItem('trueblue_wms_theme') === 'dark' ? 'dark' : 'light';
+        const accent = localStorage.getItem('trueblue_wms_accent') || 'blue';
+        document.documentElement.dataset.accent = accent;
+        if (accent === 'custom') document.documentElement.style.setProperty('--custom-accent', localStorage.getItem('trueblue_wms_custom_accent') || '#2f6feb');
+      } catch {
+        document.documentElement.dataset.theme = 'light';
+        document.documentElement.dataset.accent = 'blue';
+      }
     </script>
-    <meta name="theme-color" content="#f4f6f9" />
+    <meta name="theme-color" content="#ffffff" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <meta name="description" content="TRUEBLUE WMS untuk pengelolaan stok, penerimaan, pengiriman, audit, dan mutasi gudang secara real-time." />
     <meta property="og:title" content="TRUEBLUE WMS" />
     <meta property="og:description" content="Pengelolaan stok, penerimaan, pengiriman, audit, dan mutasi gudang secara real-time." />
-    <link rel="icon" type="image/png" href="/trueblue-lion.png" />
-    <link rel="apple-touch-icon" href="/trueblue-lion.png" />
+    <link rel="icon" type="image/png" href="/trueblue-wms-logo.png" />
+    <link rel="apple-touch-icon" href="/trueblue-wms-logo.png" />
     <title>TRUEBLUE WMS</title>
   </head>
   <body>

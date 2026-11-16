@@ -1,6 +1,17 @@
 import React, { useState, useMemo, useEffect, useRef } from 'react';
-import { OutboundItem } from '../types';
+import {
+  BranchOperationType,
+  ChannelOperationType,
+  OrderType,
+  OutboundItem,
+} from '../types';
 import { formatToWibString } from '../utils/calculations';
+import {
+  formatOrderTypeBadge,
+  isOrderVisibleForBranchManifest,
+  resolveOrderType,
+  validateManifestOrderSelection,
+} from '../utils/orderType';
 import { supabase, getActiveBranch } from '../supabase';
 import * as XLSX from 'xlsx';
 import { 
@@ -27,6 +38,7 @@ export interface ShippingManifest {
   branchId?: string;
   warehouseId?: string;
   warehouseName?: string;
+  orderType?: ChannelOperationType;
   senderName?: string;
   courierName: string;
   driverName?: string;
@@ -47,6 +59,7 @@ interface CourierManifestManagerProps {
   warehouses?: { id: string; name: string }[];
   selectedWarehouseId?: string;
   onSelectWarehouseId?: (whId: string) => void;
+  branchOperationType?: BranchOperationType;
 }
 
 export default function CourierManifestManager({
@@ -55,7 +68,8 @@ export default function CourierManifestManager({
   onUpdateOrdersShipped,
   warehouses = [],
   selectedWarehouseId = 'WH-CENTRAL',
-  onSelectWarehouseId
+  onSelectWarehouseId,
+  branchOperationType = 'HYBRID',
 }: CourierManifestManagerProps) {
   // Warehouse context
   const currentWarehouseId = (selectedWarehouseId || 'WH-CENTRAL').toUpperCase();
@@ -66,6 +80,13 @@ export default function CourierManifestManager({
 
   // Filter riwayat manifest: 'CURRENT' (hanya gudang aktif) atau 'ALL' (semua cabang)
   const [manifestHistoryFilter, setManifestHistoryFilter] = useState<'CURRENT' | 'ALL'>('CURRENT');
+  const [manifestChannelFilter, setManifestChannelFilter] = useState<'ALL' | ChannelOperationType>('ALL');
+
+  useEffect(() => {
+    if (branchOperationType !== 'HYBRID') {
+      setManifestChannelFilter('ALL');
+    }
+  }, [branchOperationType]);
 
   // Ekspedisi options
   const COURIER_OPTIONS = [
@@ -131,6 +152,7 @@ export default function CourierManifestManager({
       noPo: string;
       customerName: string;
       warehouseId: string;
+      orderType: OrderType;
       totalSku: number;
       totalQty: number;
       completedAt: string;
@@ -148,6 +170,7 @@ export default function CourierManifestManager({
           noPo: item.noPo || '-',
           customerName: item.customerName || 'Customer Umum',
           warehouseId: whId,
+          orderType: resolveOrderType(item),
           totalSku: 0,
           totalQty: 0,
           completedAt: item.completedAt || item.timestamp,
@@ -166,14 +189,24 @@ export default function CourierManifestManager({
   // Antrean scan untuk manifest saat ini
   const [manifestOrderRefs, setManifestOrderRefs] = useState<string[]>([]);
   const deletedManifestIds = useRef<Set<string>>(new Set());
+  const manifestStorageKey = `blues-shipping-manifests_${activeBranch}_${(currentUser?.username || 'default').toLowerCase()}`;
   const [createdManifests, setCreatedManifests] = useState<ShippingManifest[]>(() => {
     try {
-      const stored = localStorage.getItem('blues-shipping-manifests');
+      const stored = localStorage.getItem(manifestStorageKey);
       return stored ? JSON.parse(stored) : [];
     } catch {
       return [];
     }
   });
+
+  useEffect(() => {
+    try {
+      const stored = localStorage.getItem(manifestStorageKey);
+      setCreatedManifests(stored ? JSON.parse(stored) : []);
+    } catch {
+      setCreatedManifests([]);
+    }
+  }, [manifestStorageKey]);
 
   // Sinkronisasi dokumen manifest dari orderHistory agar multi-device dan lintas sesi tetap konsisten
   useEffect(() => {
@@ -186,12 +219,14 @@ export default function CourierManifestManager({
       const ref = item.referenceNumber || item.orderNumber || item.id;
       const itemWh = (item.warehouseId || 'WH-CENTRAL').toUpperCase();
       const matchedWh = warehouses.find(w => w.id.toUpperCase() === itemWh);
+      const itemOrderType = resolveOrderType(item);
       if (!reconstructedMap.has(mId)) {
         reconstructedMap.set(mId, {
           manifestId: mId,
           branchId: activeBranch,
           warehouseId: itemWh,
           warehouseName: matchedWh?.name || (itemWh === 'WH-CENTRAL' ? 'Gudang Pusat (Central DC)' : itemWh),
+          ...(itemOrderType === 'B2B' || itemOrderType === 'ONLINE' ? { orderType: itemOrderType } : {}),
           courierName: item.notes?.match(/\[Kurir:\s*([^\]]+)\]/)?.[1] || 'Ekspedisi Terkonfirmasi',
           handedOverBy: item.shippedBy || 'Petugas WMS',
           handedOverAt: item.shippedAt || item.timestamp,
@@ -213,10 +248,60 @@ export default function CourierManifestManager({
       const merged = [...Array.from(reconstructedMap.values()), ...createdManifests];
       setCreatedManifests(merged);
       try {
-        localStorage.setItem('blues-shipping-manifests', JSON.stringify(merged));
+        localStorage.setItem(manifestStorageKey, JSON.stringify(merged));
       } catch {}
     }
-  }, [orderHistory, createdManifests, activeBranch, warehouses]);
+  }, [orderHistory, createdManifests, activeBranch, warehouses, manifestStorageKey]);
+
+  // Muat manifest resmi dari tabel Supabase public.shipping_manifests (jika sudah dimigrasi)
+  useEffect(() => {
+    let isLive = true;
+    (async () => {
+      try {
+        if (!supabase) return;
+        const { data, error } = await supabase
+          .from('shipping_manifests')
+          .select('*')
+          .eq('branch_id', activeBranch)
+          .eq('status', 'ACTIVE')
+          .order('handed_over_at', { ascending: false });
+        if (!isLive || error || !Array.isArray(data) || data.length === 0) return;
+        setCreatedManifests((prev) => {
+          const existing = new Set(prev.map((m) => m.manifestId));
+          const serverItems: ShippingManifest[] = data
+            .filter((row: any) => row?.manifest_id && !existing.has(row.manifest_id) && !deletedManifestIds.current.has(row.manifest_id))
+            .map((row: any) => {
+              const ordType = resolveOrderType({ orderType: row.order_type });
+              return {
+                manifestId: String(row.manifest_id),
+                branchId: String(row.branch_id || activeBranch),
+                warehouseId: String(row.warehouse_id || 'WH-CENTRAL'),
+                warehouseName: row.warehouse_name || undefined,
+                ...(ordType === 'B2B' || ordType === 'ONLINE' ? { orderType: ordType } : {}),
+                senderName: row.sender_name || undefined,
+                courierName: String(row.courier_name || 'Ekspedisi Terkonfirmasi'),
+                driverName: row.driver_name || undefined,
+                driverPhone: row.driver_phone || undefined,
+                vehiclePlate: row.vehicle_plate || undefined,
+                handedOverBy: String(row.handed_over_by || 'Petugas WMS'),
+                handedOverAt: String(row.handed_over_at || new Date().toISOString()),
+                totalOrders: Number(row.total_orders || 0),
+                totalQtyPcs: Number(row.total_qty_pcs || 0),
+                orderReferences: Array.isArray(row.order_references) ? row.order_references : [],
+                notes: row.notes || undefined,
+              };
+            });
+          if (serverItems.length === 0) return prev;
+          const next = [...serverItems, ...prev];
+          try {
+            localStorage.setItem(manifestStorageKey, JSON.stringify(next));
+          } catch {}
+          return next;
+        });
+      } catch {}
+    })();
+    return () => { isLive = false; };
+  }, [activeBranch, manifestStorageKey]);
 
   // 2. Kumpulan nomor order / ref yang sudah pernah masuk ke dalam dokumen manifest yang tersimpan
   const manifestedRefNumbers = useMemo(() => {
@@ -227,32 +312,49 @@ export default function CourierManifestManager({
     return set;
   }, [createdManifests]);
 
-  // 3. Order completed yang SIAP DISERAHKAN (belum pernah di-manifest dan belum dikirim) SESUAI GUDANG TERPILIH
-  const completedOrders = useMemo(() => {
-    return Array.from(allCompletedOrdersMap.values()).filter(o => 
+  // 3. Order completed siap serah terima (lintas kanal di gudang aktif, belum dimanifestasikan & belum shipped)
+  const readyOrders = useMemo(() => {
+    return Array.from(allCompletedOrdersMap.values()).filter(o =>
       !manifestedRefNumbers.has(o.referenceNumber) &&
       !o.items.some(i => i.shipped) &&
       (o.warehouseId || 'WH-CENTRAL').toUpperCase() === currentWarehouseId
     );
   }, [allCompletedOrdersMap, manifestedRefNumbers, currentWarehouseId]);
 
-  // 4. Riwayat Dokumen Manifest Terfilter berdasarkan Cabang / Gudang
+  const unassignedCompletedCount = useMemo(() => {
+    return readyOrders.filter(o => o.orderType === 'UNASSIGNED').length;
+  }, [readyOrders]);
+
+  // 3b. Order completed yang SIAP DISERAHKAN sesuai tipe operasional cabang & filter kanal HYBRID
+  const completedOrders = useMemo(() => {
+    return readyOrders.filter(o =>
+      isOrderVisibleForBranchManifest(
+        o,
+        branchOperationType,
+        branchOperationType === 'HYBRID' ? manifestChannelFilter : 'ALL'
+      )
+    );
+  }, [readyOrders, branchOperationType, manifestChannelFilter]);
+
+  // 4. Riwayat Dokumen Manifest Terfilter berdasarkan Cabang / Gudang & tipe cabang
   const visibleManifests = useMemo(() => {
     return createdManifests.filter(m => {
       if ((m.branchId || 'CENTER') !== activeBranch) return false;
+      if (branchOperationType !== 'HYBRID' && m.orderType && m.orderType !== branchOperationType) return false;
+      if (branchOperationType === 'HYBRID' && manifestChannelFilter !== 'ALL' && m.orderType && m.orderType !== manifestChannelFilter) return false;
       if (manifestHistoryFilter === 'ALL') return true;
       const mWh = (m.warehouseId || 'WH-CENTRAL').toUpperCase();
       return mWh === currentWarehouseId;
     });
-  }, [createdManifests, activeBranch, manifestHistoryFilter, currentWarehouseId]);
+  }, [createdManifests, activeBranch, manifestHistoryFilter, currentWarehouseId, branchOperationType, manifestChannelFilter]);
 
   // Modal cetak manifest
   const [printManifest, setPrintManifest] = useState<ShippingManifest | null>(null);
 
-  // Orders dalam antrean manifest saat ini
+  // Orders dalam antrean manifest saat ini (diambil dari readyOrders tervalidasi, bukan tergantung filter tab HYBRID)
   const activeManifestOrders = useMemo(() => {
-    return completedOrders.filter(o => manifestOrderRefs.includes(o.referenceNumber));
-  }, [completedOrders, manifestOrderRefs]);
+    return readyOrders.filter(o => manifestOrderRefs.includes(o.referenceNumber));
+  }, [readyOrders, manifestOrderRefs]);
 
   const totalScannedPcs = useMemo(() => {
     return activeManifestOrders.reduce((sum, o) => sum + o.totalQty, 0);
@@ -271,19 +373,40 @@ export default function CourierManifestManager({
   // Fitur Khusus Admin: Masukkan seluruh order completed ke antrean manifest tanpa scan satu per satu
   const handleAdminSelectAll = () => {
     if (unselectedOrders.length === 0) return;
+    const candidateOrders = readyOrders.filter(
+      (o) => manifestOrderRefs.includes(o.referenceNumber) || unselectedOrders.some((u) => u.referenceNumber === o.referenceNumber)
+    );
+    const check = validateManifestOrderSelection(candidateOrders, branchOperationType);
+    if (!check.ok) {
+      playScanError();
+      setScanFeedback({
+        type: 'error',
+        message: `⚠️ ${check.error} Gunakan filter "B2B" atau "Online" terlebih dahulu pada cabang HYBRID.`,
+      });
+      return;
+    }
     playScanBeep();
-    const allRefs = completedOrders.map(o => o.referenceNumber);
+    const allRefs = candidateOrders.map(o => o.referenceNumber);
     setManifestOrderRefs(allRefs);
     setScanFeedback({
       type: 'success',
-      message: `⚡ [ADMIN] Seluruh ${allRefs.length} order completed (${completedOrders.reduce((s, o) => s + o.totalQty, 0)} Pcs) berhasil dimasukkan ke manifest!`
+      message: `⚡ [ADMIN] Seluruh ${allRefs.length} order ${check.orderType} (${candidateOrders.reduce((s, o) => s + o.totalQty, 0)} Pcs) berhasil dimasukkan ke manifest!`
     });
   };
 
   // Fitur Khusus Admin: Kirim & Terbitkan Manifest seluruh order completed langsung dalam satu klik
-  const handleAdminSendAllDirectly = () => {
+  const handleAdminSendAllDirectly = async () => {
     if (completedOrders.length === 0) {
       alert('Tidak ada pesanan berstatus Completed yang siap diserahkan.');
+      return;
+    }
+    const check = validateManifestOrderSelection(completedOrders, branchOperationType);
+    if (!check.ok || !check.orderType) {
+      playScanError();
+      setScanFeedback({
+        type: 'error',
+        message: `⚠️ ${check.error} Pilih filter B2B atau Online terlebih dahulu agar manifest tetap terpisah.`,
+      });
       return;
     }
 
@@ -291,7 +414,7 @@ export default function CourierManifestManager({
     const totalPcs = completedOrders.reduce((sum, o) => sum + o.totalQty, 0);
 
     const confirmed = window.confirm(
-      `⚡ KONFIRMASI KHUSUS ADMIN:\n\nKirim dan buat dokumen Surat Jalan Manifest untuk SELURUH ${totalOrders} order completed (${totalPcs} Pcs) ke ekspedisi "${activeCourierName}" tanpa perlu scan satu per satu?\n\nSemua order akan otomatis dirangkum ke dalam satu dokumen Manifest serah terima kurir.`
+      `⚡ KONFIRMASI KHUSUS ADMIN:\n\nKirim dan buat dokumen Surat Jalan Manifest [${check.orderType}] untuk SELURUH ${totalOrders} order completed (${totalPcs} Pcs) ke ekspedisi "${activeCourierName}"?\n\nSemua order akan otomatis dirangkum ke dalam satu dokumen Manifest serah terima kurir.`
     );
     if (!confirmed) return;
 
@@ -303,6 +426,7 @@ export default function CourierManifestManager({
       branchId: activeBranch,
       warehouseId: currentWarehouseId,
       warehouseName: currentWarehouse.name,
+      orderType: check.orderType,
       senderName: resolvedSender,
       courierName: activeCourierName,
       driverName: driverName.trim() || undefined,
@@ -313,23 +437,33 @@ export default function CourierManifestManager({
       totalOrders,
       totalQtyPcs: totalPcs,
       orderReferences: completedOrders.map(o => o.referenceNumber),
-      notes: manifestNotes.trim() ? `${manifestNotes.trim()} [Admin Bulk Handover]` : '[Admin Bulk Handover]'
+      notes: manifestNotes.trim() ? `${manifestNotes.trim()} [Admin Bulk Handover · ${check.orderType}]` : `[Admin Bulk Handover · ${check.orderType}]`
     };
+
+    const targetRefs = completedOrders.map(o => o.referenceNumber);
+    if (onUpdateOrdersShipped) {
+      try {
+        const ok = await onUpdateOrdersShipped(targetRefs, newManifest);
+        if (ok === false) {
+          throw new Error('Server menolak atau gagal mengonfirmasi pembuatan manifest.');
+        }
+      } catch (err: any) {
+        console.error('Gagal sinkron status kirim ke order history:', err);
+        setScanFeedback({
+          type: 'error',
+          message: `Gagal menyimpan manifest ke server: ${err?.message || 'Periksa koneksi dan coba lagi.'}`
+        });
+        return;
+      }
+    }
 
     const updatedManifests = [newManifest, ...createdManifests];
     setCreatedManifests(updatedManifests);
     try {
-      localStorage.setItem('blues-shipping-manifests', JSON.stringify(updatedManifests));
+      localStorage.setItem(manifestStorageKey, JSON.stringify(updatedManifests));
       window.dispatchEvent(new Event('blues-manifests-updated'));
     } catch (e) {
       console.warn('Failed to save manifest locally', e);
-    }
-
-    const targetRefs = completedOrders.map(o => o.referenceNumber);
-    if (onUpdateOrdersShipped) {
-      onUpdateOrdersShipped(targetRefs, newManifest).catch(err => {
-        console.error('Gagal sinkron status kirim ke order history:', err);
-      });
     }
 
     setManifestOrderRefs([]);
@@ -346,7 +480,7 @@ export default function CourierManifestManager({
   };
 
   // Batalkan / Hapus dokumen manifest dan kembalikan order ke status Siap Diserahkan
-  const handleDeleteManifest = (manifestId: string) => {
+  const handleDeleteManifest = async (manifestId: string) => {
     const target = createdManifests.find(m => m.manifestId === manifestId);
     if (!target) return;
     const confirmed = window.confirm(
@@ -354,20 +488,34 @@ export default function CourierManifestManager({
     );
     if (!confirmed) return;
 
+    if (onUpdateOrdersShipped && target.orderReferences && target.orderReferences.length > 0) {
+      try {
+        const ok = await onUpdateOrdersShipped(
+          target.orderReferences,
+          { manifestId: target.manifestId, orderType: target.orderType },
+          true
+        );
+        if (ok === false) {
+          throw new Error('Server gagal membatalkan manifest.');
+        }
+      } catch (err: any) {
+        console.error('Gagal mengembalikan status kirim:', err);
+        setScanFeedback({
+          type: 'error',
+          message: `Gagal membatalkan manifest di server: ${err?.message || 'Periksa koneksi dan coba lagi.'}`
+        });
+        return;
+      }
+    }
+
     deletedManifestIds.current.add(manifestId);
     const remaining = createdManifests.filter(m => m.manifestId !== manifestId);
     setCreatedManifests(remaining);
     try {
-      localStorage.setItem('blues-shipping-manifests', JSON.stringify(remaining));
+      localStorage.setItem(manifestStorageKey, JSON.stringify(remaining));
       window.dispatchEvent(new Event('blues-manifests-updated'));
     } catch (e) {
       console.warn('Failed to update local manifests', e);
-    }
-
-    if (onUpdateOrdersShipped && target.orderReferences && target.orderReferences.length > 0) {
-      onUpdateOrdersShipped(target.orderReferences, {}, true).catch(err => {
-        console.error('Gagal mengembalikan status kirim:', err);
-      });
     }
 
     setScanFeedback({
@@ -407,30 +555,7 @@ export default function CourierManifestManager({
     } catch {}
   };
 
-  // Helper untuk proses scan otomatis
-  const processBarcodeScan = (rawQuery: string) => {
-    const query = rawQuery.trim().toUpperCase();
-    if (!query) return;
-
-    // Cari di completedOrders by referenceNumber, orderNumber, noPo, atau batchNumber
-    const matched = completedOrders.find(o => 
-      o.referenceNumber.toUpperCase() === query ||
-      o.orderNumber.toUpperCase() === query ||
-      o.noPo.toUpperCase() === query ||
-      o.batchNumber.toUpperCase() === query ||
-      o.items.some(i => i.id.toUpperCase() === query || i.skuId.toUpperCase() === query)
-    );
-
-    if (!matched) {
-      playScanError();
-      setScanFeedback({
-        type: 'error',
-        message: `❌ Order / Resi "${query}" tidak ditemukan atau belum berstatus COMPLETED di Packing!`
-      });
-      setScanInput('');
-      return;
-    }
-
+  const tryQueueOrder = (matched: (typeof readyOrders)[number]) => {
     if (manifestOrderRefs.includes(matched.referenceNumber)) {
       playScanError();
       setScanFeedback({
@@ -441,13 +566,82 @@ export default function CourierManifestManager({
       return;
     }
 
+    const validation = validateManifestOrderSelection([...activeManifestOrders, matched], branchOperationType);
+    if (!validation.ok) {
+      playScanError();
+      setScanFeedback({
+        type: 'error',
+        message: `❌ ${validation.error}`
+      });
+      setScanInput('');
+      return;
+    }
+
     playScanBeep();
     setManifestOrderRefs(prev => [matched.referenceNumber, ...prev]);
     setScanFeedback({
       type: 'success',
-      message: `✓ Otomatis masuk: ${matched.referenceNumber} (${matched.customerName} - ${matched.totalQty} Pcs)`
+      message: `✓ [${formatOrderTypeBadge(matched.orderType)}] Otomatis masuk: ${matched.referenceNumber} (${matched.customerName} - ${matched.totalQty} Pcs)`
     });
     setScanInput('');
+  };
+
+  // Helper untuk proses scan otomatis
+  const processBarcodeScan = (rawQuery: string) => {
+    const query = rawQuery.trim().toUpperCase();
+    if (!query) return;
+
+    // Cari di completedOrders dulu, lalu fallback cek readyOrders/allCompletedOrdersMap untuk pesan error spesifik
+    const matched = completedOrders.find(o => 
+      o.referenceNumber.toUpperCase() === query ||
+      o.orderNumber.toUpperCase() === query ||
+      o.noPo.toUpperCase() === query ||
+      o.batchNumber.toUpperCase() === query ||
+      o.items.some(i => i.id.toUpperCase() === query || i.skuId.toUpperCase() === query)
+    );
+
+    if (!matched) {
+      const blockedCandidate = readyOrders.find(o =>
+        o.referenceNumber.toUpperCase() === query ||
+        o.orderNumber.toUpperCase() === query ||
+        o.noPo.toUpperCase() === query ||
+        o.batchNumber.toUpperCase() === query
+      );
+      if (blockedCandidate) {
+        const validation = validateManifestOrderSelection([blockedCandidate], branchOperationType);
+        playScanError();
+        setScanFeedback({
+          type: 'error',
+          message: `❌ ${validation.error || `Order "${blockedCandidate.referenceNumber}" tidak sesuai filter kanal aktif.`}`
+        });
+        setScanInput('');
+        return;
+      }
+
+      const shippedMatch = Array.from(allCompletedOrdersMap.values()).find(o =>
+        (o.referenceNumber.toUpperCase() === query || o.orderNumber.toUpperCase() === query) &&
+        (manifestedRefNumbers.has(o.referenceNumber) || o.items.some(i => i.shipped))
+      );
+      if (shippedMatch) {
+        playScanError();
+        setScanFeedback({
+          type: 'error',
+          message: `❌ Order "${shippedMatch.referenceNumber}" sudah tercatat terkirim / masuk ke manifest lain!`
+        });
+        setScanInput('');
+        return;
+      }
+
+      playScanError();
+      setScanFeedback({
+        type: 'error',
+        message: `❌ Order / Resi "${query}" tidak ditemukan atau belum berstatus COMPLETED di Packing!`
+      });
+      setScanInput('');
+      return;
+    }
+
+    tryQueueOrder(matched);
   };
 
   // Handle Scan barcode order / resi submit
@@ -487,6 +681,7 @@ export default function CourierManifestManager({
         return {
           'No': i + 1,
           'No. Manifest': manifest.manifestId,
+          'Jenis Order': manifest.orderType || matched?.orderType || '-',
           'Gudang / Cabang': manifest.warehouseName || manifest.warehouseId || 'Gudang Pusat',
           'Ekspedisi': manifest.courierName,
           'Driver': manifest.driverName || '-',
@@ -508,12 +703,14 @@ export default function CourierManifestManager({
       worksheet['!cols'] = [
         { wch: 6 },
         { wch: 22 },
+        { wch: 12 },
         { wch: 18 },
         { wch: 18 },
         { wch: 14 },
         { wch: 20 },
         { wch: 22 },
         { wch: 22 },
+        { wch: 16 },
         { wch: 16 },
         { wch: 28 },
         { wch: 12 },
@@ -531,9 +728,19 @@ export default function CourierManifestManager({
       alert('Gagal mengekspor data manifest ke Excel.');
     }
   };
-  const handleCreateManifest = () => {
+  const handleCreateManifest = async () => {
     if (activeManifestOrders.length === 0) {
       alert('Pindai atau masukkan minimal 1 order yang akan diserahkan ke kurir.');
+      return;
+    }
+
+    const validation = validateManifestOrderSelection(activeManifestOrders, branchOperationType);
+    if (!validation.ok || !validation.orderType) {
+      playScanError();
+      setScanFeedback({
+        type: 'error',
+        message: `❌ ${validation.error}`,
+      });
       return;
     }
 
@@ -544,6 +751,7 @@ export default function CourierManifestManager({
       branchId: activeBranch,
       warehouseId: currentWarehouseId,
       warehouseName: currentWarehouse.name,
+      orderType: validation.orderType,
       senderName: resolvedSender,
       courierName: activeCourierName,
       driverName: driverName.trim() || undefined,
@@ -557,20 +765,30 @@ export default function CourierManifestManager({
       notes: manifestNotes.trim() || undefined
     };
 
+    const targetRefs = activeManifestOrders.map(o => o.referenceNumber);
+    if (onUpdateOrdersShipped) {
+      try {
+        const ok = await onUpdateOrdersShipped(targetRefs, newManifest);
+        if (ok === false) {
+          throw new Error('Server menolak atau gagal mengonfirmasi pembuatan manifest.');
+        }
+      } catch (err: any) {
+        console.error('Gagal sinkron status kirim ke order history:', err);
+        setScanFeedback({
+          type: 'error',
+          message: `Gagal menyimpan manifest ke server: ${err?.message || 'Periksa koneksi dan coba lagi.'}`
+        });
+        return;
+      }
+    }
+
     const updatedManifests = [newManifest, ...createdManifests];
     setCreatedManifests(updatedManifests);
     try {
-      localStorage.setItem('blues-shipping-manifests', JSON.stringify(updatedManifests));
+      localStorage.setItem(manifestStorageKey, JSON.stringify(updatedManifests));
       window.dispatchEvent(new Event('blues-manifests-updated'));
     } catch (e) {
       console.warn('Failed to save manifest locally', e);
-    }
-
-    const targetRefs = activeManifestOrders.map(o => o.referenceNumber);
-    if (onUpdateOrdersShipped) {
-      onUpdateOrdersShipped(targetRefs, newManifest).catch(err => {
-        console.error('Gagal sinkron status kirim ke order history:', err);
-      });
     }
 
     // Reset antrean
@@ -599,15 +817,40 @@ export default function CourierManifestManager({
                 <Truck className="w-5 h-5" />
               </div>
               <h2 className="text-xl font-extrabold tracking-tight text-white">
-                5. Manifest Serah Terima Ekspedisi / Kurir
+                Manifest Serah Terima Ekspedisi / Kurir
+                <span className="ml-2 px-2 py-0.5 rounded-full text-[11px] font-black bg-sky-500/15 text-sky-300 border border-sky-500/30 align-middle">
+                  {branchOperationType}
+                </span>
               </h2>
             </div>
             <p className="text-slate-400 text-xs md:text-sm mt-1">
-              Catat serah terima paket yang telah dipacking kepada pihak kurir/ekspedisi (J&T, SPX, SiCepat, dll) lengkap dengan bukti cetak tanda terima manifest.
+              Catat serah terima paket yang telah dipacking kepada pihak kurir/ekspedisi. Manifest B2B dan Online wajib diterbitkan terpisah.
             </p>
           </div>
 
           <div className="flex flex-wrap items-center gap-2">
+            {branchOperationType === 'HYBRID' && (
+              <div className="inline-flex items-center gap-1 bg-slate-900 border border-slate-800 rounded-lg p-1 text-xs">
+                {(['ALL', 'B2B', 'ONLINE'] as const).map((ch) => (
+                  <button
+                    key={ch}
+                    type="button"
+                    onClick={() => setManifestChannelFilter(ch)}
+                    className={`px-2.5 py-1 rounded-md font-bold transition-colors cursor-pointer ${
+                      manifestChannelFilter === ch
+                        ? ch === 'B2B'
+                          ? 'bg-amber-500 text-slate-950'
+                          : ch === 'ONLINE'
+                            ? 'bg-emerald-500 text-slate-950'
+                            : 'bg-sky-500 text-slate-950'
+                        : 'text-slate-400 hover:text-white'
+                    }`}
+                  >
+                    {ch === 'ALL' ? 'Semua' : ch}
+                  </button>
+                ))}
+              </div>
+            )}
             {warehouses && warehouses.length > 0 && onSelectWarehouseId && (
               <div className="flex items-center gap-1.5 bg-slate-900 border border-slate-800 rounded-lg px-2.5 py-1.5">
                 <span className="text-[11px] text-slate-400 font-bold">Gudang:</span>
@@ -644,6 +887,15 @@ export default function CourierManifestManager({
           </div>
         </div>
       </div>
+
+      {/* Alert UNASSIGNED completed orders */}
+      {unassignedCompletedCount > 0 && (
+        <div role="alert" className="rounded-xl border border-amber-500/40 bg-amber-500/10 px-4 py-3 text-xs text-amber-200 flex items-center justify-between gap-2">
+          <span>
+            ⚠️ Terdapat <strong>{unassignedCompletedCount} order Completed berstatus UNASSIGNED</strong> di gudang ini yang tidak ditampilkan agar tidak salah kanal. Hubungi Admin untuk klasifikasi B2B / ONLINE.
+          </span>
+        </div>
+      )}
 
       {/* Main Grid: Form Serah Terima & Antrean Scan */}
       <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
@@ -883,6 +1135,9 @@ export default function CourierManifestManager({
                       <div className="min-w-0">
                         <div className="font-extrabold text-white truncate flex items-center gap-2">
                           <span>{ord.referenceNumber}</span>
+                          <span className={`px-1.5 py-0.5 rounded text-[9px] font-black border ${ord.orderType === 'B2B' ? 'bg-amber-500/20 text-amber-300 border-amber-500/30' : 'bg-emerald-500/20 text-emerald-300 border-emerald-500/30'}`}>
+                            {formatOrderTypeBadge(ord.orderType)}
+                          </span>
                           {ord.orderNumber && ord.orderNumber !== '-' && (
                             <span className="text-[10px] bg-slate-800 text-slate-300 px-1.5 py-0.5 rounded font-mono">
                               No: {ord.orderNumber}
@@ -938,10 +1193,11 @@ export default function CourierManifestManager({
                       <button
                         key={o.referenceNumber}
                         type="button"
-                        onClick={() => setManifestOrderRefs(prev => [...prev, o.referenceNumber])}
+                        onClick={() => tryQueueOrder(o)}
                         className="px-2.5 py-1 bg-[#11141B] hover:bg-slate-800 text-slate-300 border border-slate-800 rounded-lg text-[10px] font-mono flex items-center gap-1 transition-colors cursor-pointer"
                       >
                         <span>+ {o.referenceNumber}</span>
+                        <span className={`text-[9px] font-black ${o.orderType === 'B2B' ? 'text-amber-400' : 'text-sky-400'}`}>[{o.orderType}]</span>
                         <span className="text-emerald-400 font-bold">({o.totalQty})</span>
                       </button>
                     ))}
@@ -1043,7 +1299,16 @@ export default function CourierManifestManager({
               <tbody className="divide-y divide-slate-800/60 font-medium">
                 {visibleManifests.map(m => (
                   <tr key={m.manifestId} className="hover:bg-slate-800/20 transition-colors">
-                    <td className="px-4 py-3 font-mono font-bold text-white">{m.manifestId}</td>
+                    <td className="px-4 py-3 font-mono font-bold text-white">
+                      <div className="flex items-center gap-1.5">
+                        <span>{m.manifestId}</span>
+                        {m.orderType && (
+                          <span className={`px-1.5 py-0.5 rounded text-[9px] font-black border ${m.orderType === 'B2B' ? 'bg-amber-500/20 text-amber-300 border-amber-500/30' : 'bg-emerald-500/20 text-emerald-300 border-emerald-500/30'}`}>
+                            {m.orderType}
+                          </span>
+                        )}
+                      </div>
+                    </td>
                     <td className="px-4 py-3">
                       <span className="px-2 py-0.5 rounded text-[10px] font-bold bg-sky-500/10 text-sky-400 border border-sky-500/20 whitespace-nowrap">
                         {m.warehouseName || m.warehouseId || 'Gudang Pusat'}
@@ -1143,7 +1408,7 @@ export default function CourierManifestManager({
                   <p className="text-[11px] text-slate-600 mt-0.5">Bukti sah serah terima paket pesanan dari Gudang ke pihak Ekspedisi / Kurir.</p>
                 </div>
                 <div className="text-right font-mono text-[11px]">
-                  <div>NO: <strong>{printManifest.manifestId}</strong></div>
+                  <div>NO: <strong>{printManifest.manifestId}</strong> {printManifest.orderType ? `[${printManifest.orderType}]` : ''}</div>
                   <div>TANGGAL: <strong>{formatToWibString(printManifest.handedOverAt)}</strong></div>
                 </div>
               </div>

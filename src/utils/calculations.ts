@@ -240,6 +240,184 @@ export function getExpiredStatus(expiredDate: string): 'AMAN' | 'Under 24Month' 
   return 'AMAN';
 }
 
+export interface RemainingExpiryResult {
+  label: string;
+  totalDays: number;
+  totalMonths: number;
+  months: number;
+  days: number;
+  tone: 'safe' | 'amber' | 'warning' | 'danger' | 'neutral';
+  isExpired: boolean;
+}
+
+/**
+ * Menghitung sisa waktu Expired Date secara presisi (Bulan & Hari)
+ * Contoh: "20 bln 21 hari", "23 bln 26 hari", "14 hari", "Tanpa ED", dsb.
+ */
+export function calculateRemainingExpiry(
+  expiredDateStr: string,
+  baseDate: Date = new Date()
+): RemainingExpiryResult {
+  const raw = (expiredDateStr || '').trim();
+  const normalized = raw.toLowerCase();
+
+  if (isNoExpiryDate(raw) || normalized === 'no expired' || normalized === '--' || !raw) {
+    return {
+      label: 'Tanpa ED',
+      totalDays: Infinity,
+      totalMonths: Infinity,
+      months: 0,
+      days: 0,
+      tone: 'safe',
+      isExpired: false
+    };
+  }
+
+  if (normalized.includes('damage') || normalized.includes('rusak')) {
+    return {
+      label: 'Rusak',
+      totalDays: -1,
+      totalMonths: -1,
+      months: 0,
+      days: 0,
+      tone: 'danger',
+      isExpired: false
+    };
+  }
+
+  if (normalized.includes('karantina')) {
+    return {
+      label: 'Karantina',
+      totalDays: -1,
+      totalMonths: -1,
+      months: 0,
+      days: 0,
+      tone: 'warning',
+      isExpired: false
+    };
+  }
+
+  const cleanDate = normalizeDateToDmy(raw);
+  const parts = cleanDate.split('/');
+  if (parts.length !== 3) {
+    return {
+      label: cleanDate || 'Periksa ED',
+      totalDays: 0,
+      totalMonths: 0,
+      months: 0,
+      days: 0,
+      tone: 'warning',
+      isExpired: false
+    };
+  }
+
+  const day = parseInt(parts[0], 10);
+  const month = parseInt(parts[1], 10) - 1;
+  const year = parseInt(parts[2], 10);
+
+  if (isNaN(day) || isNaN(month) || isNaN(year)) {
+    return {
+      label: 'Periksa ED',
+      totalDays: 0,
+      totalMonths: 0,
+      months: 0,
+      days: 0,
+      tone: 'warning',
+      isExpired: false
+    };
+  }
+
+  const expDate = new Date(year, month, day);
+
+  // Basis tanggal hari ini (Zona Waktu Jakarta / Asia/Jakarta)
+  const todayWib = new Intl.DateTimeFormat('sv-SE', { timeZone: 'Asia/Jakarta' }).format(baseDate);
+  const currentDate = new Date(todayWib + 'T00:00:00');
+
+  const diffMs = expDate.getTime() - currentDate.getTime();
+  const totalDays = Math.round(diffMs / (1000 * 60 * 60 * 24));
+
+  if (totalDays < 0) {
+    return {
+      label: `Lewat ED (${Math.abs(totalDays)} hr)`,
+      totalDays,
+      totalMonths: 0,
+      months: 0,
+      days: 0,
+      tone: 'danger',
+      isExpired: true
+    };
+  }
+
+  if (totalDays === 0) {
+    return {
+      label: 'ED Hari ini',
+      totalDays: 0,
+      totalMonths: 0,
+      months: 0,
+      days: 0,
+      tone: 'danger',
+      isExpired: true
+    };
+  }
+
+  // Hitung jumlah bulan penuh dari currentDate ke expDate
+  let cursor = new Date(currentDate.getTime());
+  let monthsCount = 0;
+
+  while (true) {
+    const nextMonth = new Date(cursor.getFullYear(), cursor.getMonth() + 1, cursor.getDate());
+    if (nextMonth.getDate() !== cursor.getDate()) {
+      nextMonth.setDate(0);
+    }
+    if (nextMonth <= expDate) {
+      cursor = nextMonth;
+      monthsCount++;
+    } else {
+      break;
+    }
+  }
+
+  const remainingDays = Math.round((expDate.getTime() - cursor.getTime()) / (1000 * 60 * 60 * 24));
+
+  let label = '';
+  if (monthsCount > 0 && remainingDays > 0) {
+    label = `${monthsCount} bln ${remainingDays} hari`;
+  } else if (monthsCount > 0) {
+    label = `${monthsCount} bln`;
+  } else {
+    label = `${remainingDays} hari`;
+  }
+
+  // Pengelompokan tone:
+  // >= 24 bulan: neutral (abu-abu gelap netral seperti Gambar 2 baris 2: '23 bln 26 hari')
+  // 18 - < 24 bulan: amber (oranye seperti Gambar 2 baris 1: '20 bln 21 hari')
+  // 6 - < 18 bulan: warning (kuning emas)
+  // 3 - < 6 bulan: warning (oranye kemerahan)
+  // < 3 bulan: danger (merah)
+  let tone: 'safe' | 'amber' | 'warning' | 'danger' | 'neutral' = 'safe';
+  if (monthsCount >= 24) {
+    tone = 'neutral';
+  } else if (monthsCount >= 18) {
+    tone = 'amber';
+  } else if (monthsCount >= 6) {
+    tone = 'warning';
+  } else if (monthsCount >= 3) {
+    tone = 'warning';
+  } else {
+    tone = 'danger';
+  }
+
+  return {
+    label,
+    totalDays,
+    totalMonths: monthsCount,
+    months: monthsCount,
+    days: remainingDays,
+    tone,
+    isExpired: false
+  };
+}
+
 /**
  * Helper to check if a status falls into any near-expiry / under-expiry category
  */
@@ -285,8 +463,29 @@ export function getStatusBadgeClass(status: string): string {
 /**
  * Format a number with Indonesian local style (e.g. 15.120)
  */
+const idNumberFormatter = new Intl.NumberFormat('id-ID');
+const wibDateFormatter = new Intl.DateTimeFormat('id-ID', {
+  timeZone: 'Asia/Jakarta',
+  day: '2-digit',
+  month: '2-digit',
+  year: 'numeric',
+  hour: '2-digit',
+  minute: '2-digit',
+});
+const wibDateSecondsFormatter = new Intl.DateTimeFormat('id-ID', {
+  timeZone: 'Asia/Jakarta',
+  day: '2-digit',
+  month: '2-digit',
+  year: 'numeric',
+  hour: '2-digit',
+  minute: '2-digit',
+  second: '2-digit',
+});
+const wibStringCache = new Map<string, string>();
+const MAX_WIB_CACHE_SIZE = 4000;
+
 export function formatNumber(val: number): string {
-  return new Intl.NumberFormat('id-ID').format(val);
+  return idNumberFormatter.format(val);
 }
 
 /**
@@ -294,18 +493,21 @@ export function formatNumber(val: number): string {
  */
 export function formatToWibString(timestamp: string | Date, includeSeconds = false): string {
   if (!timestamp) return '-';
+  if (typeof timestamp === 'string') {
+    const cacheKey = (includeSeconds ? '1:' : '0:') + timestamp;
+    const cached = wibStringCache.get(cacheKey);
+    if (cached !== undefined) return cached;
+  }
   try {
     const date = typeof timestamp === 'string' ? new Date(timestamp) : timestamp;
     if (isNaN(date.getTime())) return '-';
-    return date.toLocaleString('id-ID', {
-      timeZone: 'Asia/Jakarta',
-      day: '2-digit',
-      month: '2-digit',
-      year: 'numeric',
-      hour: '2-digit',
-      minute: '2-digit',
-      ...(includeSeconds ? { second: '2-digit' } : {})
-    }).replace(/\./g, ':') + ' WIB';
+    const formatter = includeSeconds ? wibDateSecondsFormatter : wibDateFormatter;
+    const formatted = formatter.format(date).replace(/\./g, ':') + ' WIB';
+    if (typeof timestamp === 'string') {
+      if (wibStringCache.size >= MAX_WIB_CACHE_SIZE) wibStringCache.clear();
+      wibStringCache.set((includeSeconds ? '1:' : '0:') + timestamp, formatted);
+    }
+    return formatted;
   } catch (e) {
     return String(timestamp);
   }

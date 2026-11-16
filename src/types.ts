@@ -74,14 +74,38 @@ export interface OutboundItem {
   packingStartedAt?: string; // ISO timestamp
   batchNumber?: string; // Batch number assignment
   basketNumber?: string; // Picking and packing basket assignment
+  masterBasketNumber?: string; // Preserved picking master basket across sorting/packing
   shipped?: boolean; // Whether the item/batch is shipped
   shippedAt?: string;
   shippedBy?: string;
   manifestId?: string;
+  issueReportedAt?: string;
+  issueReportedBy?: string;
+  issueStage?: 'Picking' | 'Sortir' | 'Packing';
+  issueType?: 'Stok Kurang' | 'Barang Rusak' | 'Barcode Bermasalah' | 'Lainnya';
+  issueNotes?: string;
+  issueResolvedAt?: string;
+  issueResolvedBy?: string;
   centralWmsDeducted?: boolean; // Whether stock has been deducted from Central WMS
   centralWmsDeductedAt?: string;
   warehouseId?: string;
   warehouseName?: string;
+  outboundType?: 'quick' | 'standard' | 'bulk';
+  isQuickOutbound?: boolean;
+  orderType?: OrderType;
+  orderSource?: string;
+  orderTypeAssignedAt?: string;
+  orderTypeAssignedBy?: string;
+}
+
+export type BranchOperationType = 'B2B' | 'ONLINE' | 'HYBRID';
+export type OrderType = 'B2B' | 'ONLINE' | 'UNASSIGNED';
+export type ChannelOperationType = 'B2B' | 'ONLINE';
+
+export interface BranchConfig {
+  id: string;
+  name: string;
+  operationType: BranchOperationType;
 }
 
 export interface DccLog {
@@ -140,6 +164,8 @@ export interface CatalogItem {
   id: string; // SKU ID
   skuId: string;
   skuName: string;
+  sku?: string;
+  name?: string;
   brand?: string;
   barcode?: string;
   qtyCtnSize: number;
@@ -148,6 +174,9 @@ export interface CatalogItem {
 
 export interface ReturnItem {
   id: string;
+  caseId?: string;
+  returnNumber?: string;
+  branchId?: string;
   timestamp: string;
   skuId: string;
   skuName: string;
@@ -156,9 +185,32 @@ export interface ReturnItem {
   customerName: string;
   batchNumber: string;
   reason?: string;
-  location: string; // 'TRANSIT'
+  location: string;
   operator: string;
-  status: 'TRANSIT' | 'PROCESSED' | string;
+  status: 'DRAFT' | 'AWAITING_VIDEO' | 'QC_PENDING' | 'QC_ACCEPTED' | 'QC_REJECTED' | 'TRANSIT' | 'KARANTINA' | 'RESTOCKED' | 'CLOSED' | 'PROCESSED' | string;
+  claimedCondition?: 'BAGUS' | 'RUSAK';
+  qtyCtnSize?: number;
+  qtyInnerSize?: number;
+  evidenceStatus?: 'MISSING' | 'UPLOADING' | 'READY' | 'FAILED';
+  evidenceUrl?: string;
+  evidenceFileId?: string;
+  evidenceFileName?: string;
+  evidenceMimeType?: string;
+  evidenceSize?: number;
+  evidenceChecksum?: string | null;
+  evidenceUploadStartedAt?: string;
+  evidenceUploadedAt?: string;
+  evidenceUploadedBy?: string;
+  evidenceUploadedById?: string;
+  evidenceDeletedAt?: string;
+  evidenceDeletedBy?: string;
+  evidenceDeleteReason?: string;
+  qcDecision?: 'ACCEPT' | 'QUARANTINE' | 'REJECT';
+  qcNotes?: string;
+  qcBy?: string;
+  qcById?: string;
+  qcAt?: string;
+  stockPostedAt?: string;
 }
 
 export interface InboundReceiptItem {
@@ -314,6 +366,7 @@ export interface Warehouse {
   capacityCbm?: number; // Kapasitas (m³)
   status: WarehouseStatus;
   isCentral?: boolean; // True untuk Gudang Utama
+  isMain?: boolean;
   notes?: string;
   pickingRouteConfig?: WarehousePickingRouteConfig; // Alur rute picking per warehouse
   createdAt: string;

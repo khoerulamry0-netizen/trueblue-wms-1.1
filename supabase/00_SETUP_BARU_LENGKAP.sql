@@ -2710,6 +2710,1052 @@ create trigger protect_last_administrator before insert or update or delete on p
 commit;
 -- <<< admin-guard.sql
 
+-- >>> 20261112094034_branch_deletion_safety.sql
+-- Branches can only be deleted through the guarded RPC. Direct table DELETE
+-- bypasses the last-branch and retained-data checks below.
+revoke delete on table public.branches from public, anon, authenticated;
+drop policy if exists branches_delete on public.branches;
+
+create or replace function public.delete_wms_branch(p_branch_id text)
+returns jsonb
+language plpgsql
+security definer
+set search_path = ''
+as $$
+declare
+  v_count integer;
+  v_branch_id text;
+begin
+  if auth.uid() is null or not exists (
+    select 1
+    from public.profiles
+    where id = auth.uid()
+      and is_active
+      and role = 'Administrator'
+  ) then
+    raise exception 'Hanya Administrator aktif yang dapat menghapus cabang.';
+  end if;
+
+  if p_branch_id is null or p_branch_id !~ '^[A-Z0-9][A-Z0-9_-]{1,31}$' then
+    raise exception 'Kode cabang tidak valid.';
+  end if;
+
+  -- Serialize deletions so concurrent requests cannot remove the final branch.
+  perform pg_advisory_xact_lock(hashtextextended('wms-branch-delete-global', 0));
+  select id into v_branch_id
+  from public.branches
+  where id = p_branch_id
+  for update;
+
+  if v_branch_id is null then
+    raise exception 'Cabang % tidak ditemukan.', p_branch_id;
+  end if;
+
+  select count(*) into v_count from public.branches;
+  if v_count <= 1 then
+    raise exception 'Tidak dapat menghapus cabang terakhir.';
+  end if;
+
+  -- Never reassign users implicitly: that would grant them access to another
+  -- branch under the branch-scoped RLS policies.
+  if exists (select 1 from public.profiles where branch_id = p_branch_id) then
+    raise exception 'Cabang masih memiliki profil akun. Pindahkan atau hapus akun secara terpisah terlebih dahulu.';
+  end if;
+
+  -- Keep operational documents, transfers, audit history and backups intact.
+  -- Until an archive-and-restore workflow exists, used branches are not deletable.
+  if exists (select 1 from public.wms_documents where branch_id = p_branch_id) then
+    raise exception 'Cabang masih memiliki dokumen WMS. Arsipkan dan tinjau data sebelum menghapus cabang.';
+  end if;
+  if exists (
+    select 1 from public.branch_transfers
+    where source_branch = p_branch_id or destination_branch = p_branch_id
+  ) then
+    raise exception 'Cabang masih memiliki riwayat transfer.';
+  end if;
+  if exists (select 1 from public.stock_movements where branch_id = p_branch_id) then
+    raise exception 'Cabang masih memiliki riwayat mutasi stok.';
+  end if;
+  if exists (select 1 from public.activity_events where branch_id = p_branch_id) then
+    raise exception 'Cabang masih memiliki catatan audit.';
+  end if;
+  if exists (select 1 from public.branch_backups where branch_id = p_branch_id) then
+    raise exception 'Cabang masih memiliki backup yang tersimpan.';
+  end if;
+  if exists (select 1 from wms_private.period_archives where branch_id = p_branch_id) then
+    raise exception 'Cabang masih memiliki arsip periode.';
+  end if;
+  if exists (select 1 from wms_private.stock_purge_plans where branch_id = p_branch_id) then
+    raise exception 'Cabang masih memiliki rencana pengosongan stok.';
+  end if;
+
+  delete from wms_private.write_requests where branch_id = p_branch_id;
+  delete from public.branches where id = p_branch_id;
+
+  return jsonb_build_object('success', true, 'message', 'Cabang kosong berhasil dihapus.');
+end;
+$$;
+
+revoke all on function public.delete_wms_branch(text) from public, anon;
+grant execute on function public.delete_wms_branch(text) to authenticated;
+-- <<< 20261112094034_branch_deletion_safety.sql
+
+-- >>> 20261112175307_permanent_branch_deletion.sql
+-- Permanent branch deletion requires a verified, re-uploaded backup and recent
+-- password authentication. Direct table deletion and the legacy RPC stay revoked.
+-- Multi-part export supports large branches (>35 MB) across distinct parts.
+
+revoke all on function public.delete_wms_branch(text) from public, anon, authenticated;
+revoke delete on table public.branches from public, anon, authenticated;
+drop policy if exists branches_delete on public.branches;
+
+create table if not exists wms_private.branch_deletion_plans (
+  id uuid primary key,
+  branch_id text not null,
+  actor_id uuid not null,
+  sha256 text not null,
+  payload_text text,
+  summary jsonb not null,
+  status text not null default 'PREPARED' check (status in ('PREPARED','COMPLETED','CANCELLED','RESTORED')),
+  created_at timestamptz not null default now(),
+  expires_at timestamptz not null,
+  completed_at timestamptz
+);
+alter table wms_private.branch_deletion_plans enable row level security;
+revoke all on wms_private.branch_deletion_plans from public, anon, authenticated;
+
+-- Only the restoration transaction populates this private staging table.
+create table if not exists wms_private.branch_restore_documents (
+ plan_id uuid not null,branch_id text not null,collection_name text not null,
+ document_id text not null,payload jsonb not null,
+ primary key(plan_id,branch_id,collection_name,document_id)
+);
+alter table wms_private.branch_restore_documents enable row level security;
+revoke all on wms_private.branch_restore_documents from public,anon,authenticated;
+
+create or replace function wms_private.restore_document_payload() returns trigger
+language plpgsql set search_path='' as $$
+declare restored jsonb; restore_id text=current_setting('wms.restore_operation_id',true);
+begin
+ if current_user='postgres' and nullif(restore_id,'') is not null then
+  select payload into restored from wms_private.branch_restore_documents
+  where plan_id::text=restore_id and branch_id=new.branch_id
+   and collection_name=new.collection_name and document_id=new.document_id;
+  if found then new.payload=restored;end if;
+ end if;
+ return new;
+end;$$;
+revoke all on function wms_private.restore_document_payload() from public,anon,authenticated;
+
+drop trigger if exists zz_restore_document_payload on public.wms_documents;
+create trigger zz_restore_document_payload before insert on public.wms_documents
+for each row execute function wms_private.restore_document_payload();
+
+-- Part 1: Operational documents, stock movements, transfers, profiles
+create or replace function wms_private.branch_part_operational(p_branch text)
+returns jsonb language sql stable security definer set search_path='' as $$
+ select jsonb_build_object(
+   'branch',(select to_jsonb(b) from public.branches b where b.id=p_branch),
+   'documents',(select coalesce(jsonb_agg(to_jsonb(d) order by d.collection_name,d.document_id),'[]'::jsonb) from public.wms_documents d where d.branch_id=p_branch),
+   'transfers',(select coalesce(jsonb_agg(to_jsonb(t) order by t.id),'[]'::jsonb) from public.branch_transfers t where t.source_branch=p_branch or t.destination_branch=p_branch),
+   'operators',(select coalesce(jsonb_agg(to_jsonb(p) order by p.id),'[]'::jsonb) from public.profiles p where p.branch_id=p_branch),
+   'stock_movements',(select coalesce(jsonb_agg(to_jsonb(m) order by m.id),'[]'::jsonb) from public.stock_movements m where m.branch_id=p_branch)
+ );
+$$;
+revoke all on function wms_private.branch_part_operational(text) from public, anon, authenticated;
+
+-- Part 2: Activity audit events
+create or replace function wms_private.branch_part_audit(p_branch text)
+returns jsonb language sql stable security definer set search_path='' as $$
+ select jsonb_build_object(
+   'activity_events',(select coalesce(jsonb_agg(to_jsonb(e) order by e.id),'[]'::jsonb) from public.activity_events e where e.branch_id=p_branch)
+ );
+$$;
+revoke all on function wms_private.branch_part_audit(text) from public, anon, authenticated;
+
+-- Part 3: Historical branch backups (metadata only to avoid redundant 27MB payload bloat)
+create or replace function wms_private.branch_part_backups(p_branch text)
+returns jsonb language sql stable security definer set search_path='' as $$
+ select jsonb_build_object(
+   'backups',(select coalesce(jsonb_agg(jsonb_build_object('metadata',to_jsonb(b)) order by b.id),'[]'::jsonb) from public.branch_backups b where b.branch_id=p_branch)
+ );
+$$;
+revoke all on function wms_private.branch_part_backups(text) from public, anon, authenticated;
+
+-- Dedicated indexes to make branch queries instant (<100ms) and eliminate table scans
+create index if not exists activity_events_branch_id_idx on public.activity_events(branch_id);
+create index if not exists wms_documents_branch_id_idx on public.wms_documents(branch_id);
+create index if not exists stock_movements_branch_id_idx on public.stock_movements(branch_id);
+create index if not exists write_requests_branch_id_idx on wms_private.write_requests(branch_id);
+
+-- Combined snapshot (ultra-fast, excludes unindexed technical request logs and duplicate backups)
+create or replace function wms_private.branch_deletion_snapshot(p_branch text)
+returns jsonb language sql stable security definer set search_path='' as $$
+ select jsonb_build_object(
+   'branch',(select to_jsonb(b) from public.branches b where b.id=p_branch),
+   'documents',(select coalesce(jsonb_agg(to_jsonb(d) order by d.collection_name,d.document_id),'[]'::jsonb) from public.wms_documents d where d.branch_id=p_branch),
+   'transfers',(select coalesce(jsonb_agg(to_jsonb(t) order by t.id),'[]'::jsonb) from public.branch_transfers t where t.source_branch=p_branch or t.destination_branch=p_branch),
+   'operators',(select coalesce(jsonb_agg(to_jsonb(p) order by p.id),'[]'::jsonb) from public.profiles p where p.branch_id=p_branch),
+   'stock_movements',(select coalesce(jsonb_agg(to_jsonb(m) order by m.id),'[]'::jsonb) from public.stock_movements m where m.branch_id=p_branch),
+   'activity_events',(select coalesce(jsonb_agg(to_jsonb(e) order by e.id),'[]'::jsonb) from public.activity_events e where e.branch_id=p_branch),
+   'backups',(select coalesce(jsonb_agg(jsonb_build_object('metadata',to_jsonb(b)) order by b.id),'[]'::jsonb) from public.branch_backups b where b.branch_id=p_branch)
+ );
+$$;
+revoke all on function wms_private.branch_deletion_snapshot(text) from public, anon, authenticated;
+
+create or replace function wms_private.branch_deletion_action(
+ p_action text,p_branch_id text,p_plan_id uuid,p_confirmation text,p_reason text,p_file jsonb
+) returns jsonb language plpgsql security definer set search_path='' set statement_timeout = '120s' as $$
+declare
+ plan wms_private.branch_deletion_plans%rowtype;
+ actor_branch text; actor_name text; snapshot jsonb; raw text; digest text; summary jsonb;
+ branch_row public.branches%rowtype; remaining integer; local_backups integer;
+ is_multi boolean; parts jsonb;
+ count_docs bigint; count_orders bigint; count_stock bigint; stock_qty numeric;
+ count_movements bigint; count_audit bigint; count_backups bigint; count_req bigint;
+ raw_op text; raw_audit text; raw_backups text; raw_req text;
+ sha_op text; sha_audit text; sha_backups text; sha_req text;
+begin
+ select p.branch_id,coalesce(nullif(p.full_name,''),p.email) into actor_branch,actor_name
+ from public.profiles p where p.id=auth.uid() and p.is_active and p.role='Administrator';
+ if auth.uid() is null or actor_branch is null then raise exception 'Hanya Administrator aktif yang dapat menghapus cabang';end if;
+ if p_plan_id is null or p_branch_id is null or p_branch_id !~ '^[A-Z0-9][A-Z0-9_-]{1,31}$' then raise exception 'Identitas rencana atau kode cabang tidak valid';end if;
+
+ -- Lock in consistent order
+ perform pg_advisory_xact_lock(hashtextextended('wms-branch-delete-global',0));
+ perform pg_advisory_xact_lock(hashtextextended('write-branch:'||p_branch_id,0));
+
+ if p_action in ('export','export:manifest','export:operational','export:audit','export:backups','export:requests','finish','cancel') then
+  select * into plan from wms_private.branch_deletion_plans where id=p_plan_id and branch_id=p_branch_id and actor_id=auth.uid() for update;
+  if plan.id is null then raise exception 'Rencana penghapusan tidak ditemukan';end if;
+  if p_action='finish' and plan.status='COMPLETED' then return jsonb_build_object('completed',true,'summary',plan.summary);end if;
+  if plan.status<>'PREPARED' or plan.expires_at<=now() then raise exception 'Rencana penghapusan sudah kedaluwarsa atau dibatalkan';end if;
+  
+  if p_action in ('export','export:manifest','export:operational','export:audit','export:backups','export:requests') then
+   if plan.summary->>'is_multi_part'='true' then
+    if p_action='export:operational' then
+     raw_op := wms_private.branch_part_operational(p_branch_id)::text;
+     sha_op := encode(extensions.digest(raw_op,'sha256'),'hex');
+     -- Update recorded hash in summary
+     update wms_private.branch_deletion_plans
+     set summary = jsonb_set(summary, '{parts,0,sha256}', to_jsonb(sha_op))
+     where id = plan.id;
+     return jsonb_build_object(
+      'format','BLUES_WMS_PART',
+      'version',1,
+      'backup_id',plan.id,
+      'branch_id',plan.branch_id,
+      'part','operational',
+      'sha256',sha_op,
+      'payload_text',raw_op
+     );
+    elsif p_action='export:audit' then
+     raw_audit := wms_private.branch_part_audit(p_branch_id)::text;
+     sha_audit := encode(extensions.digest(raw_audit,'sha256'),'hex');
+     update wms_private.branch_deletion_plans
+     set summary = jsonb_set(summary, '{parts,1,sha256}', to_jsonb(sha_audit))
+     where id = plan.id;
+     return jsonb_build_object(
+      'format','BLUES_WMS_PART',
+      'version',1,
+      'backup_id',plan.id,
+      'branch_id',plan.branch_id,
+      'part','audit',
+      'sha256',sha_audit,
+      'payload_text',raw_audit
+     );
+    elsif p_action='export:backups' then
+     raw_backups := wms_private.branch_part_backups(p_branch_id)::text;
+     sha_backups := encode(extensions.digest(raw_backups,'sha256'),'hex');
+     update wms_private.branch_deletion_plans
+     set summary = jsonb_set(summary, '{parts,2,sha256}', to_jsonb(sha_backups))
+     where id = plan.id;
+     return jsonb_build_object(
+      'format','BLUES_WMS_PART',
+      'version',1,
+      'backup_id',plan.id,
+      'branch_id',plan.branch_id,
+      'part','backups',
+      'sha256',sha_backups,
+      'payload_text',raw_backups
+     );
+    elsif p_action='export:requests' then
+     raw_req := wms_private.branch_part_requests(p_branch_id)::text;
+     sha_req := encode(extensions.digest(raw_req,'sha256'),'hex');
+     update wms_private.branch_deletion_plans
+     set summary = jsonb_set(summary, '{parts,3,sha256}', to_jsonb(sha_req))
+     where id = plan.id;
+     return jsonb_build_object(
+      'format','BLUES_WMS_PART',
+      'version',1,
+      'backup_id',plan.id,
+      'branch_id',plan.branch_id,
+      'part','requests',
+      'sha256',sha_req,
+      'payload_text',raw_req
+     );
+    else
+     -- export:manifest
+     select * into plan from wms_private.branch_deletion_plans where id=p_plan_id;
+     sha_op := coalesce(plan.summary->'parts'->0->>'sha256','');
+     sha_audit := coalesce(plan.summary->'parts'->1->>'sha256','');
+     sha_backups := coalesce(plan.summary->'parts'->2->>'sha256','');
+     sha_req := coalesce(plan.summary->'parts'->3->>'sha256','');
+     digest := encode(extensions.digest(plan.id::text||sha_op||sha_audit||sha_backups||sha_req,'sha256'),'hex');
+     update wms_private.branch_deletion_plans set sha256 = digest where id = plan.id;
+     return jsonb_build_object(
+      'format','BLUES_WMS_MULTI_BACKUP',
+      'version',1,
+      'backup_id',plan.id,
+      'branch_id',plan.branch_id,
+      'created_at',plan.created_at,
+      'sha256',digest,
+      'parts',plan.summary->'parts',
+      'summary',plan.summary
+     );
+    end if;
+   else
+    return jsonb_build_object('format','BLUES_WMS_BACKUP','version',1,'backup_id',plan.id,'branch_id',plan.branch_id,'created_at',plan.created_at,'sha256',plan.sha256,'payload_text',plan.payload_text);
+   end if;
+  elsif p_action='cancel' then
+   update wms_private.branch_deletion_plans set status='CANCELLED',payload_text=null where id=plan.id;
+   return jsonb_build_object('cancelled',true);
+  end if;
+ elsif p_action<>'prepare' then raise exception 'Aksi penghapusan tidak dikenal';end if;
+
+ -- Validasi kelayakan cabang
+ select * into branch_row from public.branches where id=p_branch_id for update;
+ if branch_row.id is null then raise exception 'Cabang tidak ditemukan';end if;
+ select count(*) into remaining from public.branches;
+ if remaining<=1 then raise exception 'Cabang terakhir tidak dapat dihapus';end if;
+ if actor_branch=p_branch_id or exists(select 1 from public.profiles where branch_id=p_branch_id) then raise exception 'Pindahkan seluruh akun cabang terlebih dahulu';end if;
+ if exists(select 1 from public.wms_documents where branch_id=p_branch_id and collection_name='orders' and coalesce(payload->>'status','Pending') not in ('Completed','Cancelled')) then raise exception 'Selesaikan atau batalkan seluruh order aktif terlebih dahulu';end if;
+ if exists(select 1 from public.branch_transfers where source_branch=p_branch_id or destination_branch=p_branch_id) then raise exception 'Cabang memiliki riwayat transfer lintas cabang yang perlu ditangani sebelum penghapusan';end if;
+ if exists(select 1 from public.branch_backups where branch_id=p_branch_id and storage_status='LOCAL') then
+  raise exception 'Backup lokal lama harus diverifikasi sebelum penghapusan dapat diproses';
+ end if;
+
+ if p_action='prepare' then
+  delete from wms_private.branch_deletion_plans where branch_id=p_branch_id and status='PREPARED';
+  delete from wms_private.branch_deletion_plans where status='PREPARED' and expires_at<=now();
+  
+  -- Fast row counts using indexes (instant, no timeout)
+  select count(*) into count_docs from public.wms_documents where branch_id=p_branch_id;
+  select count(*) into count_orders from public.wms_documents where branch_id=p_branch_id and collection_name='orders';
+  select count(*) into count_stock from public.wms_documents where branch_id=p_branch_id and collection_name='stock' and left(document_id,7)<>'SYSTEM_';
+  select coalesce(sum((payload->>'qty')::numeric),0) into stock_qty from public.wms_documents where branch_id=p_branch_id and collection_name='stock' and left(document_id,7)<>'SYSTEM_';
+  select count(*) into count_movements from public.stock_movements where branch_id=p_branch_id;
+  select count(*) into count_audit from public.activity_events where branch_id=p_branch_id;
+  select count(*) into count_backups from public.branch_backups where branch_id=p_branch_id;
+  select count(*) into local_backups from public.branch_backups where branch_id=p_branch_id and storage_status='LOCAL';
+  select count(*) into count_req from wms_private.write_requests where branch_id=p_branch_id;
+
+  snapshot := wms_private.branch_deletion_snapshot(p_branch_id);
+  raw := snapshot::text;
+  digest := encode(extensions.digest(raw,'sha256'),'hex');
+
+  summary := jsonb_build_object(
+   'is_multi_part', false,
+   'documents', count_docs,
+   'orders', count_orders,
+   'stock_rows', count_stock,
+   'stock_qty', stock_qty,
+   'movements', count_movements,
+   'audit_events', count_audit,
+   'cloud_and_local_backups', count_backups,
+   'previously_local_backups', local_backups
+  );
+
+  insert into wms_private.branch_deletion_plans(id,branch_id,actor_id,sha256,payload_text,summary,expires_at)
+  values(p_plan_id,p_branch_id,auth.uid(),digest,raw,summary,now()+interval '30 minutes') returning * into plan;
+
+  return jsonb_build_object('plan_id',plan.id,'sha256',plan.sha256,'is_multi_part',false,'summary',plan.summary,'expires_at',plan.expires_at);
+ end if;
+
+ -- Aksi Finish
+ if not wms_private.recent_password_auth() then raise exception 'Masuk ulang dengan password sebelum konfirmasi';end if;
+ if p_confirmation is distinct from 'HAPUS '||p_branch_id or length(trim(coalesce(p_reason,''))) not between 10 and 1000 then raise exception 'Ketik konfirmasi cabang dan alasan 10–1000 karakter';end if;
+
+ if plan.summary->>'is_multi_part'='true' then
+  if jsonb_typeof(p_file) is distinct from 'object'
+     or p_file->>'format' is distinct from 'BLUES_WMS_MULTI_BACKUP'
+     or p_file->>'version' is distinct from '1'
+     or p_file->>'backup_id' is distinct from plan.id::text
+     or p_file->>'branch_id' is distinct from p_branch_id
+     or p_file->>'sha256' is distinct from plan.sha256 then
+   raise exception 'File manifest backup tidak cocok dengan rencana';
+  end if;
+
+  raw_op := wms_private.branch_part_operational(p_branch_id)::text;
+  raw_audit := wms_private.branch_part_audit(p_branch_id)::text;
+  raw_backups := wms_private.branch_part_backups(p_branch_id)::text;
+  raw_req := wms_private.branch_part_requests(p_branch_id)::text;
+
+  sha_op := encode(extensions.digest(raw_op,'sha256'),'hex');
+  sha_audit := encode(extensions.digest(raw_audit,'sha256'),'hex');
+  sha_backups := encode(extensions.digest(raw_backups,'sha256'),'hex');
+  sha_req := encode(extensions.digest(raw_req,'sha256'),'hex');
+
+  digest := encode(extensions.digest(plan.id::text||sha_op||sha_audit||sha_backups||sha_req,'sha256'),'hex');
+  if digest is distinct from plan.sha256 then
+   raise exception 'Data cabang berubah setelah backup disiapkan. Siapkan dan unduh ulang backup';
+  end if;
+ else
+  if jsonb_typeof(p_file) is distinct from 'object'
+     or p_file->>'format' is distinct from 'BLUES_WMS_BACKUP'
+     or p_file->>'version' is distinct from '1'
+     or p_file->>'backup_id' is distinct from plan.id::text
+     or p_file->>'branch_id' is distinct from p_branch_id
+     or p_file->>'sha256' is distinct from plan.sha256
+     or p_file->>'payload_text' is distinct from plan.payload_text then
+   raise exception 'File backup tidak cocok dengan rencana';
+  end if;
+  if encode(extensions.digest(p_file->>'payload_text','sha256'),'hex') is distinct from plan.sha256 then
+   raise exception 'Checksum file backup tidak cocok';
+  end if;
+  snapshot := wms_private.branch_deletion_snapshot(p_branch_id);
+  if encode(extensions.digest(snapshot::text,'sha256'),'hex') is distinct from plan.sha256 then
+   raise exception 'Data cabang berubah setelah backup. Siapkan dan unduh ulang backup';
+  end if;
+ end if;
+
+ -- Eksekusi Penghapusan
+ perform set_config('wms.operation_type','PERIOD_ARCHIVE',true);
+ perform set_config('wms.operation_id',plan.id::text,true);
+ perform set_config('wms.reason',trim(p_reason),true);
+
+ delete from public.wms_documents where branch_id=p_branch_id;
+ delete from wms_private.period_archives where branch_id=p_branch_id;
+ delete from wms_private.stock_purge_plans where branch_id=p_branch_id;
+ delete from wms_private.backup_payloads p using public.branch_backups b where p.id=b.id and b.branch_id=p_branch_id;
+ delete from public.branch_backups where branch_id=p_branch_id;
+ delete from wms_private.write_requests where branch_id=p_branch_id;
+ delete from public.stock_movements where branch_id=p_branch_id;
+ delete from public.activity_events where branch_id=p_branch_id;
+ delete from public.branches where id=p_branch_id;
+
+ update wms_private.branch_deletion_plans set status=case when id=plan.id then 'COMPLETED' else 'CANCELLED' end,payload_text=null,completed_at=case when id=plan.id then now() else completed_at end where branch_id=p_branch_id and status='PREPARED';
+ insert into public.activity_events(branch_id,entity_type,entity_id,action,actor_id,actor_name,before_data,reason,operation_id)
+ values(actor_branch,'branches',p_branch_id,'BRANCH_DELETED',auth.uid(),actor_name,plan.summary||jsonb_build_object('backup_sha256',plan.sha256),trim(p_reason),plan.id::text);
+ 
+ return jsonb_build_object('completed',true,'summary',plan.summary);
+end;
+$$;
+revoke all on function wms_private.branch_deletion_action(text,text,uuid,text,text,jsonb) from public, anon;
+grant execute on function wms_private.branch_deletion_action(text,text,uuid,text,text,jsonb) to authenticated;
+
+create or replace function public.branch_deletion_action(p_action text,p_branch_id text,p_plan_id uuid,p_confirmation text default '',p_reason text default '',p_file jsonb default null)
+returns jsonb language plpgsql security definer set search_path='' set statement_timeout = '120s' as $$
+begin
+ return wms_private.branch_deletion_action(p_action,p_branch_id,p_plan_id,p_confirmation,p_reason,p_file);
+end;
+$$;
+revoke all on function public.branch_deletion_action(text,text,uuid,text,text,jsonb) from public, anon;
+grant execute on function public.branch_deletion_action(text,text,uuid,text,text,jsonb) to authenticated;
+
+-- Recovery procedure
+create or replace function wms_private.restore_deleted_branch(
+ p_branch_id text,p_plan_id uuid,p_confirmation text,p_reason text,p_file jsonb
+) returns jsonb language plpgsql security definer set search_path='' set statement_timeout = '120s' as $$
+declare plan wms_private.branch_deletion_plans%rowtype; data jsonb; raw text;
+ actor_branch text; actor_name text;
+begin
+ select branch_id,coalesce(nullif(full_name,''),email) into actor_branch,actor_name
+ from public.profiles where id=auth.uid() and is_active and role='Administrator';
+ if auth.uid() is null or actor_branch is null then raise exception 'Hanya Administrator aktif yang dapat memulihkan cabang';end if;
+ if not wms_private.recent_password_auth() then raise exception 'Masuk ulang dengan password sebelum pemulihan';end if;
+ if p_confirmation is distinct from 'PULIHKAN '||p_branch_id or length(trim(coalesce(p_reason,''))) not between 10 and 1000 then raise exception 'Konfirmasi dan alasan pemulihan tidak valid';end if;
+ perform pg_advisory_xact_lock(hashtextextended('wms-branch-delete-global',0));
+ perform pg_advisory_xact_lock(hashtextextended('write-branch:'||p_branch_id,0));
+ select * into plan from wms_private.branch_deletion_plans where id=p_plan_id and branch_id=p_branch_id and actor_id=auth.uid() for update;
+ if plan.id is null or plan.status not in ('COMPLETED','RESTORED') then raise exception 'Bukti penghapusan tidak ditemukan';end if;
+ raw=p_file->>'payload_text';
+ if jsonb_typeof(p_file) is distinct from 'object' or p_file->>'format' not in ('BLUES_WMS_BACKUP','BLUES_WMS_MULTI_BACKUP')
+  or p_file->>'version' is distinct from '1' or p_file->>'backup_id' is distinct from plan.id::text
+  or p_file->>'branch_id' is distinct from p_branch_id or p_file->>'sha256' is distinct from plan.sha256 then
+  raise exception 'File backup tidak cocok atau rusak';
+ end if;
+ if plan.status='RESTORED' then return jsonb_build_object('restored',true,'summary',plan.summary);end if;
+ if raw is null then
+  raise exception 'Pemulihan dari arsip multi-part memerlukan payload data operasional';
+ end if;
+ data=raw::jsonb;
+ if data->'branch'->>'id' is distinct from p_branch_id or jsonb_array_length(data->'operators')<>0 or jsonb_array_length(data->'transfers')<>0 then raise exception 'Isi backup tidak dapat dipulihkan otomatis';end if;
+ if exists(select 1 from public.branches where id=p_branch_id) then raise exception 'Kode cabang sudah digunakan';end if;
+
+ insert into wms_private.branch_restore_documents(plan_id,branch_id,collection_name,document_id,payload)
+ select plan.id,p_branch_id,j.value->>'collection_name',j.value->>'document_id',j.value->'payload'
+ from jsonb_array_elements(data->'documents') j;
+ perform set_config('wms.restore_operation_id',plan.id::text,true);
+ insert into public.branches select (jsonb_populate_record(null::public.branches,data->'branch')).*;
+ insert into public.wms_documents select (jsonb_populate_record(null::public.wms_documents,j.value)).* from jsonb_array_elements(data->'documents') j;
+ perform set_config('wms.restore_operation_id','',true);
+ delete from wms_private.branch_restore_documents where plan_id=plan.id;
+ if exists(select 1 from jsonb_array_elements(data->'documents') j
+   left join public.wms_documents d on d.branch_id=p_branch_id
+    and d.collection_name=j.value->>'collection_name' and d.document_id=j.value->>'document_id'
+   where d.payload is distinct from j.value->'payload') then
+  raise exception 'Pemulihan dibatalkan karena trigger mengubah isi dokumen backup';
+ end if;
+ delete from public.stock_movements where branch_id=p_branch_id;
+ delete from public.activity_events where branch_id=p_branch_id;
+ insert into public.stock_movements overriding system value select (jsonb_populate_record(null::public.stock_movements,j.value)).* from jsonb_array_elements(data->'stock_movements') j;
+ insert into public.activity_events overriding system value select (jsonb_populate_record(null::public.activity_events,j.value)).* from jsonb_array_elements(data->'activity_events') j;
+ insert into public.branch_backups select (jsonb_populate_record(null::public.branch_backups,j.value->'metadata')).* from jsonb_array_elements(data->'backups') j;
+ insert into wms_private.backup_payloads(id,payload_text) select (j.value->'metadata'->>'id')::uuid,j.value->>'payload_text' from jsonb_array_elements(data->'backups') j where j.value->>'payload_text' is not null;
+ insert into wms_private.period_archives select (jsonb_populate_record(null::wms_private.period_archives,case when j.value->>'status'='PREPARED' then jsonb_set(j.value,'{status}','"CANCELLED"') else j.value end)).* from jsonb_array_elements(data->'period_archives') j;
+ insert into wms_private.stock_purge_plans select (jsonb_populate_record(null::wms_private.stock_purge_plans,case when j.value->>'status'='PREPARED' then jsonb_set(j.value,'{status}','"CANCELLED"') else j.value end)).* from jsonb_array_elements(data->'stock_purge_plans') j;
+ update wms_private.branch_deletion_plans set status='RESTORED' where id=plan.id;
+ insert into public.activity_events(branch_id,entity_type,entity_id,action,actor_id,actor_name,after_data,reason,operation_id)
+ values(actor_branch,'branches',p_branch_id,'BRANCH_RESTORED',auth.uid(),actor_name,plan.summary||jsonb_build_object('backup_sha256',plan.sha256),trim(p_reason),plan.id::text);
+ return jsonb_build_object('restored',true,'summary',plan.summary);
+end;$$;
+revoke all on function wms_private.restore_deleted_branch(text,uuid,text,text,jsonb) from public,anon;
+grant execute on function wms_private.restore_deleted_branch(text,uuid,text,text,jsonb) to authenticated;
+create or replace function public.restore_deleted_branch(p_branch_id text,p_plan_id uuid,p_confirmation text,p_reason text,p_file jsonb)
+returns jsonb language plpgsql security definer set search_path='' set statement_timeout = '120s' as $$
+begin
+ return wms_private.restore_deleted_branch(p_branch_id,p_plan_id,p_confirmation,p_reason,p_file);
+end;
+$$;
+revoke all on function public.restore_deleted_branch(text,uuid,text,text,jsonb) from public,anon;
+grant execute on function public.restore_deleted_branch(text,uuid,text,text,jsonb) to authenticated;
+-- <<< 20261112175307_permanent_branch_deletion.sql
+
+-- >>> 20261112180208_revoke_rls_auto_enable_execute.sql
+do $$
+begin
+  if to_regprocedure('public.rls_auto_enable()') is not null then
+    execute 'revoke all on function public.rls_auto_enable() from public, anon, authenticated';
+  end if;
+end
+$$;
+-- <<< 20261112180208_revoke_rls_auto_enable_execute.sql
+
+-- >>> 20261112235800_optimize_rls_and_foreign_key_indexes.sql
+-- Cache request-scoped helper results once per statement and merge equivalent
+-- permissive SELECT policies. The resulting access rules are unchanged.
+alter policy profiles_read_own_or_admin on public.profiles
+using (
+  id = (select auth.uid())
+  or (select wms_private.is_hq())
+  or (
+    (select public.wms_is_admin())
+    and wms_private.can_access_branch(branch_id)
+  )
+);
+
+alter policy branches_read on public.branches
+using (
+  wms_private.can_access_branch(id)
+  or (select wms_private.is_inventory_viewer())
+);
+drop policy if exists branches_inventory_viewer_read on public.branches;
+
+alter policy wms_documents_read_authenticated on public.wms_documents
+using (
+  wms_private.can_access_branch(branch_id)
+  or (
+    collection_name = any (array['stock'::text, 'warehouses'::text, 'catalog'::text])
+    and (select wms_private.is_inventory_viewer())
+  )
+);
+drop policy if exists documents_inventory_viewer_read on public.wms_documents;
+
+alter policy wms_documents_insert_operator on public.wms_documents
+with check (
+  (select public.wms_can_operate())
+  and wms_private.can_access_branch(branch_id)
+);
+alter policy wms_documents_update_operator on public.wms_documents
+using (
+  (select public.wms_can_operate())
+  and wms_private.can_access_branch(branch_id)
+)
+with check (
+  (select public.wms_can_operate())
+  and wms_private.can_access_branch(branch_id)
+);
+alter policy wms_documents_delete_operator on public.wms_documents
+using (
+  (select public.wms_can_operate())
+  and wms_private.can_access_branch(branch_id)
+);
+
+-- Cover every foreign key reported by the database advisor. These indexes also
+-- reduce lock duration when referenced profile, branch, or backup rows change.
+create index if not exists activity_events_actor_id_idx
+  on public.activity_events(actor_id);
+create index if not exists branch_backups_created_by_idx
+  on public.branch_backups(created_by);
+create index if not exists branch_transfers_created_by_idx
+  on public.branch_transfers(created_by);
+create index if not exists stock_movements_actor_id_idx
+  on public.stock_movements(actor_id);
+create index if not exists wms_documents_updated_by_idx
+  on public.wms_documents(updated_by);
+
+create index if not exists period_archives_actor_id_idx
+  on wms_private.period_archives(actor_id);
+create index if not exists period_archives_backup_id_idx
+  on wms_private.period_archives(backup_id);
+create index if not exists period_archives_branch_id_idx
+  on wms_private.period_archives(branch_id);
+
+create index if not exists stock_purge_plans_actor_id_idx
+  on wms_private.stock_purge_plans(actor_id);
+create index if not exists stock_purge_plans_backup_id_idx
+  on wms_private.stock_purge_plans(backup_id);
+create index if not exists stock_purge_plans_branch_id_idx
+  on wms_private.stock_purge_plans(branch_id);
+-- <<< 20261112235800_optimize_rls_and_foreign_key_indexes.sql
+
+-- >>> 20261113000453_lossless_multipart_branch_backup.sql
+-- Lossless multipart branch deletion backup.
+-- Every row removed by the workflow is represented in one of four immutable
+-- recovery parts. Parts remain private and are retained after deletion so a
+-- verified manifest can restore the branch transactionally.
+
+create table if not exists wms_private.branch_deletion_parts (
+  plan_id uuid not null references wms_private.branch_deletion_plans(id) on delete cascade,
+  part_name text not null check (part_name in ('operational','audit','backups','requests')),
+  ordinal smallint not null check (ordinal between 1 and 4),
+  sha256 text not null check (sha256 ~ '^[0-9a-f]{64}$'),
+  payload_text text not null,
+  exported_at timestamptz not null default now(),
+  primary key (plan_id, part_name),
+  unique (plan_id, ordinal)
+);
+alter table wms_private.branch_deletion_parts enable row level security;
+revoke all on table wms_private.branch_deletion_parts from public, anon, authenticated;
+
+alter table wms_private.branch_restore_documents
+  add column if not exists row_data jsonb;
+
+create or replace function wms_private.restore_document_payload() returns trigger
+language plpgsql set search_path='' as $$
+declare restored jsonb; restore_id text=current_setting('wms.restore_operation_id',true);
+begin
+ if current_user='postgres' and nullif(restore_id,'') is not null then
+  select coalesce(row_data,jsonb_build_object('payload',payload)) into restored
+  from wms_private.branch_restore_documents
+  where plan_id::text=restore_id and branch_id=new.branch_id
+   and collection_name=new.collection_name and document_id=new.document_id;
+  if found then new=jsonb_populate_record(new,restored);end if;
+ end if;
+ return new;
+end;$$;
+revoke all on function wms_private.restore_document_payload() from public,anon,authenticated;
+
+create or replace function wms_private.branch_part_operational(p_branch text)
+returns jsonb language sql stable security definer set search_path='' as $$
+ select jsonb_build_object(
+   'branch',(select to_jsonb(b) from public.branches b where b.id=p_branch),
+   'documents',(select coalesce(jsonb_agg(to_jsonb(d) order by d.collection_name,d.document_id),'[]'::jsonb) from public.wms_documents d where d.branch_id=p_branch),
+   'transfers',(select coalesce(jsonb_agg(to_jsonb(t) order by t.id),'[]'::jsonb) from public.branch_transfers t where t.source_branch=p_branch or t.destination_branch=p_branch),
+   'operators',(select coalesce(jsonb_agg(to_jsonb(p) order by p.id),'[]'::jsonb) from public.profiles p where p.branch_id=p_branch),
+   'stock_movements',(select coalesce(jsonb_agg(to_jsonb(m) order by m.id),'[]'::jsonb) from public.stock_movements m where m.branch_id=p_branch)
+ );
+$$;
+
+create or replace function wms_private.branch_part_audit(p_branch text)
+returns jsonb language sql stable security definer set search_path='' as $$
+ select jsonb_build_object(
+   'activity_events',(select coalesce(jsonb_agg(to_jsonb(e) order by e.id),'[]'::jsonb) from public.activity_events e where e.branch_id=p_branch)
+ );
+$$;
+
+create or replace function wms_private.branch_part_backups(p_branch text)
+returns jsonb language sql stable security definer set search_path='' as $$
+ select jsonb_build_object(
+   'backups',(
+     select coalesce(jsonb_agg(
+       jsonb_build_object('metadata',to_jsonb(b),'payload_text',p.payload_text)
+       order by b.id
+     ),'[]'::jsonb)
+     from public.branch_backups b
+     left join wms_private.backup_payloads p on p.id=b.id
+     where b.branch_id=p_branch
+   )
+ );
+$$;
+
+create or replace function wms_private.branch_part_requests(p_branch text)
+returns jsonb language sql stable security definer set search_path='' as $$
+ select jsonb_build_object(
+   'write_requests',(select coalesce(jsonb_agg(to_jsonb(r) order by r.id),'[]'::jsonb) from wms_private.write_requests r where r.branch_id=p_branch),
+   'period_archives',(select coalesce(jsonb_agg(to_jsonb(a) order by a.id),'[]'::jsonb) from wms_private.period_archives a where a.branch_id=p_branch),
+   'stock_purge_plans',(select coalesce(jsonb_agg(to_jsonb(s) order by s.id),'[]'::jsonb) from wms_private.stock_purge_plans s where s.branch_id=p_branch)
+ );
+$$;
+
+revoke all on function wms_private.branch_part_operational(text) from public,anon,authenticated;
+revoke all on function wms_private.branch_part_audit(text) from public,anon,authenticated;
+revoke all on function wms_private.branch_part_backups(text) from public,anon,authenticated;
+revoke all on function wms_private.branch_part_requests(text) from public,anon,authenticated;
+
+create or replace function wms_private.branch_deletion_action_v2(
+ p_action text,p_branch_id text,p_plan_id uuid,p_confirmation text,p_reason text,p_file jsonb
+) returns jsonb language plpgsql security definer set search_path='' set statement_timeout='180s' as $$
+declare
+ plan wms_private.branch_deletion_plans%rowtype;
+ actor_branch text; actor_name text; branch_row public.branches%rowtype;
+ raw text; digest text; part text; ord smallint; plan_summary jsonb; parts jsonb;
+ remaining integer; local_backups integer; expected_count integer;
+ count_docs bigint; count_orders bigint; count_stock bigint; stock_qty numeric;
+ count_movements bigint; count_audit bigint; count_backups bigint; count_req bigint;
+ stored_sha text; current_sha text; all_hashes text;
+begin
+ select p.branch_id,coalesce(nullif(p.full_name,''),p.email) into actor_branch,actor_name
+ from public.profiles p where p.id=auth.uid() and p.is_active and p.role='Administrator';
+ if auth.uid() is null or actor_branch is null or not wms_private.is_hq() then raise exception 'Hanya Administrator aktif kantor pusat yang dapat menghapus cabang';end if;
+ if p_plan_id is null or p_branch_id is null or p_branch_id !~ '^[A-Z0-9][A-Z0-9_-]{1,31}$' then raise exception 'Identitas rencana atau kode cabang tidak valid';end if;
+
+ perform pg_advisory_xact_lock(hashtextextended('wms-branch-delete-global',0));
+ perform pg_advisory_xact_lock(hashtextextended('write-branch:'||p_branch_id,0));
+
+ if p_action='prepare' then
+  select * into branch_row from public.branches where id=p_branch_id for update;
+  if branch_row.id is null then raise exception 'Cabang tidak ditemukan';end if;
+  select count(*) into remaining from public.branches;
+  if remaining<=1 then raise exception 'Cabang terakhir tidak dapat dihapus';end if;
+  if actor_branch=p_branch_id or exists(select 1 from public.profiles where branch_id=p_branch_id) then raise exception 'Pindahkan seluruh akun cabang terlebih dahulu';end if;
+  if exists(select 1 from public.wms_documents where branch_id=p_branch_id and collection_name='orders' and coalesce(payload->>'status','Pending') not in ('Completed','Cancelled')) then raise exception 'Selesaikan atau batalkan seluruh order aktif terlebih dahulu';end if;
+  if exists(select 1 from public.branch_transfers where source_branch=p_branch_id or destination_branch=p_branch_id) then raise exception 'Cabang memiliki riwayat transfer lintas cabang yang perlu ditangani sebelum penghapusan';end if;
+  if exists(select 1 from public.branch_backups where branch_id=p_branch_id and storage_status='LOCAL') then raise exception 'Backup lokal lama harus diverifikasi sebelum penghapusan dapat diproses';end if;
+
+  update wms_private.branch_deletion_plans set status='CANCELLED',payload_text=null
+  where branch_id=p_branch_id and status='PREPARED';
+  delete from wms_private.branch_deletion_plans where status='PREPARED' and expires_at<=now();
+
+  select count(*) into count_docs from public.wms_documents where branch_id=p_branch_id;
+  select count(*) into count_orders from public.wms_documents where branch_id=p_branch_id and collection_name='orders';
+  select count(*) into count_stock from public.wms_documents where branch_id=p_branch_id and collection_name='stock' and left(document_id,7)<>'SYSTEM_';
+  select coalesce(sum((payload->>'qty')::numeric),0) into stock_qty from public.wms_documents where branch_id=p_branch_id and collection_name='stock' and left(document_id,7)<>'SYSTEM_';
+  select count(*) into count_movements from public.stock_movements where branch_id=p_branch_id;
+  select count(*) into count_audit from public.activity_events where branch_id=p_branch_id;
+  select count(*) into count_backups from public.branch_backups where branch_id=p_branch_id;
+  select count(*) into local_backups from public.branch_backups where branch_id=p_branch_id and storage_status='LOCAL';
+  select count(*) into count_req from wms_private.write_requests where branch_id=p_branch_id;
+
+  parts=jsonb_build_array(
+   jsonb_build_object('part','operational','label','Data operasional','filename','operational.json','sha256','','bytes',0),
+   jsonb_build_object('part','audit','label','Riwayat audit','filename','audit.json','sha256','','bytes',0),
+   jsonb_build_object('part','backups','label','Backup historis','filename','backups.json','sha256','','bytes',0),
+   jsonb_build_object('part','requests','label','Request dan arsip','filename','requests.json','sha256','','bytes',0)
+  );
+  plan_summary=jsonb_build_object('is_multi_part',true,'format_version',2,'documents',count_docs,'orders',count_orders,
+   'stock_rows',count_stock,'stock_qty',stock_qty,'movements',count_movements,'audit_events',count_audit,
+   'cloud_and_local_backups',count_backups,'previously_local_backups',local_backups,'write_requests',count_req,'parts',parts);
+  insert into wms_private.branch_deletion_plans(id,branch_id,actor_id,sha256,payload_text,summary,expires_at)
+  values(p_plan_id,p_branch_id,auth.uid(),repeat('0',64),null,plan_summary,now()+interval '60 minutes') returning * into plan;
+  return jsonb_build_object('plan_id',plan.id,'sha256',plan.sha256,'is_multi_part',true,'parts',parts,'summary',plan_summary,'expires_at',plan.expires_at);
+ end if;
+
+ select * into plan from wms_private.branch_deletion_plans
+ where id=p_plan_id and branch_id=p_branch_id and actor_id=auth.uid() for update;
+ if plan.id is null then raise exception 'Rencana penghapusan tidak ditemukan';end if;
+ if p_action='finish' and plan.status='COMPLETED' then return jsonb_build_object('completed',true,'summary',plan.summary);end if;
+ if p_action='cancel' then
+  if plan.status='PREPARED' then update wms_private.branch_deletion_plans set status='CANCELLED',payload_text=null where id=plan.id;end if;
+  return jsonb_build_object('cancelled',true);
+ end if;
+ if plan.status<>'PREPARED' or plan.expires_at<=now() then raise exception 'Rencana penghapusan sudah kedaluwarsa atau dibatalkan';end if;
+
+ if p_action like 'export:%' and p_action<>'export:manifest' then
+  part=substr(p_action,8);
+  if part='operational' then raw=wms_private.branch_part_operational(p_branch_id)::text;ord=1;
+  elsif part='audit' then raw=wms_private.branch_part_audit(p_branch_id)::text;ord=2;
+  elsif part='backups' then raw=wms_private.branch_part_backups(p_branch_id)::text;ord=3;
+  elsif part='requests' then raw=wms_private.branch_part_requests(p_branch_id)::text;ord=4;
+  else raise exception 'Bagian backup tidak dikenal';end if;
+  digest=encode(extensions.digest(raw,'sha256'),'hex');
+  insert into wms_private.branch_deletion_parts(plan_id,part_name,ordinal,sha256,payload_text)
+  values(plan.id,part,ord,digest,raw)
+  on conflict(plan_id,part_name) do update set ordinal=excluded.ordinal,sha256=excluded.sha256,payload_text=excluded.payload_text,exported_at=now();
+  return jsonb_build_object('format','BLUES_WMS_PART','version',2,'backup_id',plan.id,'branch_id',plan.branch_id,
+   'part',part,'sha256',digest,'bytes',octet_length(raw),'payload_text',raw);
+ end if;
+
+ if p_action in ('export','export:manifest') then
+  select count(*),string_agg(sha256,'' order by ordinal) into expected_count,all_hashes
+  from wms_private.branch_deletion_parts where plan_id=plan.id;
+  if expected_count<>4 then raise exception 'Unduh keempat bagian backup sebelum membuat manifest';end if;
+  digest=encode(extensions.digest(plan.id::text||all_hashes,'sha256'),'hex');
+  select jsonb_agg(jsonb_build_object('part',d.part_name,'label',case d.part_name when 'operational' then 'Data operasional' when 'audit' then 'Riwayat audit' when 'backups' then 'Backup historis' else 'Request dan arsip' end,
+    'filename',d.part_name||'.json','sha256',d.sha256,'bytes',octet_length(d.payload_text)) order by d.ordinal)
+  into parts from wms_private.branch_deletion_parts d where d.plan_id=plan.id;
+  plan_summary=jsonb_set(plan.summary,'{parts}',parts);
+  update wms_private.branch_deletion_plans d set sha256=digest,summary=plan_summary where d.id=plan.id returning * into plan;
+  return jsonb_build_object('format','BLUES_WMS_MULTI_BACKUP','version',2,'backup_id',plan.id,'branch_id',plan.branch_id,
+   'created_at',plan.created_at,'sha256',digest,'parts',parts,'summary',plan_summary);
+ end if;
+
+ if p_action<>'finish' then raise exception 'Aksi penghapusan tidak dikenal';end if;
+ if not wms_private.recent_password_auth() then raise exception 'Masuk ulang dengan password sebelum konfirmasi';end if;
+ if p_confirmation is distinct from 'HAPUS '||p_branch_id or length(trim(coalesce(p_reason,''))) not between 10 and 1000 then raise exception 'Ketik konfirmasi cabang dan alasan 10-1000 karakter';end if;
+ if jsonb_typeof(p_file) is distinct from 'object' or p_file->>'format' is distinct from 'BLUES_WMS_MULTI_BACKUP'
+   or p_file->>'version' is distinct from '2' or p_file->>'backup_id' is distinct from plan.id::text
+   or p_file->>'branch_id' is distinct from p_branch_id or p_file->>'sha256' is distinct from plan.sha256 then
+  raise exception 'Manifest backup tidak cocok dengan rencana';
+ end if;
+
+ for part,ord in select v.part_name,v.part_ordinal from (values ('operational',1::smallint),('audit',2::smallint),('backups',3::smallint),('requests',4::smallint)) v(part_name,part_ordinal) loop
+  select sha256 into stored_sha from wms_private.branch_deletion_parts where plan_id=plan.id and part_name=part;
+  if part='operational' then raw=wms_private.branch_part_operational(p_branch_id)::text;
+  elsif part='audit' then raw=wms_private.branch_part_audit(p_branch_id)::text;
+  elsif part='backups' then raw=wms_private.branch_part_backups(p_branch_id)::text;
+  else raw=wms_private.branch_part_requests(p_branch_id)::text;end if;
+  current_sha=encode(extensions.digest(raw,'sha256'),'hex');
+  if stored_sha is null or current_sha is distinct from stored_sha then raise exception 'Data cabang berubah setelah backup. Unduh ulang seluruh bagian';end if;
+ end loop;
+ select string_agg(sha256,'' order by ordinal) into all_hashes from wms_private.branch_deletion_parts where plan_id=plan.id;
+ if encode(extensions.digest(plan.id::text||all_hashes,'sha256'),'hex') is distinct from plan.sha256 then raise exception 'Checksum manifest tidak cocok';end if;
+
+ perform set_config('wms.operation_type','PERIOD_ARCHIVE',true);
+ perform set_config('wms.operation_id',plan.id::text,true);
+ perform set_config('wms.reason',trim(p_reason),true);
+ delete from public.wms_documents where branch_id=p_branch_id;
+ delete from wms_private.period_archives where branch_id=p_branch_id;
+ delete from wms_private.stock_purge_plans where branch_id=p_branch_id;
+ delete from wms_private.backup_payloads p using public.branch_backups b where p.id=b.id and b.branch_id=p_branch_id;
+ delete from public.branch_backups where branch_id=p_branch_id;
+ delete from wms_private.write_requests where branch_id=p_branch_id;
+ delete from public.stock_movements where branch_id=p_branch_id;
+ delete from public.activity_events where branch_id=p_branch_id;
+ delete from public.branches where id=p_branch_id;
+ update wms_private.branch_deletion_plans set status='COMPLETED',payload_text=null,completed_at=now() where id=plan.id;
+ insert into public.activity_events(branch_id,entity_type,entity_id,action,actor_id,actor_name,before_data,reason,operation_id)
+ values(actor_branch,'branches',p_branch_id,'BRANCH_DELETED',auth.uid(),actor_name,plan.summary||jsonb_build_object('backup_sha256',plan.sha256),trim(p_reason),plan.id::text);
+ return jsonb_build_object('completed',true,'summary',plan.summary);
+end;
+$$;
+revoke all on function wms_private.branch_deletion_action_v2(text,text,uuid,text,text,jsonb) from public,anon,authenticated;
+
+create or replace function public.branch_deletion_action(p_action text,p_branch_id text,p_plan_id uuid,p_confirmation text default '',p_reason text default '',p_file jsonb default null)
+returns jsonb language plpgsql security definer set search_path='' set statement_timeout='180s' as $$
+begin return wms_private.branch_deletion_action_v2(p_action,p_branch_id,p_plan_id,p_confirmation,p_reason,p_file);end;
+$$;
+revoke all on function public.branch_deletion_action(text,text,uuid,text,text,jsonb) from public,anon;
+grant execute on function public.branch_deletion_action(text,text,uuid,text,text,jsonb) to authenticated;
+
+create or replace function wms_private.restore_deleted_branch_v2(
+ p_branch_id text,p_plan_id uuid,p_confirmation text,p_reason text,p_file jsonb
+) returns jsonb language plpgsql security definer set search_path='' set statement_timeout='180s' as $$
+declare
+ plan wms_private.branch_deletion_plans%rowtype; actor_branch text; actor_name text;
+ op jsonb;audit_data jsonb;backups_data jsonb;requests_data jsonb;
+ raw text;stored_sha text;all_hashes text;digest text;part text;
+begin
+ select branch_id,coalesce(nullif(full_name,''),email) into actor_branch,actor_name
+ from public.profiles where id=auth.uid() and is_active and role='Administrator';
+ if auth.uid() is null or actor_branch is null or not wms_private.is_hq() then raise exception 'Hanya Administrator aktif kantor pusat yang dapat memulihkan cabang';end if;
+ if not wms_private.recent_password_auth() then raise exception 'Masuk ulang dengan password sebelum pemulihan';end if;
+ if p_confirmation is distinct from 'PULIHKAN '||p_branch_id or length(trim(coalesce(p_reason,''))) not between 10 and 1000 then raise exception 'Konfirmasi dan alasan pemulihan tidak valid';end if;
+ perform pg_advisory_xact_lock(hashtextextended('wms-branch-delete-global',0));
+ perform pg_advisory_xact_lock(hashtextextended('write-branch:'||p_branch_id,0));
+ select * into plan from wms_private.branch_deletion_plans where id=p_plan_id and branch_id=p_branch_id for update;
+ if plan.id is null or plan.status not in ('COMPLETED','RESTORED') then raise exception 'Bukti penghapusan tidak ditemukan';end if;
+ if plan.status='RESTORED' then return jsonb_build_object('restored',true,'summary',plan.summary);end if;
+ if jsonb_typeof(p_file) is distinct from 'object' or p_file->>'format' is distinct from 'BLUES_WMS_MULTI_BACKUP'
+   or p_file->>'version' is distinct from '2' or p_file->>'backup_id' is distinct from plan.id::text
+   or p_file->>'branch_id' is distinct from p_branch_id or p_file->>'sha256' is distinct from plan.sha256 then raise exception 'Manifest backup tidak cocok atau rusak';end if;
+ select string_agg(sha256,'' order by ordinal) into all_hashes from wms_private.branch_deletion_parts where plan_id=plan.id;
+ if all_hashes is null or (select count(*) from wms_private.branch_deletion_parts where plan_id=plan.id)<>4
+   or encode(extensions.digest(plan.id::text||all_hashes,'sha256'),'hex') is distinct from plan.sha256 then raise exception 'Arsip recovery server tidak lengkap';end if;
+ select payload_text::jsonb into op from wms_private.branch_deletion_parts where plan_id=plan.id and part_name='operational';
+ select payload_text::jsonb into audit_data from wms_private.branch_deletion_parts where plan_id=plan.id and part_name='audit';
+ select payload_text::jsonb into backups_data from wms_private.branch_deletion_parts where plan_id=plan.id and part_name='backups';
+ select payload_text::jsonb into requests_data from wms_private.branch_deletion_parts where plan_id=plan.id and part_name='requests';
+ if op->'branch'->>'id' is distinct from p_branch_id or jsonb_array_length(op->'operators')<>0 or jsonb_array_length(op->'transfers')<>0 then raise exception 'Isi backup tidak dapat dipulihkan otomatis';end if;
+ if exists(select 1 from public.branches where id=p_branch_id) then raise exception 'Kode cabang sudah digunakan';end if;
+
+ insert into wms_private.branch_restore_documents(plan_id,branch_id,collection_name,document_id,payload,row_data)
+ select plan.id,p_branch_id,j.value->>'collection_name',j.value->>'document_id',j.value->'payload',j.value from jsonb_array_elements(op->'documents') j;
+ perform set_config('wms.restore_operation_id',plan.id::text,true);
+ insert into public.branches select (jsonb_populate_record(null::public.branches,op->'branch')).*;
+ insert into public.wms_documents select (jsonb_populate_record(null::public.wms_documents,j.value)).* from jsonb_array_elements(op->'documents') j;
+ perform set_config('wms.restore_operation_id','',true);
+ delete from wms_private.branch_restore_documents where plan_id=plan.id;
+ if exists(select 1 from jsonb_array_elements(op->'documents') j left join public.wms_documents d on d.branch_id=p_branch_id and d.collection_name=j.value->>'collection_name' and d.document_id=j.value->>'document_id' where d.payload is distinct from j.value->'payload') then raise exception 'Pemulihan dibatalkan karena trigger mengubah isi dokumen backup';end if;
+ delete from public.stock_movements where branch_id=p_branch_id;
+ delete from public.activity_events where branch_id=p_branch_id;
+ insert into public.stock_movements overriding system value select (jsonb_populate_record(null::public.stock_movements,j.value)).* from jsonb_array_elements(op->'stock_movements') j;
+ insert into public.activity_events overriding system value select (jsonb_populate_record(null::public.activity_events,j.value)).* from jsonb_array_elements(audit_data->'activity_events') j;
+ insert into public.branch_backups select (jsonb_populate_record(null::public.branch_backups,j.value->'metadata')).* from jsonb_array_elements(backups_data->'backups') j;
+ insert into wms_private.backup_payloads(id,payload_text) select (j.value->'metadata'->>'id')::uuid,j.value->>'payload_text' from jsonb_array_elements(backups_data->'backups') j where j.value->>'payload_text' is not null;
+ insert into wms_private.write_requests select (jsonb_populate_record(null::wms_private.write_requests,j.value)).* from jsonb_array_elements(requests_data->'write_requests') j;
+ insert into wms_private.period_archives select (jsonb_populate_record(null::wms_private.period_archives,j.value)).* from jsonb_array_elements(requests_data->'period_archives') j;
+ insert into wms_private.stock_purge_plans select (jsonb_populate_record(null::wms_private.stock_purge_plans,j.value)).* from jsonb_array_elements(requests_data->'stock_purge_plans') j;
+
+ for part in select unnest(array['operational','audit','backups','requests']) loop
+  select sha256 into stored_sha from wms_private.branch_deletion_parts where plan_id=plan.id and part_name=part;
+  if part='operational' then raw=wms_private.branch_part_operational(p_branch_id)::text;
+  elsif part='audit' then raw=wms_private.branch_part_audit(p_branch_id)::text;
+  elsif part='backups' then raw=wms_private.branch_part_backups(p_branch_id)::text;
+  else raw=wms_private.branch_part_requests(p_branch_id)::text;end if;
+  if encode(extensions.digest(raw,'sha256'),'hex') is distinct from stored_sha then raise exception 'Pemulihan tidak identik untuk bagian %',part;end if;
+ end loop;
+ update wms_private.branch_deletion_plans set status='RESTORED' where id=plan.id;
+ insert into public.activity_events(branch_id,entity_type,entity_id,action,actor_id,actor_name,after_data,reason,operation_id)
+ values(actor_branch,'branches',p_branch_id,'BRANCH_RESTORED',auth.uid(),actor_name,plan.summary||jsonb_build_object('backup_sha256',plan.sha256),trim(p_reason),plan.id::text);
+ return jsonb_build_object('restored',true,'summary',plan.summary);
+end;
+$$;
+revoke all on function wms_private.restore_deleted_branch_v2(text,uuid,text,text,jsonb) from public,anon,authenticated;
+
+create or replace function public.restore_deleted_branch(p_branch_id text,p_plan_id uuid,p_confirmation text,p_reason text,p_file jsonb)
+returns jsonb language plpgsql security definer set search_path='' set statement_timeout='180s' as $$
+begin return wms_private.restore_deleted_branch_v2(p_branch_id,p_plan_id,p_confirmation,p_reason,p_file);end;
+$$;
+revoke all on function public.restore_deleted_branch(text,uuid,text,text,jsonb) from public,anon;
+grant execute on function public.restore_deleted_branch(text,uuid,text,text,jsonb) to authenticated;
+
+revoke all on function wms_private.branch_deletion_action(text,text,uuid,text,text,jsonb) from public, anon, authenticated;
+revoke all on function wms_private.restore_deleted_branch(text,uuid,text,text,jsonb) from public, anon, authenticated;
+-- <<< 20261113000453_lossless_multipart_branch_backup.sql
+
+-- >>> 20261114133500_fix_return_qc_regex.sql
+create or replace function wms_private.process_return_qc(
+  p_request_id uuid,
+  p_branch_id text,
+  p_case_id text,
+  p_decision text,
+  p_notes text default ''
+) returns jsonb
+language plpgsql
+security definer
+set search_path=''
+as $function$
+declare
+  actor_role text;
+  actor_name text;
+  decision text=upper(btrim(coalesce(p_decision,'')));
+  target_location text;
+  target_status text;
+  stock_status text;
+  ret public.wms_documents%rowtype;
+  current_stock public.wms_documents%rowtype;
+  stock_id text;
+  warehouse_id text;
+  qty bigint;
+  qty_before bigint;
+  qty_after bigint;
+  ctn_size bigint;
+  inner_size bigint;
+  result jsonb='[]'::jsonb;
+  case_count integer;
+  finalized_count integer;
+  log_id text;
+begin
+  if p_request_id is null or nullif(btrim(p_branch_id),'') is null or nullif(btrim(p_case_id),'') is null then
+    raise exception 'Identitas transaksi QC tidak lengkap';
+  end if;
+  if decision not in ('ACCEPT','QUARANTINE','REJECT') then
+    raise exception 'Keputusan QC tidak valid';
+  end if;
+  select role,coalesce(nullif(btrim(full_name),''),email)
+  into actor_role,actor_name
+  from public.profiles where id=auth.uid() and is_active;
+  if auth.uid() is null or actor_role not in ('Administrator','Admin') or not wms_private.can_access_branch(p_branch_id) then
+    raise exception 'QC return hanya untuk admin cabang yang berwenang';
+  end if;
+
+  perform pg_advisory_xact_lock(hashtextextended('return-qc:'||p_branch_id||':'||p_case_id,0));
+  perform 1 from public.wms_documents
+   where branch_id=p_branch_id and collection_name='returns'
+     and coalesce(payload->>'caseId',document_id)=p_case_id
+   order by document_id for update;
+
+  select count(*),count(*) filter(where payload->>'status' in ('RESTOCKED','KARANTINA','QC_REJECTED'))
+  into case_count,finalized_count
+  from public.wms_documents
+  where branch_id=p_branch_id and collection_name='returns'
+    and coalesce(payload->>'caseId',document_id)=p_case_id;
+  if case_count=0 then raise exception 'Kasus return tidak ditemukan';end if;
+  if finalized_count=case_count then
+    if exists(
+      select 1 from public.wms_documents
+      where branch_id=p_branch_id and collection_name='returns'
+        and coalesce(payload->>'caseId',document_id)=p_case_id
+        and payload->>'qcDecision' is distinct from decision
+    ) then raise exception 'Kasus return sudah diproses dengan keputusan lain';end if;
+    return jsonb_build_object('caseId',p_case_id,'decision',decision,'idempotent',true,'items',case_count);
+  end if;
+  if finalized_count>0 then raise exception 'Status item dalam kasus return tidak konsisten';end if;
+
+  target_location=case decision when 'ACCEPT' then 'TRANSIT' when 'QUARANTINE' then 'KARANTINA' else 'RETURN-REJECTED' end;
+  target_status=case decision when 'ACCEPT' then 'RESTOCKED' when 'QUARANTINE' then 'KARANTINA' else 'QC_REJECTED' end;
+  stock_status=case when decision='QUARANTINE' then 'Damage' else 'AMAN' end;
+  perform set_config('wms.operation_id',p_request_id::text,true);
+  perform set_config('wms.operation_type','RETURN_QC',true);
+  perform set_config('wms.reason',coalesce(nullif(btrim(p_notes),''),'Keputusan QC return'),true);
+
+  for ret in
+    select * from public.wms_documents
+    where branch_id=p_branch_id and collection_name='returns'
+      and coalesce(payload->>'caseId',document_id)=p_case_id
+    order by document_id
+  loop
+    qty=(ret.payload->>'qty')::bigint;
+    if qty is null or qty<=0 then raise exception 'Qty return tidak valid';end if;
+    if decision<>'REJECT' then
+      warehouse_id=upper(coalesce(nullif(btrim(ret.payload->>'warehouseId'),''),'WH-CENTRAL'));
+      stock_id=(case when warehouse_id='WH-CENTRAL' then '' else warehouse_id||'_' end)
+        ||upper(btrim(ret.payload->>'skuId'))||'_'
+        ||regexp_replace(coalesce(nullif(btrim(ret.payload->>'expiredDate'),''),'No Expired'),'[-/ .\\]','_','g')||'_'
+        ||regexp_replace(target_location,'[-/ .\\]','_','g');
+      select * into current_stock from public.wms_documents
+       where branch_id=p_branch_id and collection_name='stock' and document_id=stock_id for update;
+      qty_before=coalesce((current_stock.payload->>'qty')::bigint,0);
+      qty_after=qty_before+qty;
+      ctn_size=greatest(coalesce((current_stock.payload->>'qtyCtnSize')::bigint,(ret.payload->>'qtyCtnSize')::bigint,144),1);
+      inner_size=greatest(coalesce((current_stock.payload->>'qtyInnerSize')::bigint,(ret.payload->>'qtyInnerSize')::bigint,12),1);
+      insert into public.wms_documents(branch_id,collection_name,document_id,payload,updated_by)
+      values(p_branch_id,'stock',stock_id,
+        coalesce(current_stock.payload,'{}'::jsonb)||jsonb_build_object(
+          'id',stock_id,'skuId',ret.payload->>'skuId','skuName',ret.payload->>'skuName',
+          'expiredDate',ret.payload->>'expiredDate','location',target_location,'warehouseId',warehouse_id,
+          'qty',qty_after,'qtyCtnSize',ctn_size,'qtyInnerSize',inner_size,
+          'qtyCtn',qty_after/ctn_size,'qtyInner',(qty_after%ctn_size)/inner_size,
+          'qtyLoose',(qty_after%ctn_size)%inner_size,'status',stock_status
+        ),auth.uid())
+      on conflict(branch_id,collection_name,document_id) do update
+        set payload=excluded.payload,updated_by=auth.uid();
+      result=result||jsonb_build_array(jsonb_build_object('returnId',ret.document_id,'stockId',stock_id,'qty',qty));
+    end if;
+    update public.wms_documents set
+      payload=payload||jsonb_strip_nulls(jsonb_build_object(
+        'status',target_status,'location',target_location,'qcDecision',decision,'qcNotes',nullif(btrim(p_notes),''),
+        'qcBy',actor_name,'qcById',auth.uid(),'qcAt',clock_timestamp(),
+        'stockPostedAt',case when decision='REJECT' then null else clock_timestamp() end
+      )),updated_by=auth.uid()
+    where branch_id=p_branch_id and collection_name='returns' and document_id=ret.document_id;
+    log_id='RETURN_QC_'||md5(p_case_id||':'||ret.document_id);
+    insert into public.wms_documents(branch_id,collection_name,document_id,payload,updated_by)
+    values(p_branch_id,'logs',log_id,jsonb_build_object(
+      'id',log_id,'timestamp',clock_timestamp(),'type','RETURN_QC','qty',qty,
+      'skuId',ret.payload->>'skuId','skuName',ret.payload->>'skuName',
+      'locationFrom','RETURN-QC','locationTo',target_location,'user',actor_name,
+      'description','QC return '||coalesce(ret.payload->>'returnNumber',p_case_id)||': '||decision
+    ),auth.uid()) on conflict(branch_id,collection_name,document_id) do nothing;
+  end loop;
+  return jsonb_build_object('caseId',p_case_id,'decision',decision,'idempotent',false,'items',case_count,'posted',result);
+end;$function$;
+
+grant execute on function wms_private.process_return_qc(uuid,text,text,text,text) to authenticated;
+
+create or replace function public.process_return_qc(
+  p_request_id uuid,p_branch_id text,p_case_id text,p_decision text,p_notes text default ''
+) returns jsonb language sql security definer set search_path='' as $$
+  select wms_private.process_return_qc(p_request_id,p_branch_id,p_case_id,p_decision,p_notes)
+$$;
+
+revoke all on function public.process_return_qc(uuid,text,text,text,text) from public,anon;
+grant execute on function public.process_return_qc(uuid,text,text,text,text) to authenticated;
+-- <<< 20261114133500_fix_return_qc_regex.sql
+
+
 
 -- ==============================================================================
 -- IZIN PENUH OPERATOR PICKER / PACKER & PENGHAPUSAN RESTRIKSI STOK
@@ -2761,3 +3807,987 @@ revoke all on function wms_private.stock_pickable(jsonb),wms_private.validate_op
 
 -- Cabang Default
 insert into public.branches(id, name) values ('KOL', 'KOL - Gudang Utama') on conflict (id) do nothing;
+
+-- =====================================================================
+-- B2B, ONLINE, HYBRID & SHIPPING MANIFEST SCHEMA & RPCS
+-- =====================================================================
+
+-- B2B, Online, Hybrid Branch Configuration, Shipping & Manifest, and Unassigned Order Classification
+
+alter table public.branches
+  add column if not exists operation_type text not null default 'HYBRID';
+
+alter table public.branches
+  drop constraint if exists branches_operation_type_check;
+
+alter table public.branches
+  add constraint branches_operation_type_check
+  check (operation_type in ('B2B', 'ONLINE', 'HYBRID'));
+
+update public.branches
+set operation_type = 'HYBRID'
+where operation_type is null;
+
+-- Expand allowed roles on public.profiles to include Shipping
+do $$
+declare
+  c record;
+begin
+  for c in
+    select conname
+    from pg_constraint
+    where conrelid = 'public.profiles'::regclass
+      and contype = 'c'
+      and pg_get_constraintdef(oid) ilike '%role%'
+      and pg_get_constraintdef(oid) ilike '%Packer%'
+  loop
+    execute format('alter table public.profiles drop constraint %I', c.conname);
+  end loop;
+end $$;
+
+alter table public.profiles
+  drop constraint if exists profiles_role_check;
+
+alter table public.profiles
+  add constraint profiles_role_check
+  check (role in ('Administrator', 'Admin', 'Picker', 'Packer', 'Shipping', 'Viewer'));
+
+-- Restrictive read policy for Shipping role (orders, warehouses, settings only)
+drop policy if exists documents_shipping_read on public.wms_documents;
+create policy documents_shipping_read
+  on public.wms_documents
+  as restrictive
+  for select
+  to authenticated
+  using (
+    (select public.wms_current_role()) is distinct from 'Shipping'
+    or collection_name in ('orders', 'warehouses', 'settings')
+  );
+
+-- Durable Shipping Manifest ledger table
+create table if not exists public.shipping_manifests (
+  manifest_id text primary key,
+  branch_id text not null references public.branches(id) on delete cascade,
+  warehouse_id text not null default 'WH-CENTRAL',
+  warehouse_name text not null default '',
+  order_type text not null check (order_type in ('B2B', 'ONLINE')),
+  courier_name text not null,
+  sender_name text not null default '',
+  driver_name text,
+  driver_phone text,
+  vehicle_plate text,
+  handed_over_by text not null,
+  handed_over_by_id uuid references auth.users(id) on delete set null,
+  handed_over_at timestamptz not null default now(),
+  total_orders integer not null default 0 check (total_orders >= 0),
+  total_qty_pcs numeric not null default 0 check (total_qty_pcs >= 0),
+  order_references jsonb not null default '[]'::jsonb,
+  notes text,
+  status text not null default 'ACTIVE' check (status in ('ACTIVE', 'CANCELLED')),
+  cancelled_at timestamptz,
+  cancelled_by uuid references auth.users(id) on delete set null,
+  created_at timestamptz not null default now()
+);
+
+create index if not exists shipping_manifests_branch_created_idx
+  on public.shipping_manifests (branch_id, created_at desc);
+
+create index if not exists shipping_manifests_handed_over_by_id_idx
+  on public.shipping_manifests (handed_over_by_id);
+
+create index if not exists shipping_manifests_cancelled_by_id_idx
+  on public.shipping_manifests (cancelled_by);
+
+alter table public.shipping_manifests enable row level security;
+revoke all on public.shipping_manifests from public, anon;
+grant select on public.shipping_manifests to authenticated;
+
+drop policy if exists shipping_manifests_read on public.shipping_manifests;
+create policy shipping_manifests_read
+  on public.shipping_manifests
+  for select
+  to authenticated
+  using (
+    (select wms_private.can_access_branch(branch_id))
+    and (select public.wms_current_role()) in ('Administrator', 'Admin', 'Shipping', 'Viewer')
+  );
+
+-- Save or update branch including operation_type ('B2B', 'ONLINE', 'HYBRID')
+create or replace function public.save_branch(
+  p_id text,
+  p_name text,
+  p_operation_type text default 'HYBRID'
+)
+returns jsonb
+language plpgsql
+security definer
+set search_path = ''
+as $$
+declare
+  v_id text;
+  v_name text;
+  v_op text;
+  v_actor text;
+  v_exists boolean;
+  v_row public.branches%rowtype;
+begin
+  if auth.uid() is null then
+    raise exception 'Sesi pengguna tidak valid.';
+  end if;
+
+  v_id := upper(trim(coalesce(p_id, '')));
+  v_name := trim(coalesce(p_name, ''));
+  v_op := upper(trim(coalesce(nullif(p_operation_type, ''), 'HYBRID')));
+
+  if v_id !~ '^[A-Z0-9][A-Z0-9_-]{1,31}$' then
+    raise exception 'Kode cabang harus 2â€“32 karakter (A-Z, 0-9, -, _).';
+  end if;
+  if length(v_name) not between 1 and 100 then
+    raise exception 'Nama cabang harus 1â€“100 karakter.';
+  end if;
+  if v_op not in ('B2B', 'ONLINE', 'HYBRID') then
+    raise exception 'Tipe operasional cabang harus B2B, ONLINE, atau HYBRID.';
+  end if;
+
+  select exists(select 1 from public.branches where id = v_id) into v_exists;
+
+  if not v_exists then
+    if not wms_private.is_hq() then
+      raise exception 'Hanya Administrator kantor pusat yang dapat membuat cabang baru.';
+    end if;
+    insert into public.branches (id, name, operation_type)
+    values (v_id, v_name, v_op)
+    returning * into v_row;
+  else
+    if not wms_private.is_hq() and not (public.wms_is_admin() and wms_private.can_access_branch(v_id)) then
+      raise exception 'Hanya admin cabang yang berwenang dapat mengubah konfigurasi cabang.';
+    end if;
+
+    if not wms_private.is_hq() then
+      -- Branch Admin may update operation_type of their own branch; name remains locked unless HQ
+      update public.branches
+      set operation_type = v_op
+      where id = v_id
+      returning * into v_row;
+    else
+      update public.branches
+      set name = v_name,
+          operation_type = v_op
+      where id = v_id
+      returning * into v_row;
+    end if;
+  end if;
+
+  select coalesce(nullif(full_name, ''), email) into v_actor
+  from public.profiles where id = auth.uid();
+
+  insert into public.activity_events (
+    branch_id, entity_type, entity_id, action, actor_id, actor_name, after_data, reason
+  ) values (
+    v_id,
+    'branches',
+    v_id,
+    case when v_exists then 'BRANCH_UPDATE' else 'BRANCH_CREATE' end,
+    auth.uid(),
+    coalesce(v_actor, 'Admin WMS'),
+    jsonb_build_object('id', v_row.id, 'name', v_row.name, 'operation_type', v_row.operation_type),
+    'Konfigurasi tipe operasional cabang: ' || v_row.operation_type
+  );
+
+  return jsonb_build_object(
+    'id', v_row.id,
+    'name', v_row.name,
+    'operation_type', v_row.operation_type
+  );
+end;
+$$;
+
+revoke all on function public.save_branch(text, text, text) from public, anon;
+grant execute on function public.save_branch(text, text, text) to authenticated;
+
+-- Atomic Shipping Manifest commit & cancellation RPC
+create or replace function public.commit_shipping_manifest(
+  p_request_id uuid,
+  p_branch_id text,
+  p_order_refs text[],
+  p_manifest jsonb default '{}'::jsonb,
+  p_action text default 'create'
+)
+returns jsonb
+language plpgsql
+security definer
+set search_path = ''
+as $$
+declare
+  v_role text;
+  v_actor text;
+  v_action text;
+  v_branch_op text;
+  v_req wms_private.write_requests%rowtype;
+  v_body jsonb;
+  v_refs text[];
+  v_manifest_id text;
+  v_order_types text[];
+  v_order_type text;
+  v_handed_over_at timestamptz;
+  v_now_iso text;
+  v_matched_count integer := 0;
+  v_updated_count integer := 0;
+  v_total_qty numeric := 0;
+  v_existing_manifest public.shipping_manifests%rowtype;
+  v_ref text;
+  v_result jsonb;
+begin
+  v_role := public.wms_current_role();
+  if auth.uid() is null or v_role not in ('Administrator', 'Admin', 'Shipping') or not wms_private.can_access_branch(p_branch_id) then
+    raise exception 'Akses Shipping & Manifest ditolak untuk pengguna atau cabang ini.';
+  end if;
+
+  if p_request_id is null then
+    raise exception 'Request ID transaksi wajib diisi.';
+  end if;
+
+  v_action := lower(trim(coalesce(nullif(p_action, ''), 'create')));
+  if v_action not in ('create', 'cancel') then
+    raise exception 'Aksi manifest harus create atau cancel.';
+  end if;
+
+  perform pg_advisory_xact_lock(hashtextextended('write:' || p_request_id::text, 0));
+  perform pg_advisory_xact_lock(hashtextextended('write-branch:' || p_branch_id, 0));
+
+  v_body := jsonb_build_object(
+    'action', v_action,
+    'refs', coalesce(to_jsonb(p_order_refs), '[]'::jsonb),
+    'manifest', coalesce(p_manifest, '{}'::jsonb)
+  );
+
+  select * into v_req from wms_private.write_requests where id = p_request_id;
+  if found then
+    if v_req.actor_id <> auth.uid() or v_req.branch_id <> p_branch_id or v_req.body is distinct from v_body then
+      raise exception 'ID transaksi manifest sudah digunakan untuk permintaan lain.';
+    end if;
+    return v_req.result;
+  end if;
+
+  select coalesce(nullif(full_name, ''), email) into v_actor
+  from public.profiles where id = auth.uid();
+  v_actor := coalesce(nullif(trim(coalesce(p_manifest->>'handedOverBy', '')), ''), v_actor, 'Petugas Shipping');
+
+  select coalesce(operation_type, 'HYBRID') into v_branch_op
+  from public.branches where id = p_branch_id;
+  v_branch_op := coalesce(v_branch_op, 'HYBRID');
+
+  v_manifest_id := trim(coalesce(p_manifest->>'manifestId', p_manifest->>'manifest_id', ''));
+
+  select coalesce(array_agg(distinct upper(trim(r))), array[]::text[])
+  into v_refs
+  from unnest(coalesce(p_order_refs, array[]::text[])) as r
+  where trim(coalesce(r, '')) <> '';
+
+  if v_action = 'cancel' then
+    if v_manifest_id = '' and coalesce(array_length(v_refs, 1), 0) = 0 then
+      raise exception 'Referensi manifest atau order untuk pembatalan tidak ditemukan.';
+    end if;
+
+    if v_manifest_id <> '' then
+      select * into v_existing_manifest
+      from public.shipping_manifests
+      where manifest_id = v_manifest_id and branch_id = p_branch_id
+      for update;
+
+      if found then
+        update public.shipping_manifests
+        set status = 'CANCELLED',
+            cancelled_at = now(),
+            cancelled_by = auth.uid()
+        where manifest_id = v_manifest_id and branch_id = p_branch_id;
+
+        if coalesce(array_length(v_refs, 1), 0) = 0 then
+          select coalesce(array_agg(distinct upper(trim(val))), array[]::text[])
+          into v_refs
+          from jsonb_array_elements_text(coalesce(v_existing_manifest.order_references, '[]'::jsonb)) as val
+          where trim(coalesce(val, '')) <> '';
+        end if;
+      end if;
+    end if;
+
+    perform set_config('wms.operation_id', p_request_id::text, true);
+    perform set_config('wms.operation_type', 'SHIPPING_MANIFEST_CANCEL', true);
+    perform set_config('wms.reason', 'Pembatalan manifest ekspedisi ' || coalesce(nullif(v_manifest_id, ''), '-'), true);
+
+    with locked as (
+      select d.document_id, d.payload
+      from public.wms_documents d
+      where d.branch_id = p_branch_id
+        and d.collection_name = 'orders'
+        and (
+          (v_manifest_id <> '' and d.payload->>'manifestId' = v_manifest_id)
+          or (
+            coalesce(array_length(v_refs, 1), 0) > 0
+            and (
+              upper(trim(coalesce(d.payload->>'referenceNumber', ''))) = any(v_refs)
+              or upper(trim(coalesce(d.payload->>'orderNumber', ''))) = any(v_refs)
+              or upper(trim(d.document_id)) = any(v_refs)
+            )
+          )
+        )
+      order by d.document_id
+      for update
+    ),
+    updated as (
+      update public.wms_documents d
+      set payload = (d.payload - 'shippedAt' - 'shippedBy' - 'manifestId') || jsonb_build_object('shipped', false)
+      from locked l
+      where d.branch_id = p_branch_id
+        and d.collection_name = 'orders'
+        and d.document_id = l.document_id
+      returning 1
+    )
+    select count(*) into v_updated_count from updated;
+
+    v_result := jsonb_build_object(
+      'success', true,
+      'action', 'cancel',
+      'manifestId', nullif(v_manifest_id, ''),
+      'updatedCount', v_updated_count
+    );
+
+    insert into wms_private.write_requests (id, actor_id, branch_id, body, result)
+    values (p_request_id, auth.uid(), p_branch_id, v_body, v_result);
+
+    return v_result;
+  end if;
+
+  -- Action: create
+  if coalesce(array_length(v_refs, 1), 0) = 0 then
+    raise exception 'Pilih minimal 1 order untuk dibuatkan manifest pengiriman.';
+  end if;
+  if v_manifest_id = '' then
+    raise exception 'Nomor Manifest (manifestId) wajib diisi.';
+  end if;
+
+  -- Lock candidate order rows consistently before validating
+  perform 1
+  from public.wms_documents d
+  where d.branch_id = p_branch_id
+    and d.collection_name = 'orders'
+    and (
+      upper(trim(coalesce(d.payload->>'referenceNumber', ''))) = any(v_refs)
+      or upper(trim(coalesce(d.payload->>'orderNumber', ''))) = any(v_refs)
+      or upper(trim(d.document_id)) = any(v_refs)
+    )
+  order by d.document_id
+  for update;
+
+  -- Ensure every submitted reference actually exists in branch orders
+  foreach v_ref in array v_refs loop
+    if not exists (
+      select 1
+      from public.wms_documents d
+      where d.branch_id = p_branch_id
+        and d.collection_name = 'orders'
+        and (
+          upper(trim(coalesce(d.payload->>'referenceNumber', ''))) = v_ref
+          or upper(trim(coalesce(d.payload->>'orderNumber', ''))) = v_ref
+          or upper(trim(d.document_id)) = v_ref
+        )
+    ) then
+      raise exception 'Referensi order % tidak ditemukan di cabang %.', v_ref, p_branch_id;
+    end if;
+  end loop;
+
+  if exists (
+    select 1
+    from public.wms_documents d
+    where d.branch_id = p_branch_id
+      and d.collection_name = 'orders'
+      and (
+        upper(trim(coalesce(d.payload->>'referenceNumber', ''))) = any(v_refs)
+        or upper(trim(coalesce(d.payload->>'orderNumber', ''))) = any(v_refs)
+        or upper(trim(d.document_id)) = any(v_refs)
+      )
+      and coalesce(d.payload->>'status', 'Pending') <> 'Completed'
+  ) then
+    raise exception 'Semua order pada manifest harus berstatus Completed (selesai packing).';
+  end if;
+
+  if exists (
+    select 1
+    from public.wms_documents d
+    where d.branch_id = p_branch_id
+      and d.collection_name = 'orders'
+      and (
+        upper(trim(coalesce(d.payload->>'referenceNumber', ''))) = any(v_refs)
+        or upper(trim(coalesce(d.payload->>'orderNumber', ''))) = any(v_refs)
+        or upper(trim(d.document_id)) = any(v_refs)
+      )
+      and coalesce((d.payload->>'shipped')::boolean, false) = true
+  ) then
+    raise exception 'Ada order yang sudah tercatat terkirim pada manifest lain (double shipping diblokir).';
+  end if;
+
+  if exists (
+    select 1
+    from public.wms_documents d
+    where d.branch_id = p_branch_id
+      and d.collection_name = 'orders'
+      and (
+        upper(trim(coalesce(d.payload->>'referenceNumber', ''))) = any(v_refs)
+        or upper(trim(coalesce(d.payload->>'orderNumber', ''))) = any(v_refs)
+        or upper(trim(d.document_id)) = any(v_refs)
+      )
+      and upper(trim(coalesce(d.payload->>'orderType', d.payload->>'order_type', 'UNASSIGNED'))) not in ('B2B', 'ONLINE')
+  ) then
+    raise exception 'Order UNASSIGNED tidak boleh masuk manifest. Minta Admin mengklasifikasikan order terlebih dahulu.';
+  end if;
+
+  select array_agg(distinct upper(trim(coalesce(d.payload->>'orderType', d.payload->>'order_type', '')))),
+         count(*),
+         coalesce(sum((d.payload->>'qty')::numeric), 0)
+  into v_order_types, v_matched_count, v_total_qty
+  from public.wms_documents d
+  where d.branch_id = p_branch_id
+    and d.collection_name = 'orders'
+    and (
+      upper(trim(coalesce(d.payload->>'referenceNumber', ''))) = any(v_refs)
+      or upper(trim(coalesce(d.payload->>'orderNumber', ''))) = any(v_refs)
+      or upper(trim(d.document_id)) = any(v_refs)
+    );
+
+  if coalesce(array_length(v_order_types, 1), 0) > 1 then
+    raise exception 'Manifest B2B dan Manifest Online harus dibuat terpisah dan tidak boleh digabung dalam satu dokumen.';
+  end if;
+
+  v_order_type := v_order_types[1];
+  if v_order_type not in ('B2B', 'ONLINE') then
+    raise exception 'Jenis order manifest tidak valid.';
+  end if;
+
+  if v_branch_op <> 'HYBRID' and v_branch_op <> v_order_type then
+    raise exception 'Cabang bertipe % tidak mengizinkan manifest order %.', v_branch_op, v_order_type;
+  end if;
+
+  v_handed_over_at := coalesce(
+    nullif(p_manifest->>'handedOverAt', '')::timestamptz,
+    now()
+  );
+  v_now_iso := to_char(v_handed_over_at at time zone 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"');
+
+  insert into public.shipping_manifests (
+    manifest_id,
+    branch_id,
+    warehouse_id,
+    warehouse_name,
+    order_type,
+    courier_name,
+    sender_name,
+    driver_name,
+    driver_phone,
+    vehicle_plate,
+    handed_over_by,
+    handed_over_by_id,
+    handed_over_at,
+    total_orders,
+    total_qty_pcs,
+    order_references,
+    notes,
+    status
+  ) values (
+    v_manifest_id,
+    p_branch_id,
+    coalesce(nullif(trim(p_manifest->>'warehouseId'), ''), 'WH-CENTRAL'),
+    coalesce(trim(p_manifest->>'warehouseName'), ''),
+    v_order_type,
+    coalesce(nullif(trim(p_manifest->>'courierName'), ''), 'EKSPEDISI'),
+    coalesce(trim(p_manifest->>'senderName'), ''),
+    nullif(trim(coalesce(p_manifest->>'driverName', '')), ''),
+    nullif(trim(coalesce(p_manifest->>'driverPhone', '')), ''),
+    nullif(upper(trim(coalesce(p_manifest->>'vehiclePlate', ''))), ''),
+    v_actor,
+    auth.uid(),
+    v_handed_over_at,
+    coalesce((p_manifest->>'totalOrders')::integer, array_length(v_refs, 1), 0),
+    coalesce((p_manifest->>'totalQtyPcs')::numeric, v_total_qty, 0),
+    to_jsonb(v_refs),
+    nullif(trim(coalesce(p_manifest->>'notes', '')), ''),
+    'ACTIVE'
+  )
+  on conflict (manifest_id) do nothing;
+
+  perform set_config('wms.operation_id', p_request_id::text, true);
+  perform set_config('wms.operation_type', 'SHIPPING_MANIFEST', true);
+  perform set_config('wms.reason', 'Serah terima ekspedisi ' || v_manifest_id || ' (' || v_order_type || ')', true);
+
+  with updated as (
+    update public.wms_documents d
+    set payload = d.payload || jsonb_build_object(
+      'shipped', true,
+      'shippedAt', v_now_iso,
+      'shippedBy', v_actor,
+      'manifestId', v_manifest_id
+    )
+    where d.branch_id = p_branch_id
+      and d.collection_name = 'orders'
+      and (
+        upper(trim(coalesce(d.payload->>'referenceNumber', ''))) = any(v_refs)
+        or upper(trim(coalesce(d.payload->>'orderNumber', ''))) = any(v_refs)
+        or upper(trim(d.document_id)) = any(v_refs)
+      )
+    returning 1
+  )
+  select count(*) into v_updated_count from updated;
+
+  v_result := jsonb_build_object(
+    'success', true,
+    'action', 'create',
+    'manifestId', v_manifest_id,
+    'orderType', v_order_type,
+    'updatedCount', v_updated_count
+  );
+
+  insert into wms_private.write_requests (id, actor_id, branch_id, body, result)
+  values (p_request_id, auth.uid(), p_branch_id, v_body, v_result);
+
+  return v_result;
+end;
+$$;
+
+revoke all on function public.commit_shipping_manifest(uuid, text, text[], jsonb, text) from public, anon;
+grant execute on function public.commit_shipping_manifest(uuid, text, text[], jsonb, text) to authenticated;
+
+-- Admin-only order classification RPC (assigns B2B or ONLINE without touching stock or workflow state)
+create or replace function public.assign_order_types(
+  p_request_id uuid,
+  p_branch_id text,
+  p_assignments jsonb
+)
+returns jsonb
+language plpgsql
+security definer
+set search_path = ''
+as $$
+declare
+  v_role text;
+  v_actor text;
+  v_req wms_private.write_requests%rowtype;
+  v_item jsonb;
+  v_doc_id text;
+  v_ref text;
+  v_type text;
+  v_updated_count integer := 0;
+  v_now_iso text;
+  v_result jsonb;
+begin
+  v_role := public.wms_current_role();
+  if auth.uid() is null or v_role not in ('Administrator', 'Admin') or not wms_private.can_access_branch(p_branch_id) then
+    raise exception 'Hanya Admin atau Administrator cabang yang dapat mengklasifikasikan order.';
+  end if;
+
+  if p_request_id is null or jsonb_typeof(p_assignments) is distinct from 'array' or jsonb_array_length(p_assignments) not between 1 and 2000 then
+    raise exception 'Daftar klasifikasi order harus berisi 1â€“2000 entri.';
+  end if;
+
+  perform pg_advisory_xact_lock(hashtextextended('write:' || p_request_id::text, 0));
+  perform pg_advisory_xact_lock(hashtextextended('write-branch:' || p_branch_id, 0));
+
+  select * into v_req from wms_private.write_requests where id = p_request_id;
+  if found then
+    if v_req.actor_id <> auth.uid() or v_req.branch_id <> p_branch_id or v_req.body is distinct from p_assignments then
+      raise exception 'ID permintaan klasifikasi sudah digunakan.';
+    end if;
+    return v_req.result;
+  end if;
+
+  select coalesce(nullif(full_name, ''), email) into v_actor
+  from public.profiles where id = auth.uid();
+  v_actor := coalesce(v_actor, 'Admin WMS');
+  v_now_iso := to_char(now() at time zone 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"');
+
+  perform set_config('wms.operation_id', p_request_id::text, true);
+  perform set_config('wms.operation_type', 'ORDER_TYPE_ASSIGNMENT', true);
+  perform set_config('wms.reason', 'Klasifikasi jenis order (B2B/ONLINE) oleh Admin', true);
+
+  for v_item in select value from jsonb_array_elements(p_assignments) loop
+    v_doc_id := trim(coalesce(v_item->>'document_id', v_item->>'id', ''));
+    v_ref := upper(trim(coalesce(v_item->>'referenceNumber', v_item->>'reference_number', '')));
+    v_type := upper(trim(coalesce(v_item->>'order_type', v_item->>'orderType', '')));
+
+    if v_type not in ('B2B', 'ONLINE') then
+      raise exception 'Nilai klasifikasi order harus B2B atau ONLINE.';
+    end if;
+    if v_doc_id = '' and v_ref = '' then
+      raise exception 'Setiap baris klasifikasi wajib menyertakan document_id atau referenceNumber.';
+    end if;
+
+    with target_rows as (
+      select d.document_id, d.payload
+      from public.wms_documents d
+      where d.branch_id = p_branch_id
+        and d.collection_name = 'orders'
+        and coalesce(d.payload->>'status', 'Pending') <> 'Cancelled'
+        and (
+          (v_doc_id <> '' and d.document_id = v_doc_id)
+          or (v_ref <> '' and upper(trim(coalesce(d.payload->>'referenceNumber', d.payload->>'orderNumber', ''))) = v_ref)
+        )
+      order by d.document_id
+      for update
+    ),
+    updated as (
+      update public.wms_documents d
+      set payload = d.payload || jsonb_build_object(
+        'orderType', v_type,
+        'orderTypeAssignedAt', v_now_iso,
+        'orderTypeAssignedBy', v_actor
+      )
+      from target_rows t
+      where d.branch_id = p_branch_id
+        and d.collection_name = 'orders'
+        and d.document_id = t.document_id
+      returning 1
+    )
+    select v_updated_count + count(*) into v_updated_count from updated;
+  end loop;
+
+  v_result := jsonb_build_object('success', true, 'updatedCount', v_updated_count);
+
+  insert into wms_private.write_requests (id, actor_id, branch_id, body, result)
+  values (p_request_id, auth.uid(), p_branch_id, p_assignments, v_result);
+
+  return v_result;
+end;
+$$;
+
+revoke all on function public.assign_order_types(uuid, text, jsonb) from public, anon;
+grant execute on function public.assign_order_types(uuid, text, jsonb) to authenticated;
+
+-- Admin user management SQL RPC fallback (used when Edge Function is unavailable)
+create or replace function public.admin_manage_user(body jsonb)
+returns jsonb
+language plpgsql
+security definer
+set search_path = ''
+as $$
+declare
+  v_actor record;
+  v_action text;
+  v_target_id uuid;
+  v_target record;
+  v_branch_id text;
+  v_full_name text;
+  v_role text;
+  v_admin_count integer;
+begin
+  if auth.uid() is null then
+    return jsonb_build_object('error', 'Sesi masuk tidak valid.');
+  end if;
+
+  select role, is_active, branch_id, full_name, email
+  into v_actor
+  from public.profiles
+  where id = auth.uid();
+
+  if not found or not v_actor.is_active or v_actor.role not in ('Admin', 'Administrator') then
+    return jsonb_build_object('error', 'Hanya admin WMS yang dapat mengelola akun.');
+  end if;
+
+  v_action := lower(trim(coalesce(body->>'action', '')));
+  v_branch_id := coalesce(nullif(trim(coalesce(body->>'branchId', '')), ''), v_actor.branch_id, 'CENTER');
+  v_full_name := trim(coalesce(body->>'fullName', ''));
+  v_role := trim(coalesce(body->>'role', ''));
+
+  if v_actor.role <> 'Administrator' and v_branch_id <> v_actor.branch_id then
+    return jsonb_build_object('error', 'Akses cabang ditolak.');
+  end if;
+  if v_actor.role <> 'Administrator' and v_role = 'Administrator' then
+    return jsonb_build_object('error', 'Hanya kantor pusat dapat memberikan akses Administrator.');
+  end if;
+
+  if v_action = 'update' then
+    if coalesce(trim(body->>'userId'), '') = '' or length(v_full_name) not between 1 and 120
+       or v_role not in ('Administrator', 'Admin', 'Picker', 'Packer', 'Shipping', 'Viewer') then
+      return jsonb_build_object('error', 'Profil atau peran tidak valid.');
+    end if;
+
+    v_target_id := (body->>'userId')::uuid;
+    select id, role, is_active, branch_id into v_target
+    from public.profiles where id = v_target_id for update;
+
+    if not found then
+      return jsonb_build_object('error', 'Akun tidak ditemukan.');
+    end if;
+    if v_actor.role <> 'Administrator' and (v_target.branch_id <> v_actor.branch_id or v_target.role = 'Administrator') then
+      return jsonb_build_object('error', 'Akses akun ditolak.');
+    end if;
+
+    if v_target.is_active and v_target.role = 'Administrator' and v_role <> 'Administrator' then
+      select count(*) into v_admin_count from public.profiles where role = 'Administrator' and is_active;
+      if v_admin_count <= 1 then
+        return jsonb_build_object('error', 'Admin terakhir tidak dapat diturunkan perannya.');
+      end if;
+    end if;
+
+    update public.profiles
+    set full_name = v_full_name,
+        role = v_role,
+        branch_id = v_branch_id
+    where id = v_target_id;
+
+    insert into public.activity_events (
+      branch_id, entity_type, entity_id, action, actor_id, actor_name, after_data, reason
+    ) values (
+      v_branch_id, 'accounts', v_target_id::text, 'ACCOUNT_UPDATE',
+      auth.uid(), coalesce(nullif(v_actor.full_name, ''), v_actor.email),
+      jsonb_build_object('fullName', v_full_name, 'role', v_role, 'branch_id', v_branch_id),
+      'Pengelolaan akun oleh admin'
+    );
+
+    return jsonb_build_object('success', true);
+  elsif v_action = 'delete' then
+    if coalesce(trim(body->>'userId'), '') = '' then
+      return jsonb_build_object('error', 'ID akun tidak valid.');
+    end if;
+
+    v_target_id := (body->>'userId')::uuid;
+    if v_target_id = auth.uid() then
+      return jsonb_build_object('error', 'Akun aktif tidak dapat menonaktifkan dirinya sendiri.');
+    end if;
+
+    select id, role, is_active, branch_id into v_target
+    from public.profiles where id = v_target_id for update;
+    if not found then
+      return jsonb_build_object('error', 'Akun tidak ditemukan.');
+    end if;
+    if v_actor.role <> 'Administrator' and (v_target.branch_id <> v_actor.branch_id or v_target.role = 'Administrator') then
+      return jsonb_build_object('error', 'Akses akun ditolak.');
+    end if;
+
+    if v_target.is_active and v_target.role = 'Administrator' then
+      select count(*) into v_admin_count from public.profiles where role = 'Administrator' and is_active;
+      if v_admin_count <= 1 then
+        return jsonb_build_object('error', 'Admin terakhir tidak dapat dihapus atau dinonaktifkan.');
+      end if;
+    end if;
+
+    update public.profiles set is_active = false where id = v_target_id;
+
+    insert into public.activity_events (
+      branch_id, entity_type, entity_id, action, actor_id, actor_name, after_data, reason
+    ) values (
+      v_branch_id, 'accounts', v_target_id::text, 'ACCOUNT_DEACTIVATE',
+      auth.uid(), coalesce(nullif(v_actor.full_name, ''), v_actor.email),
+      jsonb_build_object('userId', v_target_id::text),
+      'Penonaktifan akun oleh admin'
+    );
+
+    return jsonb_build_object('success', true);
+  end if;
+
+  return jsonb_build_object('error', 'Edge Function admin-users diperlukan untuk membuat akun login baru.');
+end;
+$$;
+
+revoke all on function public.admin_manage_user(jsonb) from public, anon;
+grant execute on function public.admin_manage_user(jsonb) to authenticated;
+
+-- Hardened Marketplace Webhook RPC (whitelist + explicit orderType, else UNASSIGNED; never guesses from PO/customer)
+create or replace function public.marketplace_order_webhook(
+  payload jsonb,
+  p_secret text default 'TRUEBLUE_WEBHOOK_2026'
+)
+returns jsonb
+language plpgsql
+security definer
+set search_path = ''
+as $$
+declare
+  v_branch_id text;
+  v_warehouse_id text;
+  v_branch_op text;
+  v_order_number text;
+  v_customer_name text;
+  v_no_po text;
+  v_source text;
+  v_explicit_type text;
+  v_order_type text;
+  v_configured_secret text;
+  v_items jsonb;
+  v_item jsonb;
+  v_sku text;
+  v_need_num numeric;
+  v_stock record;
+  v_reserved numeric;
+  v_free integer;
+  v_need integer;
+  v_take integer;
+  v_import_items jsonb := '[]'::jsonb;
+  v_req_id uuid := gen_random_uuid();
+  v_idx integer := 0;
+  v_now_iso text;
+  v_actor text;
+begin
+  if auth.uid() is null or not public.wms_is_admin() then
+    raise exception 'Webhook simulator hanya dapat dijalankan oleh Admin atau Administrator yang login.';
+  end if;
+
+  if jsonb_typeof(payload) is distinct from 'object' then
+    raise exception 'Payload webhook harus berupa JSON object.';
+  end if;
+
+  v_branch_id := upper(trim(coalesce(nullif(payload->>'branchId', ''), nullif(payload->>'branch_id', ''), 'CENTER')));
+  if not wms_private.can_access_branch(v_branch_id) then
+    raise exception 'Akses cabang % ditolak untuk webhook.', v_branch_id;
+  end if;
+
+  select d.payload->>'secretKey' into v_configured_secret
+  from public.wms_documents d
+  where d.branch_id = v_branch_id
+    and d.collection_name = 'settings'
+    and d.document_id = 'marketplace_webhook_config'
+  limit 1;
+
+  v_configured_secret := coalesce(nullif(trim(coalesce(v_configured_secret, '')), ''), 'TRUEBLUE_WEBHOOK_2026');
+  if trim(coalesce(p_secret, '')) is distinct from v_configured_secret then
+    raise exception 'Secret key webhook tidak cocok.';
+  end if;
+
+  select coalesce(operation_type, 'HYBRID') into v_branch_op
+  from public.branches where id = v_branch_id;
+  if not found then
+    raise exception 'Cabang % tidak ditemukan.', v_branch_id;
+  end if;
+
+  v_warehouse_id := upper(trim(coalesce(nullif(payload->>'warehouseId', ''), nullif(payload->>'warehouse_id', ''), 'WH-CENTRAL')));
+  v_order_number := left(trim(coalesce(payload->>'orderNumber', payload->>'order_sn', '')), 128);
+  v_customer_name := left(trim(coalesce(nullif(payload->>'customerName', ''), nullif(payload->>'buyer', ''), 'Marketplace Buyer')), 200);
+  v_no_po := left(trim(coalesce(payload->>'noPo', '')), 128);
+
+  if length(v_order_number) not between 1 and 128 then
+    raise exception 'orderNumber wajib diisi (1â€“128 karakter).';
+  end if;
+
+  v_source := upper(regexp_replace(trim(coalesce(
+    payload->>'orderSource',
+    payload->>'order_source',
+    payload->>'marketplace',
+    payload->>'platform',
+    payload->>'source',
+    ''
+  )), '\s+', '_', 'g'));
+
+  v_explicit_type := upper(trim(coalesce(payload->>'orderType', payload->>'order_type', '')));
+  if v_explicit_type in ('B2B', 'ONLINE') then
+    v_order_type := v_explicit_type;
+  elsif v_source in ('SHOPEE', 'TIKTOK', 'TIKTOK_SHOP', 'TOKOPEDIA', 'LAZADA', 'BLIBLI', 'MABANG', 'JUBELIO') then
+    v_order_type := 'ONLINE';
+  else
+    v_order_type := 'UNASSIGNED';
+  end if;
+
+  if v_order_type in ('B2B', 'ONLINE') and v_branch_op <> 'HYBRID' and v_branch_op <> v_order_type then
+    raise exception 'Order bertipe % tidak diizinkan masuk ke cabang bertipe %.', v_order_type, v_branch_op;
+  end if;
+
+  v_items := coalesce(payload->'items', '[]'::jsonb);
+  if jsonb_typeof(v_items) is distinct from 'array' or jsonb_array_length(v_items) = 0 then
+    raise exception 'Payload webhook wajib menyertakan minimal 1 item SKU.';
+  end if;
+
+  v_now_iso := to_char(now() at time zone 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"');
+  select coalesce(nullif(full_name, ''), email) into v_actor from public.profiles where id = auth.uid();
+
+  perform pg_advisory_xact_lock(hashtextextended('write-branch:' || v_branch_id, 0));
+
+  for v_item in select value from jsonb_array_elements(v_items) loop
+    v_sku := upper(trim(coalesce(v_item->>'skuId', v_item->>'sku', '')));
+    v_need_num := coalesce((v_item->>'qty')::numeric, 0);
+    if v_sku = '' or v_need_num <= 0 or floor(v_need_num) <> v_need_num then
+      raise exception 'Item webhook wajib memiliki skuId dan qty bilangan bulat > 0.';
+    end if;
+    v_need := v_need_num::integer;
+
+    for v_stock in
+      select
+        d.payload->>'skuId' as sku_id,
+        coalesce(nullif(d.payload->>'skuName', ''), d.payload->>'skuId') as sku_name,
+        d.payload->>'location' as location,
+        coalesce(nullif(d.payload->>'expiredDate', ''), 'No Expired') as expired_date,
+        (d.payload->>'qty')::numeric as qty
+      from public.wms_documents d
+      where d.branch_id = v_branch_id
+        and d.collection_name = 'stock'
+        and left(d.document_id, 7) <> 'SYSTEM_'
+        and upper(trim(d.payload->>'skuId')) = v_sku
+        and coalesce(d.payload->>'warehouseId', 'WH-CENTRAL') = v_warehouse_id
+        and (d.payload->>'qty')::numeric > 0
+        and wms_private.stock_pickable(d.payload)
+      order by
+        case when coalesce(d.payload->>'expiredDate', 'No Expired') in ('No Expired', '--', '-') then 1 else 0 end,
+        d.payload->>'expiredDate',
+        d.document_id
+    loop
+      exit when v_need <= 0;
+
+      select coalesce(sum((o.payload->>'qty')::numeric), 0) into v_reserved
+      from public.wms_documents o
+      where o.branch_id = v_branch_id
+        and o.collection_name = 'orders'
+        and coalesce(o.payload->>'status', 'Pending') = 'Pending'
+        and coalesce((o.payload->>'stockDeducted')::boolean, false) = false
+        and coalesce(o.payload->>'warehouseId', 'WH-CENTRAL') = v_warehouse_id
+        and upper(trim(o.payload->>'skuId')) = upper(trim(v_stock.sku_id))
+        and upper(trim(o.payload->>'location')) = upper(trim(v_stock.location))
+        and coalesce(nullif(o.payload->>'expiredDate', ''), 'No Expired') = v_stock.expired_date;
+
+      v_free := greatest(0, floor(v_stock.qty - v_reserved))::integer;
+      if v_free <= 0 then
+        continue;
+      end if;
+
+      v_take := least(v_need, v_free);
+      v_import_items := v_import_items || jsonb_build_array(jsonb_build_object(
+        'id', 'IMP_' || replace(v_req_id::text, '-', '') || '_' || v_idx::text,
+        'orderNumber', v_order_number,
+        'referenceNumber', v_order_number,
+        'customerName', v_customer_name,
+        'noPo', v_no_po,
+        'batchNumber', coalesce(nullif(trim(payload->>'batchNumber'), ''), 'WEBHOOK-' || to_char(now(), 'YYYYMMDD')),
+        'skuId', v_stock.sku_id,
+        'skuName', v_stock.sku_name,
+        'location', v_stock.location,
+        'expiredDate', v_stock.expired_date,
+        'qty', v_take,
+        'warehouseId', v_warehouse_id,
+        'status', 'Pending',
+        'stockDeducted', false,
+        'picked', false,
+        'scanned', false,
+        'timestamp', v_now_iso,
+        'orderType', v_order_type,
+        'orderSource', coalesce(nullif(v_source, ''), 'WEBHOOK_UNKNOWN')
+      ));
+      v_idx := v_idx + 1;
+      v_need := v_need - v_take;
+    end loop;
+
+    if v_need > 0 then
+      raise exception 'Stok pickable SKU % di cabang % (%) tidak mencukupi (kurang % pcs).', v_sku, v_branch_id, v_warehouse_id, v_need;
+    end if;
+  end loop;
+
+  perform wms_private.import_wms_orders(v_req_id, v_branch_id, v_warehouse_id, v_import_items);
+
+  return jsonb_build_object(
+    'success', true,
+    'requestId', v_req_id,
+    'orderNumber', v_order_number,
+    'orderType', v_order_type,
+    'orderSource', coalesce(nullif(v_source, ''), 'WEBHOOK_UNKNOWN'),
+    'allocatedRows', v_idx,
+    'actor', coalesce(v_actor, 'Admin WMS')
+  );
+end;
+$$;
+
+revoke all on function public.marketplace_order_webhook(jsonb, text) from public, anon;
+grant execute on function public.marketplace_order_webhook(jsonb, text) to authenticated;
+

@@ -151,11 +151,33 @@ begin
    or jsonb_typeof(v->'qty') is distinct from 'number'
    or (v->>'qty')::numeric<=0 or (v->>'qty')::numeric<>trunc((v->>'qty')::numeric)
  ) then raise exception 'Order belum siap untuk scan'; end if;
- if p_phase='packing' and not exists (
-  select 1 from wms_private.scan_sessions s where s.branch_id=p_branch
-   and s.reference_number=p_reference and s.phase='sorting' and s.state='finished'
-   and s.basket=trim(p_basket) and s.snapshot=v_snapshot
- ) then raise exception 'Sortir server belum lengkap atau order berubah'; end if;
+ if p_phase='packing' and not (
+  exists (
+   select 1 from wms_private.scan_sessions s where s.branch_id=p_branch
+    and s.reference_number=p_reference and s.phase='sorting' and s.state='finished'
+    and s.basket=trim(p_basket) and s.snapshot=v_snapshot
+  )
+  or (
+   exists (
+    select 1 from public.wms_documents d where d.branch_id=p_branch
+     and d.collection_name='orders'
+     and d.payload->>'referenceNumber'=p_reference
+     and upper(trim(coalesce(d.payload->>'basketNumber','')))=upper(trim(p_basket))
+     and nullif(trim(d.payload->>'sortedAt'),'') is not null
+     and nullif(trim(d.payload->>'sortedBy'),'') is not null
+   )
+   and not exists (
+    select 1 from public.wms_documents d where d.branch_id=p_branch
+     and d.collection_name='orders'
+     and d.payload->>'referenceNumber'=p_reference
+     and (
+      upper(trim(coalesce(d.payload->>'basketNumber','')))<>upper(trim(p_basket))
+      or nullif(trim(d.payload->>'sortedAt'),'') is null
+      or nullif(trim(d.payload->>'sortedBy'),'') is null
+     )
+   )
+  )
+ ) then raise exception 'Sortir belum lengkap atau order berubah'; end if;
  insert into wms_private.scan_sessions(id,branch_id,reference_number,phase,basket,actor_id,snapshot)
  values(p_session,p_branch,p_reference,p_phase,trim(p_basket),auth.uid(),v_snapshot);
  return jsonb_build_object('session',p_session,'state','open');

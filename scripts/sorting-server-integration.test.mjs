@@ -173,8 +173,8 @@ test('sorting component handlers call the server controller and never legacy com
   assert.match(declarations.get('handleSortScanProduct'), /applySortingProgress/);
   assert.match(declarations.get('handleEndSorting'), /controller\.finish\(/);
   assert.doesNotMatch(declarations.get('handleEndSorting'), /onCompleteSorting|onEditOrderHistoryBatch/);
-  assert.match(source, /onClick=\{DEV_BASELINE_SORTING \? handleBaselineEndSorting : handleEndSorting\}/);
-  assert.match(source, /disabled=\{DEV_BASELINE_SORTING[\s\S]*?: !SERVER_SCAN_ENABLED \|\| !sortServerReady \|\| savingSort \|\| sortSlots\.length === 0/);
+  assert.match(source, /onClick=\{(?:DEV_BASELINE_SORTING|useBaselineSort) \? handleBaselineEndSorting : handleEndSorting\}/);
+  assert.match(source, /disabled=\{(?:DEV_BASELINE_SORTING|useBaselineSort)[\s\S]*?: !SERVER_SCAN_ENABLED \|\| !sortServerReady \|\| savingSort \|\| sortSlots\.length === 0/);
 });
 
 test('real sorting scan handler awaits RPC progress and blocks double submit and disabled flag', async () => {
