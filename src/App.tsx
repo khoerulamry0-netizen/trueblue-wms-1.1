@@ -90,6 +90,7 @@ const CekFisik = React.lazy(() => import('./components/CekFisik'));
 const LocationTransferManager = React.lazy(() => import('./components/LocationTransferManager'));
 const UserManagement = React.lazy(() => import('./components/UserManagement'));
 const ProductCatalog = React.lazy(() => import('./components/ProductCatalog'));
+const MarketplaceIntegration = React.lazy(() => import('./components/MarketplaceIntegration'));
 const GoogleWorkspaceSync = React.lazy(() => import('./components/GoogleWorkspaceSync'));
 const ReturnManager = React.lazy(() => import('./components/ReturnManager'));
 const InboundManager = React.lazy(() => import('./components/InboundManager'));
@@ -1546,6 +1547,11 @@ export default function App() {
       if (!['dashboard', 'inventory', 'bulk-transfer'].includes(activeTab)) {
         setActiveTab('dashboard');
       }
+      return;
+    }
+
+    if (!['Admin', 'Administrator'].includes(role || '') && activeTab === 'marketplace') {
+      setActiveTab('dashboard');
       return;
     }
 
@@ -3936,6 +3942,18 @@ export default function App() {
                 onFetchAccessibleBranches={fetchAccessibleBranches}
                 onFetchBranchCatalog={fetchBranchCatalog}
               />
+            </motion.div>
+          )}
+
+          {activeTab === 'marketplace' && (currentUser?.role === 'Administrator' || currentUser?.role === 'Admin') && (
+            <motion.div
+              key="marketplace"
+              initial={{ opacity: 0, y: 15 }}
+              animate={{ opacity: 1, y: 0 }}
+              exit={{ opacity: 0, y: -15 }}
+              transition={{ duration: 0.15 }}
+            >
+              <MarketplaceIntegration currentUser={currentUser} catalog={catalog} />
             </motion.div>
           )}
 

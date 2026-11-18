@@ -1,6 +1,6 @@
 import AccountSecurity from './AccountSecurity';
 import React, {useState,useEffect,useRef,useMemo} from 'react';
-import {LayoutDashboard,Package,Truck,ClipboardList,Boxes,ClipboardCheck,ArrowLeftRight,Calendar,LineChart,Database,Users,FileText,Menu,X,KeyRound,LogOut,ChevronRight,Moon,Sun,Scale,ShoppingCart,LayoutGrid,Palette,Check,RotateCcw} from 'lucide-react';
+import {LayoutDashboard,Package,Truck,ClipboardList,Boxes,ClipboardCheck,ArrowLeftRight,Calendar,LineChart,Database,Users,FileText,Menu,X,KeyRound,LogOut,ChevronRight,Moon,Sun,Scale,ShoppingCart,LayoutGrid,Palette,Check,RotateCcw,Store} from 'lucide-react';
 import BranchPanel from './BranchPanel';
 import WriteStatus from './WriteStatus';
 import type {UiTheme} from '../utils/uiTheme';
@@ -77,6 +77,7 @@ export default function AppShell({theme,onToggleTheme,children,activeTab,onNavig
      group: t('nav.masterData'),
      items: [
        { id: 'catalog', label: t('nav.catalog'), icon: Database, roles: management },
+       { id: 'marketplace', label: 'Integrasi Marketplace', icon: Store, roles: management },
        { id: 'users', label: t('nav.operators'), icon: Users, roles: management }
      ]
    }

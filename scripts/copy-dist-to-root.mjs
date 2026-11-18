@@ -1,6 +1,14 @@
 import fs from 'node:fs';
 import path from 'node:path';
 
+// The application is served from this project's dist directory. Mirroring to
+// parent directories is only a legacy convenience and can fail (or crash the
+// Node process) when those directories are managed by another process.
+if (process.env.MIRROR_DIST_TO_PARENT !== 'true') {
+  console.log('Skipping optional parent dist mirror. Set MIRROR_DIST_TO_PARENT=true to enable it.');
+  process.exit(0);
+}
+
 try {
   const currentDist = path.resolve('dist');
   const parentDist = path.resolve('..', 'dist');
