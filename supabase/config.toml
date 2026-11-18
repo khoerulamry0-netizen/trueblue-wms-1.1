@@ -13,6 +13,11 @@ import_map = "./functions/return-drive-admin/deno.json"
 # Uncomment to specify a custom file path to the entrypoint.
 # Supported file extensions are: .ts, .js, .mjs, .jsx, .tsx
 entrypoint = "./functions/return-drive-admin/index.ts"
+
+[functions.shopee-live]
+enabled = true
+verify_jwt = false
+entrypoint = "./functions/shopee-live/index.ts"
 # Specifies static files to be bundled with the function. Supports glob patterns.
 # For example, if you want to serve static HTML pages in your function:
 # static_files = [ "./functions/return-drive-admin/*.html" ]
