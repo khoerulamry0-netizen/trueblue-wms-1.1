@@ -3953,7 +3953,9 @@ export default function App() {
               exit={{ opacity: 0, y: -15 }}
               transition={{ duration: 0.15 }}
             >
-              <MarketplaceIntegration currentUser={currentUser} catalog={catalog} />
+              <React.Suspense fallback={<div className="rounded-2xl border border-slate-800/80 bg-[#11141B] p-6 text-sm text-slate-400">Memuat integrasi marketplace…</div>}>
+                <MarketplaceIntegration currentUser={currentUser} catalog={catalog} />
+              </React.Suspense>
             </motion.div>
           )}
 
