@@ -8,7 +8,8 @@ import type {OrderIssueReportInput, OrderSessionData, OrderSessionResult} from '
 import { useLanguage } from '../i18n/LanguageContext';
 import React, { useState, useMemo, useRef } from 'react';
 import { createPortal } from 'react-dom';
-import { StockItem, OutboundItem, Warehouse, ChannelOperationType } from '../types';
+import { CatalogItem, StockItem, OutboundItem, Warehouse, ChannelOperationType } from '../types';
+import { buildBundleMap, expandManualEntriesForBundles } from '../utils/bundleExplode';
 import UnassignedOrdersBanner from './UnassignedOrdersBanner';
 import ShippingReceiptModal, { type ShippingOrderData } from './ShippingReceiptModal';
 import { resolveOrderType } from '../utils/orderType';
@@ -79,6 +80,7 @@ interface BulkOutboundProps {
   allowedModes?: ('create' | 'pick' | 'validate' | 'history')[];
   channelMode?: ChannelOperationType;
   stock: StockItem[];
+  catalog?: CatalogItem[];
   warehouses?: Warehouse[];
   onProcessOutbound: (items: Omit<OutboundItem, 'id' | 'timestamp'>[]) => Promise<boolean>;
   currentUser?: { username: string; role: string; fullName: string } | null;
@@ -103,6 +105,9 @@ interface ParsedRow {
   originalText: string;
   isValid: boolean;
   error?: string;
+  bundleSku?: string;
+  bundleName?: string;
+  bundleQty?: number;
   allocatedLines: {
     location: string;
     expiredDate: string;
@@ -112,6 +117,7 @@ interface ParsedRow {
 
 export default function BulkOutbound({ 
   stock = [], 
+  catalog = [],
   warehouses = [],
   onProcessOutbound,
   currentUser,
@@ -1042,93 +1048,111 @@ export default function BulkOutbound({
         return;
       }
 
-      // Check matches from allocatable stock pool
-      const matches = stockClone.filter(item => 
-        item.skuId.toLowerCase() === skuId.toLowerCase() && item.qty > 0
+      const bundleLookup = buildBundleMap(catalog);
+      const expandedEntries = expandManualEntriesForBundles(
+        [{ skuId, qty, originalText: trimmed }],
+        bundleLookup
       );
 
-      const physicalMatches = stock.filter(item => 
-        (item.warehouseId || 'WH-CENTRAL').toUpperCase() === activeWh &&
-        item.skuId.toLowerCase() === skuId.toLowerCase() && item.qty > 0
-      );
-      const totalPhysical = physicalMatches.reduce((sum, item) => sum + item.qty, 0);
-      const lockedForSku = lockedStockSummary.byWarehouseSku.get(`${activeWh}__${skuId.toUpperCase()}`) || 0;
+      expandedEntries.forEach(entry => {
+        const targetSkuId = entry.skuId;
+        const targetQty = entry.qty;
+        const bundleMeta = entry.bundleSku
+          ? { bundleSku: entry.bundleSku, bundleName: entry.bundleName, bundleQty: entry.bundleQty }
+          : {};
 
-      if (matches.length === 0) {
-        let errorMsg = `SKU "${skuId}" tidak memiliki stok aktif di gudang terpilih (${activeWh}) atau tidak terdaftar.`;
-        if (totalPhysical > 0 && lockedForSku > 0) {
-          errorMsg = `SKU "${skuId}" memiliki stok fisik (${totalPhysical} pcs) namun seluruhnya sedang TERKUNCI oleh order pending (${lockedForSku} pcs).`;
+        // Check matches from allocatable stock pool
+        const matches = stockClone.filter(item => 
+          item.skuId.toLowerCase() === targetSkuId.toLowerCase() && item.qty > 0
+        );
+
+        const physicalMatches = stock.filter(item => 
+          (item.warehouseId || 'WH-CENTRAL').toUpperCase() === activeWh &&
+          item.skuId.toLowerCase() === targetSkuId.toLowerCase() && item.qty > 0
+        );
+        const totalPhysical = physicalMatches.reduce((sum, item) => sum + item.qty, 0);
+        const lockedForSku = lockedStockSummary.byWarehouseSku.get(`${activeWh}__${targetSkuId.toUpperCase()}`) || 0;
+
+        if (matches.length === 0) {
+          let errorMsg = `SKU "${targetSkuId}" tidak memiliki stok aktif di gudang terpilih (${activeWh}) atau tidak terdaftar.`;
+          if (totalPhysical > 0 && lockedForSku > 0) {
+            errorMsg = `SKU "${targetSkuId}" memiliki stok fisik (${totalPhysical} pcs) namun seluruhnya sedang TERKUNCI oleh order pending (${lockedForSku} pcs).`;
+          }
+
+          newParsedRows.push({
+            skuId: targetSkuId,
+            qty: targetQty,
+            originalText: trimmed,
+            isValid: false,
+            error: errorMsg,
+            ...bundleMeta,
+            allocatedLines: []
+          });
+          return;
+        }
+
+        const safeAllocatableLocations = matches
+          .sort((a, b) => {
+            const dateDiff = parseDateForSort(a.expiredDate).getTime() - parseDateForSort(b.expiredDate).getTime();
+            if (dateDiff !== 0) return dateDiff;
+            return getLocationRank(a.location) - getLocationRank(b.location);
+          });
+
+        if (safeAllocatableLocations.length === 0) {
+          newParsedRows.push({
+            skuId: targetSkuId,
+            qty: targetQty,
+            originalText: trimmed,
+            isValid: false,
+            error: `SKU "${targetSkuId}" tidak memiliki stok aktif di lokasi manapun.`,
+            ...bundleMeta,
+            allocatedLines: []
+          });
+          return;
+        }
+
+        const totalAvailable = safeAllocatableLocations.reduce((sum, item) => sum + item.qty, 0);
+        if (targetQty > totalAvailable) {
+          let errorMsg = `Stok bersih tidak mencukupi! Diminta: ${targetQty} pcs, Tersedia: ${totalAvailable} pcs.`;
+          if (lockedForSku > 0) {
+            errorMsg = `Stok bebas tidak mencukupi! Diminta: ${targetQty} pcs, Tersedia bebas: ${totalAvailable} pcs (Total Fisik: ${totalPhysical} pcs, Terkunci Order Lain: ${lockedForSku} pcs).`;
+          }
+
+          newParsedRows.push({
+            skuId: targetSkuId,
+            qty: targetQty,
+            originalText: trimmed,
+            isValid: false,
+            error: errorMsg,
+            ...bundleMeta,
+            allocatedLines: []
+          });
+          return;
+        }
+
+        let remainingToAllocate = targetQty;
+        const allocated: { location: string; expiredDate: string; qtyAllocated: number }[] = [];
+
+        for (const locItem of safeAllocatableLocations) {
+          if (remainingToAllocate <= 0) break;
+          const take = Math.min(remainingToAllocate, locItem.qty);
+          allocated.push({
+            location: locItem.location,
+            expiredDate: locItem.expiredDate,
+            qtyAllocated: take
+          });
+          locItem.qty -= take;
+          remainingToAllocate -= take;
         }
 
         newParsedRows.push({
-          skuId,
-          qty,
+          skuId: targetSkuId,
+          qty: targetQty,
           originalText: trimmed,
-          isValid: false,
-          error: errorMsg,
-          allocatedLines: []
+          isValid: true,
+          ...bundleMeta,
+          allocatedLines: allocated
         });
-        return;
-      }
-
-      const safeAllocatableLocations = matches
-        .sort((a, b) => {
-          const dateDiff = parseDateForSort(a.expiredDate).getTime() - parseDateForSort(b.expiredDate).getTime();
-          if (dateDiff !== 0) return dateDiff;
-          return getLocationRank(a.location) - getLocationRank(b.location);
-        });
-
-      if (safeAllocatableLocations.length === 0) {
-        newParsedRows.push({
-          skuId,
-          qty,
-          originalText: trimmed,
-          isValid: false,
-          error: `SKU "${skuId}" tidak memiliki stok aktif di lokasi manapun.`,
-          allocatedLines: []
-        });
-        return;
-      }
-
-      const totalAvailable = safeAllocatableLocations.reduce((sum, item) => sum + item.qty, 0);
-      if (qty > totalAvailable) {
-        let errorMsg = `Stok bersih tidak mencukupi! Diminta: ${qty} pcs, Tersedia: ${totalAvailable} pcs.`;
-        if (lockedForSku > 0) {
-          errorMsg = `Stok bebas tidak mencukupi! Diminta: ${qty} pcs, Tersedia bebas: ${totalAvailable} pcs (Total Fisik: ${totalPhysical} pcs, Terkunci Order Lain: ${lockedForSku} pcs).`;
-        }
-
-        newParsedRows.push({
-          skuId,
-          qty,
-          originalText: trimmed,
-          isValid: false,
-          error: errorMsg,
-          allocatedLines: []
-        });
-        return;
-      }
-
-      let remainingToAllocate = qty;
-      const allocated: { location: string; expiredDate: string; qtyAllocated: number }[] = [];
-
-      for (const locItem of safeAllocatableLocations) {
-        if (remainingToAllocate <= 0) break;
-        const take = Math.min(remainingToAllocate, locItem.qty);
-        allocated.push({
-          location: locItem.location,
-          expiredDate: locItem.expiredDate,
-          qtyAllocated: take
-        });
-        locItem.qty -= take;
-        remainingToAllocate -= take;
-      }
-
-      newParsedRows.push({
-        skuId,
-        qty,
-        originalText: trimmed,
-        isValid: true,
-        allocatedLines: allocated
       });
     });
 
@@ -1371,6 +1395,7 @@ export default function BulkOutbound({
             orderType: channelMode,
             orderSource: channelMode === 'ONLINE' ? 'MANUAL_ONLINE' : 'MANUAL_B2B',
           } : {}),
+          ...(row.bundleSku ? { bundleSku: row.bundleSku, bundleQty: row.bundleQty } : {}),
         };
         if (orderNumber.trim()) outItem.orderNumber = orderNumber.trim();
         if (noPo.trim()) outItem.noPo = noPo.trim();
@@ -1606,6 +1631,7 @@ export default function BulkOutbound({
       {['Administrator', 'Admin'].includes(currentUser?.role || '') && (
         <OrderFileImport
           stock={stock}
+          catalog={catalog}
           orderHistory={orderHistory}
           warehouseId={selectedWarehouseId || 'WH-CENTRAL'}
           defaultOrderType={channelMode}
@@ -1894,6 +1920,15 @@ export default function BulkOutbound({
                           <span className={`font-mono font-bold px-2 py-0.5 rounded text-xs ${row.isValid ? 'bg-emerald-500/10 text-emerald-400 border border-emerald-500/20' : 'bg-rose-500/10 text-rose-400 border border-rose-500/20'}`}>
                             {row.skuId}
                           </span>
+                          {row.bundleSku && (
+                            <span
+                              className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded bg-violet-500/15 border border-violet-500/30 text-[10px] font-bold text-violet-300"
+                              title={row.bundleName ? `Dari paket bundling ${row.bundleName}` : undefined}
+                            >
+                              <Layers className="w-3 h-3 text-violet-400" />
+                              Bundling: {row.bundleSku}{row.bundleQty ? ` ×${row.bundleQty}` : ''}
+                            </span>
+                          )}
                           <span className="text-slate-400 font-mono">Diminta: <strong className="text-white">{row.qty}</strong> pcs</span>
                           {row.isValid && hasUnder24 && (
                             <span className="flex items-center gap-1 text-[10px] bg-amber-500/10 text-amber-400 border border-amber-500/20 font-extrabold px-1.5 py-0.5 rounded-md animate-pulse">

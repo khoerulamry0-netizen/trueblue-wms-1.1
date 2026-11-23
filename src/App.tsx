@@ -1133,12 +1133,17 @@ export default function App() {
         brand: resolvedBrand,
         barcode: resolvedBarcode,
         qtyCtnSize: newItem.qtyCtnSize,
-        qtyInnerSize: newItem.qtyInnerSize
+        qtyInnerSize: newItem.qtyInnerSize,
+        ...(newItem.isBundle && Array.isArray(newItem.bundleComponents) && newItem.bundleComponents.length > 0
+          ? { isBundle: true, bundleComponents: newItem.bundleComponents }
+          : {})
       };
       await setDoc(doc(db, 'catalog', docId), itemToSave);
       const nextCatalog = [...catalogRef.current.filter(c => normalizeSkuKey(c.skuId) !== docId), itemToSave];
       applyCatalogLocalState(nextCatalog);
-      await syncCatalogItemsToStock([itemToSave], nextCatalog);
+      if (!itemToSave.isBundle) {
+        await syncCatalogItemsToStock([itemToSave], nextCatalog);
+      }
       return true;
     } catch (error) {
       console.error('Error adding catalog item: ', error);
@@ -1166,7 +1171,7 @@ export default function App() {
         skuId: docId
       };
 
-      const latestStock = await loadLatestStockForCatalogSync();
+      const latestStock = merged.isBundle ? [] : await loadLatestStockForCatalogSync();
       const batch = writeBatch(db);
       batch.set(doc(db, 'catalog', docId), merged);
 
@@ -3764,6 +3769,7 @@ export default function App() {
                   allowedModes={allowedModes}
                   initialMode={initialMode}
                   stock={stock}
+                  catalog={catalog}
                   warehouses={warehouses}
                   onProcessOutbound={handleProcessOutbound}
                   currentUser={currentUser}
