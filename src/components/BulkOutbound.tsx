@@ -464,7 +464,7 @@ TOTAL QTY     : ${lastPackedOrder.totalQty} pcs
     });
 
     return Object.values(groups).sort((a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime());
-  }, [orderHistory]);
+  }, [orderHistory, channelMode]);
 
   // Riwayat order reguler (mengecualikan transaksi Outbound Cepat agar tidak tercampur & mengikuti kanal aktif)
   const regularOrderHistory = useMemo(() => {
@@ -886,9 +886,15 @@ TOTAL QTY     : ${lastPackedOrder.totalQty} pcs
     if (!SERVER_SCAN_ENABLED) {
       const ref = packingTask?.reference;
       const activeOrder = ref ? pendingOrders.find(ord => ord.referenceNumber === ref) : undefined;
-      if (!activeOrder || !activeOrder.items?.length || !activeOrder.items.every((item: OutboundItem) => (packingScannedQty[item.id] || 0) >= item.qty)) {
+      if (!activeOrder || !activeOrder.items?.length) {
         setPackingScanSuccess(null);
-        setPackingScanError(scanServerUnavailable);
+        setPackingScanError('Order pending tidak ditemukan atau sudah selesai diproses.');
+        triggerErrorSound();
+        return;
+      }
+      if (!activeOrder.items.every((item: OutboundItem) => (packingScannedQty[item.id] || 0) >= item.qty)) {
+        setPackingScanSuccess(null);
+        setPackingScanError('❌ Validasi scan barang belum lengkap 100%! Selesaikan scan seluruh barcode SKU terlebih dahulu.');
         triggerErrorSound();
         return;
       }
