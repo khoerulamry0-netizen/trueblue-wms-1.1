@@ -952,50 +952,58 @@ export default function App() {
 
   const runAdminAction = async (body: Record<string, unknown>) => {
     if (!supabase) throw new Error('Supabase belum dikonfigurasi.');
-    const { data, error } = await supabase.functions.invoke('admin-users', { body });
-    if (!error && !data?.error) return;
 
-    const { data: rpcData, error: rpcError } = await supabase.rpc('admin_manage_user', { body });
-    if (!rpcError && !(rpcData && typeof rpcData === 'object' && 'error' in rpcData && (rpcData as any).error)) {
-      return;
+    let staleCreateRpcNotice = '';
+    if (body.action !== 'invite') {
+      const { data: rpcData, error: rpcError } = await supabase.rpc('admin_manage_user', { body });
+      const rpcObjError =
+        rpcData && typeof rpcData === 'object' && 'error' in rpcData ? String((rpcData as any).error) : '';
+      if (!rpcError && !rpcObjError) {
+        return rpcData;
+      }
+      if (rpcObjError && !/Edge Function admin-users diperlukan/i.test(rpcObjError)) {
+        throw new Error(rpcObjError);
+      }
+      staleCreateRpcNotice = rpcObjError || (rpcError?.code !== 'PGRST202' ? rpcError?.message || '' : '');
     }
 
+    const { data, error } = await supabase.functions.invoke('admin-users', { body });
+    if (!error && !data?.error) return data;
+
+    let edgeDetail = data?.error ? String(data.error) : '';
     if (error) {
-      let detail = error.message;
+      edgeDetail = error.message;
       try {
         if ('context' in error && (error as any).context) {
           const res = (error as any).context as Response;
           const cloned = res.clone ? res.clone() : res;
           const json = await cloned.json();
-          if (json?.error) detail = json.error;
-          else if (json?.message) detail = json.message;
-          else if (typeof json === 'string') detail = json;
+          if (json?.error) edgeDetail = String(json.error);
+          else if (json?.message) edgeDetail = String(json.message);
+          else if (typeof json === 'string') edgeDetail = json;
         }
       } catch {
         try {
           const res = (error as any).context as Response;
           const text = await res.text();
-          if (text) detail = text;
+          if (text) edgeDetail = text;
         } catch {}
       }
-      const rpcDetail = rpcData && typeof rpcData === 'object' && 'error' in rpcData ? String((rpcData as any).error) : rpcError?.message;
-      throw new Error(rpcDetail || detail);
     }
-    if (data?.error) {
-      const rpcDetail = rpcData && typeof rpcData === 'object' && 'error' in rpcData ? String((rpcData as any).error) : rpcError?.message;
-      throw new Error(rpcDetail || String(data.error));
+
+    if (/requested function was not found|not_found|failed to send a request to the edge function|404/i.test(edgeDetail)) {
+      throw new Error(
+        staleCreateRpcNotice
+          ? 'Pembuatan akun gagal: fungsi SQL `admin_manage_user` perlu diperbarui di Supabase SQL Editor (jalankan `supabase/migrations/20261123000000_admin_create_user_rpc.sql`) atau deploy Edge Function `admin-users`.'
+          : 'Layanan pembuatan akun belum aktif di Supabase. Jalankan migrasi SQL `20261123000000_admin_create_user_rpc.sql` di Supabase SQL Editor.'
+      );
     }
+
+    throw new Error(edgeDetail || staleCreateRpcNotice || 'Operasi akun gagal.');
   };
 
   const handleAddUser = async (newUser: UserAccount) => {
-    const branchToUse = newUser.branch_id || getActiveBranch() || 'CENTER';
-    if (supabase) {
-      try {
-        await supabase.from('branches').upsert({ id: branchToUse, name: branchToUse }, { onConflict: 'id' });
-      } catch (err) {
-        console.warn('Pre-ensuring branch in branches table failed:', err);
-      }
-    }
+    const branchToUse = (newUser.branch_id || getActiveBranch() || 'CENTER').trim();
     const finalFullName = (newUser.fullName || newUser.username).trim();
 
     await runAdminAction({
@@ -1202,16 +1210,88 @@ export default function App() {
     }
   };
 
-  const handleDeleteCatalogItem = async (skuId: string) => {
+  const deleteCatalogItemsByKeys = async (
+    skuIds: string[]
+  ): Promise<{ success: boolean; deletedCount: number; errorMessage?: string }> => {
     try {
-      const docId = normalizeSkuKey(skuId);
-      await deleteDoc(doc(db, 'catalog', docId));
-      applyCatalogLocalState(catalogRef.current.filter(c => normalizeSkuKey(c.skuId) !== docId));
-      return true;
+      const targetKeys = new Set(
+        skuIds.map((id) => normalizeSkuKey(id)).filter(Boolean)
+      );
+      if (targetKeys.size === 0) {
+        return { success: true, deletedCount: 0 };
+      }
+
+      setIsSyncingNow(true);
+
+      let docIdsToDelete: string[] = [];
+      const matchedSkuKeys = new Set<string>(targetKeys);
+
+      if (isSupabaseConfigured && supabase) {
+        const snapshot = await getDocs(collection(db, 'catalog'));
+        const seenDocIds = new Set<string>();
+        for (const entry of snapshot.docs) {
+          const data = entry.data() as Partial<CatalogItem>;
+          const keyById = normalizeSkuKey(entry.id);
+          const keyBySku = normalizeSkuKey(data?.skuId || entry.id);
+          if (targetKeys.has(keyById) || targetKeys.has(keyBySku)) {
+            if (!seenDocIds.has(entry.id)) {
+              seenDocIds.add(entry.id);
+              docIdsToDelete.push(entry.id);
+            }
+            matchedSkuKeys.add(keyById);
+            matchedSkuKeys.add(keyBySku);
+          }
+        }
+      } else {
+        docIdsToDelete = Array.from(
+          new Set(
+            catalogRef.current
+              .filter((c) => targetKeys.has(normalizeSkuKey(c.skuId || c.id)) || targetKeys.has(normalizeSkuKey(c.id)))
+              .map((c) => c.id || normalizeSkuKey(c.skuId))
+              .filter(Boolean)
+          )
+        );
+        if (docIdsToDelete.length === 0) {
+          docIdsToDelete = Array.from(targetKeys);
+        }
+      }
+
+      const chunkSize = 400;
+      for (let i = 0; i < docIdsToDelete.length; i += chunkSize) {
+        const chunk = docIdsToDelete.slice(i, i + chunkSize);
+        const batchDelete = writeBatch(db);
+        chunk.forEach((id) => {
+          batchDelete.delete(doc(db, 'catalog', id));
+        });
+        await batchDelete.commit();
+      }
+
+      const nextCatalog = catalogRef.current.filter(
+        (c) =>
+          !matchedSkuKeys.has(normalizeSkuKey(c.skuId)) &&
+          !matchedSkuKeys.has(normalizeSkuKey(c.id))
+      );
+      applyCatalogLocalState(nextCatalog);
+      setIsSyncingNow(false);
+      return { success: true, deletedCount: docIdsToDelete.length || targetKeys.size };
     } catch (error) {
-      console.error('Error deleting catalog item: ', error);
-      return false;
+      console.error('Error deleting catalog items: ', error);
+      setIsSyncingNow(false);
+      return {
+        success: false,
+        deletedCount: 0,
+        errorMessage: error instanceof Error ? error.message : 'Gagal menghapus data katalog.',
+      };
     }
+  };
+
+  const handleDeleteCatalogItem = async (skuId: string) => {
+    const res = await deleteCatalogItemsByKeys([skuId]);
+    return res.success;
+  };
+
+  const handleBatchDeleteCatalogItems = async (skuIds: string[]) => {
+    return deleteCatalogItemsByKeys(skuIds);
   };
 
   const handleBatchImportCatalog = async (
@@ -3937,6 +4017,7 @@ export default function App() {
                 onAddCatalogItem={handleAddCatalogItem}
                 onUpdateCatalogItem={handleUpdateCatalogItem}
                 onDeleteCatalogItem={handleDeleteCatalogItem}
+                onBatchDeleteCatalogItems={handleBatchDeleteCatalogItems}
                 onBatchImportCatalog={handleBatchImportCatalog}
                 onSyncStockToCatalog={handleSyncStockToCatalog}
                 onFetchAccessibleBranches={fetchAccessibleBranches}

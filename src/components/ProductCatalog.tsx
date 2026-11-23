@@ -50,6 +50,7 @@ interface ProductCatalogProps {
   onAddCatalogItem: (item: Omit<CatalogItem, 'id'>) => Promise<boolean>;
   onUpdateCatalogItem: (skuId: string, updatedFields: Partial<CatalogItem>) => Promise<boolean>;
   onDeleteCatalogItem: (skuId: string) => Promise<boolean>;
+  onBatchDeleteCatalogItems?: (skuIds: string[]) => Promise<{ success: boolean; deletedCount: number; errorMessage?: string }>;
   onBatchImportCatalog: (
     items: Omit<CatalogItem, 'id'>[],
     mode: 'merge' | 'replace'
@@ -71,6 +72,7 @@ export default function ProductCatalog({
   onAddCatalogItem,
   onUpdateCatalogItem,
   onDeleteCatalogItem,
+  onBatchDeleteCatalogItems,
   onBatchImportCatalog,
   onSyncStockToCatalog,
   onFetchAccessibleBranches,
@@ -118,6 +120,8 @@ export default function ProductCatalog({
 
   // File parse error / preview state
   const [parsedImportRows, setParsedImportRows] = useState<ParsedCatalogSheetRow[]>([]);
+  const [selectedSkuKeys, setSelectedSkuKeys] = useState<string[]>([]);
+  const [isDeletingCatalog, setIsDeletingCatalog] = useState(false);
 
   const [catalogConfirmModal, setCatalogConfirmModal] = useState<{
     isOpen: boolean;
@@ -129,7 +133,11 @@ export default function ProductCatalog({
     onConfirm?: () => void;
   } | null>(null);
 
-  const isAdmin = userRole !== 'Packer' && userRole !== 'Picker';
+  const isAdmin =
+    userRole !== 'Packer' &&
+    userRole !== 'Picker' &&
+    userRole !== 'Viewer' &&
+    userRole !== 'Shipping';
 
   const handleCopyBarcode = (bc: string) => {
     if (!bc || bc === '-') return;
@@ -234,6 +242,44 @@ export default function ProductCatalog({
   }, [catalog, searchTerm, activeTab, stockSummaryMap]);
 
   const displayedCatalog = filteredCatalog;
+
+  const activeSelectedSkuSet = useMemo(() => {
+    const validKeys = new Set(catalog.map((item) => normalizeSkuKey(item.skuId)));
+    return new Set(selectedSkuKeys.filter((key) => validKeys.has(key)));
+  }, [catalog, selectedSkuKeys]);
+
+  const visibleSelectedCount = useMemo(
+    () =>
+      displayedCatalog.filter((item) => activeSelectedSkuSet.has(normalizeSkuKey(item.skuId))).length,
+    [displayedCatalog, activeSelectedSkuSet]
+  );
+
+  const allVisibleSelected =
+    displayedCatalog.length > 0 && visibleSelectedCount === displayedCatalog.length;
+
+  const toggleSelectSku = (skuId: string) => {
+    const key = normalizeSkuKey(skuId);
+    if (!key) return;
+    setSelectedSkuKeys((prev) =>
+      prev.includes(key) ? prev.filter((item) => item !== key) : [...prev, key]
+    );
+  };
+
+  const toggleSelectAllVisible = () => {
+    const visibleKeys = displayedCatalog.map((item) => normalizeSkuKey(item.skuId)).filter(Boolean);
+    if (visibleKeys.length === 0) return;
+    const visibleSet = new Set(visibleKeys);
+    setSelectedSkuKeys((prev) => {
+      const prevSet = new Set(prev);
+      const everyVisibleAlreadySelected = visibleKeys.every((key) => prevSet.has(key));
+      if (everyVisibleAlreadySelected) {
+        return prev.filter((key) => !visibleSet.has(key));
+      }
+      const next = new Set(prev);
+      visibleKeys.forEach((key) => next.add(key));
+      return Array.from(next);
+    });
+  };
 
   // Catalog Statistics
   const stats = useMemo(() => {
@@ -377,16 +423,104 @@ export default function ProductCatalog({
     }
   };
 
-  const handleDeleteItem = async (item: CatalogItem) => {
-    if (!isAdmin) return;
-    if (confirm(`Apakah Anda yakin ingin menghapus SKU "${item.skuId}" dari katalog?\n\nTindakan ini tidak akan menghapus stok fisik yang ada di sistem.`)) {
-      const success = await onDeleteCatalogItem(item.skuId);
-      if (success) {
-        setSuccessMsg(`SKU "${item.skuId}" berhasil dihapus dari katalog.`);
+  const executeCatalogDelete = async (skuIds: string[], successMessage: string) => {
+    if (!isAdmin || skuIds.length === 0 || isDeletingCatalog) return;
+    setCatalogConfirmModal(null);
+    setIsDeletingCatalog(true);
+    setSuccessMsg('');
+    try {
+      let ok = false;
+      let errMsg = '';
+      if (onBatchDeleteCatalogItems) {
+        const res = await onBatchDeleteCatalogItems(skuIds);
+        ok = res.success;
+        errMsg = res.errorMessage || '';
       } else {
-        alert('Gagal menghapus item dari katalog.');
+        ok = true;
+        for (const skuId of skuIds) {
+          const deleted = await onDeleteCatalogItem(skuId);
+          if (!deleted) {
+            ok = false;
+            errMsg = `Gagal menghapus SKU "${skuId}" dari katalog.`;
+            break;
+          }
+        }
       }
+
+      if (ok) {
+        const removed = new Set(skuIds.map((id) => normalizeSkuKey(id)));
+        setSelectedSkuKeys((prev) => prev.filter((key) => !removed.has(key)));
+        setSuccessMsg(successMessage);
+      } else {
+        setCatalogConfirmModal({
+          isOpen: true,
+          title: 'Gagal Menghapus Data Katalog',
+          message: errMsg || 'Terjadi kesalahan saat menghapus item katalog dari server.',
+          warningType: 'danger',
+          confirmText: 'Tutup',
+          showCancel: false,
+          onConfirm: () => setCatalogConfirmModal(null),
+        });
+      }
+    } finally {
+      setIsDeletingCatalog(false);
     }
+  };
+
+  const handleDeleteItem = (item: CatalogItem) => {
+    if (!isAdmin || isDeletingCatalog) return;
+    setCatalogConfirmModal({
+      isOpen: true,
+      title: `Hapus SKU "${item.skuId}"?`,
+      message: `Apakah Anda yakin ingin menghapus SKU "${item.skuId}" (${item.skuName}) dari master katalog?\n\nTindakan ini tidak akan menghapus stok fisik atau riwayat order yang ada di sistem.`,
+      warningType: 'danger',
+      confirmText: 'Ya, Hapus SKU',
+      showCancel: true,
+      onConfirm: () => {
+        void executeCatalogDelete(
+          [item.skuId],
+          `SKU "${item.skuId}" berhasil dihapus dari katalog.`
+        );
+      },
+    });
+  };
+
+  const handleDeleteSelected = () => {
+    const targetKeys = Array.from(activeSelectedSkuSet);
+    if (!isAdmin || targetKeys.length === 0 || isDeletingCatalog) return;
+    setCatalogConfirmModal({
+      isOpen: true,
+      title: `Hapus ${formatNumber(targetKeys.length)} SKU Terpilih?`,
+      message: `Anda akan menghapus ${formatNumber(targetKeys.length)} item dari master katalog produk.\n\nStok fisik gudang dan riwayat transaksi tidak akan terhapus.`,
+      warningType: 'danger',
+      confirmText: `Ya, Hapus Terpilih (${targetKeys.length})`,
+      showCancel: true,
+      onConfirm: () => {
+        void executeCatalogDelete(
+          targetKeys,
+          `${formatNumber(targetKeys.length)} SKU berhasil dihapus dari katalog.`
+        );
+      },
+    });
+  };
+
+  const handleDeleteAllCatalog = () => {
+    if (!isAdmin || catalog.length === 0 || isDeletingCatalog) return;
+    const allSkuIds = catalog.map((item) => item.skuId).filter(Boolean);
+    setCatalogConfirmModal({
+      isOpen: true,
+      title: `Hapus Seluruh Data Katalog (${formatNumber(allSkuIds.length)} SKU)?`,
+      message: `PERINGATAN: Anda akan MENGOSONGKAN seluruh ${formatNumber(allSkuIds.length)} item master katalog produk di cabang ini.\n\nStok fisik di gudang dan riwayat order TIDAK akan terhapus, dan katalog dapat diimpor ulang kapan saja.`,
+      warningType: 'danger',
+      confirmText: `Ya, Hapus Semua (${allSkuIds.length})`,
+      showCancel: true,
+      onConfirm: () => {
+        void executeCatalogDelete(
+          allSkuIds,
+          `Seluruh ${formatNumber(allSkuIds.length)} data katalog berhasil dihapus.`
+        );
+      },
+    });
   };
 
   // Bidirectional Sync between Stock & Catalog
@@ -830,6 +964,20 @@ export default function ProductCatalog({
               </button>
             )}
 
+            {/* Delete All Catalog Button */}
+            {isAdmin && catalog.length > 0 && (
+              <button
+                id="btn-delete-all-catalog"
+                onClick={handleDeleteAllCatalog}
+                disabled={isDeletingCatalog}
+                className="flex items-center justify-center gap-1.5 px-3.5 py-2 bg-rose-600/15 hover:bg-rose-600/25 border border-rose-500/40 text-rose-300 disabled:opacity-50 active:scale-95 text-xs font-bold rounded-xl transition-all cursor-pointer shadow-md"
+                title={language === 'en' ? 'Clear all catalog data' : 'Hapus seluruh data katalog produk'}
+              >
+                <Trash2 className="w-4 h-4 text-rose-400" />
+                <span>{isDeletingCatalog ? (language === 'en' ? 'Deleting...' : 'Menghapus...') : (language === 'en' ? 'Delete Catalog' : 'Hapus Katalog')}</span>
+              </button>
+            )}
+
             {/* Add New SKU Button */}
             {isAdmin && (
               <button
@@ -1021,6 +1169,45 @@ export default function ProductCatalog({
           </div>
         </div>
 
+        {/* Selected Rows Action Bar */}
+        {isAdmin && activeSelectedSkuSet.size > 0 && (
+          <div className="px-4 py-2.5 bg-rose-950/30 border-b border-rose-500/30 flex flex-wrap items-center justify-between gap-3">
+            <div className="flex items-center gap-2 text-xs text-rose-200 font-semibold">
+              <Trash2 className="w-4 h-4 text-rose-400" />
+              <span>
+                {language === 'en'
+                  ? `${formatNumber(activeSelectedSkuSet.size)} catalog item(s) selected`
+                  : `${formatNumber(activeSelectedSkuSet.size)} item katalog dipilih`}
+              </span>
+            </div>
+            <div className="flex items-center gap-2">
+              <button
+                type="button"
+                onClick={() => setSelectedSkuKeys([])}
+                disabled={isDeletingCatalog}
+                className="px-3 py-1.5 rounded-lg border border-slate-700 bg-slate-900 hover:bg-slate-800 text-[11px] font-semibold text-slate-300 cursor-pointer disabled:opacity-50"
+              >
+                {language === 'en' ? 'Clear Selection' : 'Batal Pilih'}
+              </button>
+              <button
+                type="button"
+                onClick={handleDeleteSelected}
+                disabled={isDeletingCatalog}
+                className="inline-flex items-center gap-1.5 px-3.5 py-1.5 rounded-lg bg-rose-600 hover:bg-rose-500 text-[11px] font-extrabold text-white cursor-pointer shadow-md shadow-rose-600/20 disabled:opacity-50"
+              >
+                <Trash2 className="w-3.5 h-3.5" />
+                <span>
+                  {isDeletingCatalog
+                    ? (language === 'en' ? 'Deleting...' : 'Menghapus...')
+                    : (language === 'en'
+                        ? `Delete Selected (${activeSelectedSkuSet.size})`
+                        : `Hapus Terpilih (${activeSelectedSkuSet.size})`)}
+                </span>
+              </button>
+            </div>
+          </div>
+        )}
+
         {/* Catalog Table */}
         <div 
           className="overflow-x-auto max-h-[680px] overflow-y-auto relative scroll-smooth border-b border-slate-850"
@@ -1028,6 +1215,17 @@ export default function ProductCatalog({
           <table className="w-full border-collapse text-left">
             <thead className="sticky top-0 z-20 bg-[#11141B]">
               <tr className="bg-slate-950/80 backdrop-blur-md text-[10px] font-bold text-slate-400 uppercase tracking-wider border-b border-slate-850 shadow-sm">
+                {isAdmin && (
+                  <th className="py-3 px-3 w-10 text-center">
+                    <input
+                      type="checkbox"
+                      aria-label="Pilih semua SKU yang tampil"
+                      checked={allVisibleSelected}
+                      onChange={toggleSelectAllVisible}
+                      className="w-3.5 h-3.5 rounded border-slate-600 bg-slate-900 text-rose-500 focus:ring-rose-500 cursor-pointer accent-rose-500"
+                    />
+                  </th>
+                )}
                 <th className="py-3 px-4 w-32">SKU ID</th>
                 <th className="py-3 px-4">Nama Barang</th>
                 <th className="py-3 px-4 w-32">Brand</th>
@@ -1042,7 +1240,7 @@ export default function ProductCatalog({
             <tbody className="divide-y divide-slate-850/60 text-xs">
               {filteredCatalog.length === 0 ? (
                 <tr>
-                  <td colSpan={isAdmin ? 9 : 8} className="py-12 text-center text-slate-500">
+                  <td colSpan={isAdmin ? 10 : 8} className="py-12 text-center text-slate-500">
                     <Package className="w-8 h-8 mx-auto text-slate-600 mb-2" />
                     Tidak ada SKU yang cocok dengan pencarian / filter Anda.
                   </td>
@@ -1050,7 +1248,8 @@ export default function ProductCatalog({
               ) : (
                 <>
                   {displayedCatalog.map((item) => {
-                  const normSku = item.skuId.toUpperCase();
+                  const normSku = normalizeSkuKey(item.skuId);
+                  const isRowSelected = activeSelectedSkuSet.has(normSku);
                   const itemBrand = getProductBrand(item.skuId, item.skuName, item.brand);
                   const itemBarcode = getBarcodeForSku(item.skuId, item.barcode);
                   const stockData = stockSummaryMap.get(normSku);
@@ -1059,7 +1258,18 @@ export default function ProductCatalog({
                   const splits = calculatePackQuantities(totalQtyPcs, item.qtyCtnSize, item.qtyInnerSize);
 
                   return (
-                    <tr key={item.skuId} className="hover:bg-slate-800/20 transition-colors">
+                    <tr key={item.skuId} className={`transition-colors ${isRowSelected ? 'bg-rose-500/5 hover:bg-rose-500/10' : 'hover:bg-slate-800/20'}`}>
+                      {isAdmin && (
+                        <td className="py-3.5 px-3 text-center">
+                          <input
+                            type="checkbox"
+                            aria-label={`Pilih SKU ${item.skuId}`}
+                            checked={isRowSelected}
+                            onChange={() => toggleSelectSku(item.skuId)}
+                            className="w-3.5 h-3.5 rounded border-slate-600 bg-slate-900 text-rose-500 focus:ring-rose-500 cursor-pointer accent-rose-500"
+                          />
+                        </td>
+                      )}
                       <td className="py-3.5 px-4 font-mono font-black text-indigo-400 select-all">
                         {item.skuId}
                       </td>

@@ -157,6 +157,30 @@ test('UserManagement filters operators by branch, role, and search query', async
     assert.ok(container.textContent.includes('FADIL'));
     assert.ok(container.textContent.includes('AMRI'));
 
+    // 4) Open "Tambah operator" modal and verify creation errors render visibly inside the dialog
+    const addBtn = [...container.querySelectorAll('button')].find((b) => /Tambah/i.test(b.textContent || ''));
+    assert.ok(addBtn, 'Add operator button must exist');
+    await flush(() => addBtn.click());
+    const dialog = container.querySelector('form[role="dialog"]');
+    assert.ok(dialog, 'Add operator dialog must render');
+    const idInput = dialog.querySelector('input[required][type="text"]');
+    const pwInput = dialog.querySelector('input[type="password"]');
+    const setInput = async (el, val) => {
+      await flush(() => {
+        const setter = Object.getOwnPropertyDescriptor(dom.window.HTMLInputElement.prototype, 'value').set;
+        setter.call(el, val);
+        el.dispatchEvent(new dom.window.Event('input', { bubbles: true }));
+        el.dispatchEvent(new dom.window.Event('change', { bubbles: true }));
+      });
+    };
+    await setInput(idInput, 'shipping01');
+    await setInput(pwInput, '12345678');
+    await flush(() => {
+      dialog.dispatchEvent(new dom.window.Event('submit', { bubbles: true, cancelable: true }));
+    });
+    const modalAlert = dialog.querySelector('[role="alert"]');
+    assert.ok(modalAlert, 'Validation/backend error must render inside the Add Operator dialog');
+
     await flush(() => root.unmount());
   } finally {
     await server.close();
