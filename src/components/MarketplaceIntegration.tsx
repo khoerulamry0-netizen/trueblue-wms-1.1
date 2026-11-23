@@ -10,7 +10,7 @@ type MarketplaceStore = {
   store_key: string;
   store_name: string;
   mode: 'DEMO' | 'LIVE';
-  connection_status: 'CONNECTED' | 'DISCONNECTED' | 'NOT_CONFIGURED';
+  connection_status: 'CONNECTED' | 'DISCONNECTED' | 'NOT_CONFIGURED' | 'PENDING';
   last_synced_at: string | null;
   external_shop_id?: number | null;
   last_error?: string | null;
