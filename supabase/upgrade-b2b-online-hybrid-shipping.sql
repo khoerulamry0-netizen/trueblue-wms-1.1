@@ -1,4 +1,4 @@
-﻿-- B2B, Online, Hybrid Branch Configuration, Shipping & Manifest, and Unassigned Order Classification
+-- B2B, Online, Hybrid Branch Configuration, Shipping & Manifest, and Unassigned Order Classification
 
 alter table public.branches
   add column if not exists operation_type text not null default 'HYBRID';
@@ -646,12 +646,12 @@ $$;
 revoke all on function public.assign_order_types(uuid, text, jsonb) from public, anon;
 grant execute on function public.assign_order_types(uuid, text, jsonb) to authenticated;
 
--- Admin user management SQL RPC fallback (used when Edge Function is unavailable)
+-- Admin user management SQL RPC (supports create, update, delete directly in Postgres)
 create or replace function public.admin_manage_user(body jsonb)
 returns jsonb
 language plpgsql
 security definer
-set search_path = ''
+set search_path = public, extensions
 as $$
 declare
   v_actor record;
@@ -661,6 +661,11 @@ declare
   v_branch_id text;
   v_full_name text;
   v_role text;
+  v_username text;
+  v_password text;
+  v_email text;
+  v_new_id uuid;
+  v_instance_id uuid;
   v_admin_count integer;
 begin
   if auth.uid() is null then
@@ -677,7 +682,7 @@ begin
   end if;
 
   v_action := lower(trim(coalesce(body->>'action', '')));
-  v_branch_id := coalesce(nullif(trim(coalesce(body->>'branchId', '')), ''), v_actor.branch_id, 'CENTER');
+  v_branch_id := upper(coalesce(nullif(trim(coalesce(body->>'branchId', '')), ''), v_actor.branch_id, 'CENTER'));
   v_full_name := trim(coalesce(body->>'fullName', ''));
   v_role := trim(coalesce(body->>'role', ''));
 
@@ -688,7 +693,120 @@ begin
     return jsonb_build_object('error', 'Hanya kantor pusat dapat memberikan akses Administrator.');
   end if;
 
-  if v_action = 'update' then
+  if v_action = 'create' then
+    v_username := lower(trim(coalesce(body->>'username', '')));
+    v_password := coalesce(body->>'password', '');
+    v_full_name := coalesce(nullif(v_full_name, ''), v_username);
+
+    if v_username !~ '^[a-z0-9][a-z0-9._-]{2,31}$'
+       or length(v_password) < 8
+       or length(v_password) > 128
+       or length(v_full_name) not between 1 and 120
+       or v_role not in ('Administrator', 'Admin', 'Picker', 'Packer', 'Shipping', 'Viewer') then
+      return jsonb_build_object('error', 'ID, password (minimal 8 karakter), nama, atau peran tidak valid.');
+    end if;
+
+    if not exists (select 1 from public.branches where id = v_branch_id) then
+      if v_actor.role = 'Administrator' then
+        insert into public.branches (id, name, operation_type)
+        values (v_branch_id, v_branch_id, 'HYBRID')
+        on conflict (id) do nothing;
+      else
+        return jsonb_build_object('error', 'Akses cabang ditolak: Cabang "' || v_branch_id || '" tidak terdaftar.');
+      end if;
+    end if;
+
+    v_email := v_username || '@operators.blues.invalid';
+
+    if exists (select 1 from auth.users where lower(email) = v_email) then
+      return jsonb_build_object('error', 'ID akun "' || v_username || '" sudah terdaftar.');
+    end if;
+
+    v_new_id := gen_random_uuid();
+    select coalesce(
+      (select u.instance_id from auth.users u where u.id = auth.uid()),
+      '00000000-0000-0000-0000-000000000000'::uuid
+    ) into v_instance_id;
+
+    insert into auth.users (
+      id,
+      instance_id,
+      aud,
+      role,
+      email,
+      encrypted_password,
+      email_confirmed_at,
+      confirmation_token,
+      recovery_token,
+      email_change_token_new,
+      email_change,
+      raw_app_meta_data,
+      raw_user_meta_data,
+      created_at,
+      updated_at
+    ) values (
+      v_new_id,
+      v_instance_id,
+      'authenticated',
+      'authenticated',
+      v_email,
+      crypt(v_password, gen_salt('bf')),
+      now(),
+      '',
+      '',
+      '',
+      '',
+      '{"provider":"email","providers":["email"]}'::jsonb,
+      jsonb_build_object('full_name', v_full_name),
+      now(),
+      now()
+    );
+
+    insert into auth.identities (
+      id,
+      user_id,
+      provider_id,
+      identity_data,
+      provider,
+      last_sign_in_at,
+      created_at,
+      updated_at
+    ) values (
+      gen_random_uuid(),
+      v_new_id,
+      v_new_id::text,
+      jsonb_build_object(
+        'sub', v_new_id::text,
+        'email', v_email,
+        'email_verified', true,
+        'phone_verified', false
+      ),
+      'email',
+      now(),
+      now(),
+      now()
+    ) on conflict (provider_id, provider) do nothing;
+
+    insert into public.profiles (id, email, full_name, role, branch_id, is_active)
+    values (v_new_id, v_email, v_full_name, v_role, v_branch_id, true)
+    on conflict (id) do update set
+      email = excluded.email,
+      full_name = excluded.full_name,
+      role = excluded.role,
+      branch_id = excluded.branch_id,
+      is_active = true;
+
+    insert into public.activity_events (
+      branch_id, entity_type, entity_id, action, actor_id, actor_name, after_data, reason
+    ) values (
+      v_branch_id, 'accounts', v_new_id::text, 'ACCOUNT_CREATE',
+      auth.uid(), coalesce(nullif(v_actor.full_name, ''), v_actor.email),
+      jsonb_build_object('username', v_username, 'fullName', v_full_name, 'role', v_role, 'branch_id', v_branch_id),
+      'Pengelolaan akun oleh admin'
+    );
+
+    return jsonb_build_object('success', true, 'userId', v_new_id::text, 'username', v_username);
+  elsif v_action = 'update' then
     if coalesce(trim(body->>'userId'), '') = '' or length(v_full_name) not between 1 and 120
        or v_role not in ('Administrator', 'Admin', 'Picker', 'Packer', 'Shipping', 'Viewer') then
       return jsonb_build_object('error', 'Profil atau peran tidak valid.');
@@ -768,7 +886,7 @@ begin
     return jsonb_build_object('success', true);
   end if;
 
-  return jsonb_build_object('error', 'Edge Function admin-users diperlukan untuk membuat akun login baru.');
+  return jsonb_build_object('error', 'Aksi pengelolaan akun tidak dikenal.');
 end;
 $$;
 

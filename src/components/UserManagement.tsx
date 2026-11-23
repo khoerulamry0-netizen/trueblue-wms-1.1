@@ -127,8 +127,13 @@ export default function UserManagement({ users, currentUser, onAddUser, onUpdate
         await onUpdateUser(editing.email || editing.username, { fullName: finalFullName, role, branch_id: branchId });
         setNotice('Profil operator diperbarui.'); setEditing(null);
       } else {
-        if (users.some(user => (user.email || user.username).toLowerCase() === cleanEmail)) {
-          throw new Error('ID akun "' + cleanEmail + '" sudah terdaftar.');
+        const existingUser = users.find(user => (user.email || user.username).toLowerCase() === cleanEmail);
+        if (existingUser) {
+          throw new Error(
+            existingUser.is_active === false
+              ? `ID akun "${cleanEmail}" sudah pernah terdaftar dengan status nonaktif.`
+              : `ID akun "${cleanEmail}" sudah terdaftar.`
+          );
         }
         await onAddUser({ username: cleanEmail, password, fullName: finalFullName, role, branch_id: branchId });
         setNotice('Akun operator berhasil dibuat. Operator bisa langsung login dengan ID dan password.'); 
@@ -158,10 +163,11 @@ export default function UserManagement({ users, currentUser, onAddUser, onUpdate
         {isAdmin && <button onClick={openInvite} className="inline-flex items-center gap-2 rounded-xl bg-emerald-500 px-4 py-2.5 text-xs font-bold text-slate-950 hover:bg-emerald-400"><UserPlus className="w-4 h-4" />{t('user.addOperator')}</button>}
       </div>
       {notice && <p className="rounded-xl border border-emerald-500/25 bg-emerald-500/10 p-3 text-xs text-emerald-300">{notice}</p>}
-      {error && <p className="rounded-xl border border-rose-500/25 bg-rose-500/10 p-3 text-xs text-rose-300">{error}</p>}
+      {error && !inviteOpen && !editing && <p role="alert" className="rounded-xl border border-rose-500/25 bg-rose-500/10 p-3 text-xs text-rose-300">{error}</p>}
 
       {editing && <form onSubmit={submit} className="rounded-2xl border border-slate-700 bg-[#11141B] p-4 space-y-3">
-        <div className="flex justify-between items-center"><h3 className="text-sm font-bold text-white">{t('user.editProfile')}</h3><button type="button" onClick={() => setEditing(null)} aria-label="Tutup"><X className="w-4 h-4" /></button></div>
+        <div className="flex justify-between items-center"><h3 className="text-sm font-bold text-white">{t('user.editProfile')}</h3><button type="button" onClick={() => { setEditing(null); setError(''); }} aria-label="Tutup"><X className="w-4 h-4" /></button></div>
+        {error && <p role="alert" className="rounded-xl border border-rose-500/35 bg-rose-500/15 p-3 text-xs text-rose-200">{error}</p>}
         <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
           <input value={fullName} onChange={event => setFullName(event.target.value)} placeholder={t('user.fullNamePlaceholder')} maxLength={120} className="rounded-lg border border-slate-700 bg-slate-900 px-3 py-2 text-sm text-white" />
           <input value={email} readOnly className="rounded-lg border border-slate-800 bg-slate-950 px-3 py-2 text-sm text-slate-400" />
@@ -245,8 +251,9 @@ export default function UserManagement({ users, currentUser, onAddUser, onUpdate
         </div>
       </div>
 
-      {inviteOpen && <><button type="button" className="fixed inset-0 z-[140] bg-black/45 backdrop-blur-[2px]" aria-label="Tutup form tambah operator" onClick={() => setInviteOpen(false)} /><form onSubmit={submit} role="dialog" aria-modal="true" aria-label={t('user.addOperatorTitle')} className="fixed top-20 left-1/2 z-[150] max-h-[calc(100dvh-96px)] w-[min(1100px,calc(100vw-32px))] -translate-x-1/2 overflow-y-auto rounded-2xl border border-emerald-500/20 bg-[#11141B] p-4 space-y-3 shadow-2xl">
-        <div className="flex justify-between items-center"><h3 className="text-sm font-bold text-white flex gap-2 items-center"><User className="w-4 h-4 text-emerald-400" />{t('user.addOperatorTitle')}</h3><button type="button" onClick={() => setInviteOpen(false)} aria-label="Tutup"><X className="w-4 h-4" /></button></div>
+      {inviteOpen && <><button type="button" className="fixed inset-0 z-[140] bg-black/45 backdrop-blur-[2px]" aria-label="Tutup form tambah operator" onClick={() => { setInviteOpen(false); setError(''); }} /><form onSubmit={submit} role="dialog" aria-modal="true" aria-label={t('user.addOperatorTitle')} className="fixed top-20 left-1/2 z-[150] max-h-[calc(100dvh-96px)] w-[min(1100px,calc(100vw-32px))] -translate-x-1/2 overflow-y-auto rounded-2xl border border-emerald-500/20 bg-[#11141B] p-4 space-y-3 shadow-2xl">
+        <div className="flex justify-between items-center"><h3 className="text-sm font-bold text-white flex gap-2 items-center"><User className="w-4 h-4 text-emerald-400" />{t('user.addOperatorTitle')}</h3><button type="button" onClick={() => { setInviteOpen(false); setError(''); }} aria-label="Tutup"><X className="w-4 h-4" /></button></div>
+        {error && <p role="alert" className="rounded-xl border border-rose-500/35 bg-rose-500/15 p-3 text-xs font-medium text-rose-200">{error}</p>}
         <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
           <input autoFocus value={fullName} onChange={event => setFullName(event.target.value)} placeholder={t('user.fullNamePlaceholder')} maxLength={120} className="rounded-lg border border-slate-700 bg-slate-900 px-3 py-2 text-sm text-white" />
           <input type="text" autoComplete="off" required minLength={3} maxLength={32} value={email} onChange={event => setEmail(event.target.value)} placeholder={t('user.idPlaceholder')} className="rounded-lg border border-slate-700 bg-slate-900 px-3 py-2 text-sm text-white" />
@@ -254,7 +261,7 @@ export default function UserManagement({ users, currentUser, onAddUser, onUpdate
           <select aria-label="Cabang operator" value={branchId} onChange={e=>setBranchId(e.target.value)} className="rounded-lg border border-slate-700 bg-slate-900 px-3 py-2 text-sm text-white">{branches.length ? branches.map(b=><option key={b.id} value={b.id}>{b.id} — {b.name}</option>) : <option value={branchId || 'CENTER'}>{branchId || 'CENTER'}</option>}</select>
         </div>
         <input type="password" autoComplete="new-password" required minLength={8} maxLength={128} value={password} onChange={event => setPassword(event.target.value)} placeholder={t('user.passwordPlaceholder')} aria-label="Password akun baru" className="w-full rounded-lg border border-slate-700 bg-slate-900 px-3 py-2 text-sm text-white" /><p className="text-[11px] text-slate-400">{language === 'en' ? 'ID is case-insensitive. Operators can log in directly without email confirmation.' : 'ID tidak membedakan huruf besar/kecil. Operator bisa langsung masuk tanpa konfirmasi email.'}</p>
-        <button disabled={busy} className="rounded-lg bg-emerald-500 px-4 py-2 text-xs font-bold text-slate-950 disabled:opacity-50">{t('user.createAccount')}</button>
+        <button disabled={busy} className="rounded-lg bg-emerald-500 px-4 py-2 text-xs font-bold text-slate-950 disabled:opacity-50">{busy ? (language === 'en' ? 'Creating account...' : 'Membuat akun...') : t('user.createAccount')}</button>
       </form></>}
     </div>
   );
