@@ -1587,8 +1587,13 @@ export default function MabangWmsOutbound({
       if (slot.isComplete) continue;
       const itemIdx = slot.order.items.findIndex(it => {
         const skuClean = it.skuId.trim().toUpperCase();
+        const skuBarcodeClean = getBarcodeForSku(it.skuId).trim().toUpperCase();
+        const barcodeUpper = barcode.toUpperCase();
         const currentCount = slot.itemsDecomposed[it.id] || 0;
-        return (skuClean === matchedSkuId || skuClean === barcode.toUpperCase()) && currentCount < it.qty;
+        return (
+          (skuClean === matchedSkuId || skuClean === barcodeUpper || (skuBarcodeClean !== '-' && skuBarcodeClean === barcodeUpper)) &&
+          currentCount < it.qty
+        );
       });
       if (itemIdx !== -1) {
         targetSlotIndex = sIdx;
@@ -4584,7 +4589,10 @@ export default function MabangWmsOutbound({
         <MasterBasketMonitorModal
           isOpen={isMasterBasketMonitorOpen}
           onClose={() => setIsMasterBasketMonitorOpen(false)}
-          orderHistory={orderHistory}
+          orderHistory={(orderHistory || []).filter((item) => {
+            const orderType = resolveOrderType(item);
+            return requireExplicitOnlineType ? orderType === 'ONLINE' : orderType !== 'B2B';
+          })}
           onUpdateOrderSession={onUpdateOrderSession}
           onAfterRenameMasterBasket={(refs, newBasketCode) => {
             const refSet = new Set(refs);
