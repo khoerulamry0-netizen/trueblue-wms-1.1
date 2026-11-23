@@ -7,8 +7,10 @@ import type { ScanProgress } from '../utils/serverScanRpc';
 import type {OrderIssueReportInput, OrderSessionData, OrderSessionResult} from '../utils/orderSession';
 import { useLanguage } from '../i18n/LanguageContext';
 import React, { useState, useMemo, useRef } from 'react';
+import { createPortal } from 'react-dom';
 import { StockItem, OutboundItem, Warehouse, ChannelOperationType } from '../types';
 import UnassignedOrdersBanner from './UnassignedOrdersBanner';
+import ShippingReceiptModal, { type ShippingOrderData } from './ShippingReceiptModal';
 import { resolveOrderType } from '../utils/orderType';
 import { 
   formatNumber, 
@@ -229,7 +231,17 @@ export default function BulkOutbound({
 
   // Active packing validation session states
   const [activePackingRef, setActivePackingRef] = useState<string | null>(null);
-  const [lastPackedOrder, setLastPackedOrder] = useState<any | null>(null);
+  const lastB2bReceiptStorageKey = `wms_b2b_last_receipt_${getActiveBranch() || 'CENTER'}_${currentUser?.username || 'packer'}`;
+  const [receiptOrder, setReceiptOrder] = useState<ShippingOrderData | null>(null);
+  const [lastPackedReceipt, setLastPackedReceipt] = useState<ShippingOrderData | null>(() => {
+    try {
+      const saved = localStorage.getItem(`wms_b2b_last_receipt_${getActiveBranch() || 'CENTER'}_${currentUser?.username || 'packer'}`);
+      return saved ? (JSON.parse(saved) as ShippingOrderData) : null;
+    } catch {
+      return null;
+    }
+  });
+  const [autoPrintReceipt, setAutoPrintReceipt] = useState<boolean>(true);
   const [packingScannedQty, setPackingScannedQty] = useState<{ [itemId: string]: number }>({});
   const [packingScanError, setPackingScanError] = useState<string | null>(null);
   const [packingScanSuccess, setPackingScanSuccess] = useState<string | null>(null);
@@ -245,9 +257,6 @@ export default function BulkOutbound({
   const packingBusyRef = useRef(false);
   const packingControllers = useRef(new Map<string, ReturnType<typeof createScanServerSession>>());
 
-  // Iframe check and clipboard states
-  const [isInIframe, setIsInIframe] = useState(false);
-  const [copiedReceipt, setCopiedReceipt] = useState(false);
   const [showBatchPickingModal, setShowBatchPickingModal] = useState(false);
 
   // Custom dialogs state for browser confirm block bypass
@@ -313,78 +322,53 @@ export default function BulkOutbound({
     }
   };
 
-  React.useEffect(() => {
-    try {
-      setIsInIframe(window.self !== window.top);
-    } catch (e) {
-      setIsInIframe(true);
-    }
-  }, []);
-
-  const handleCopyReceipt = () => {
-    if (!lastPackedOrder) return;
-    const dateStr = new Date().toLocaleString('id-ID');
-    const itemsText = lastPackedOrder.items.map((item: any) => 
-      `- ${item.skuId} (${item.skuName}) | Rak: ${item.location} | Exp: ${item.expiredDate} | Qty: ${item.qty} pcs`
-    ).join('\n');
-
-    const receiptText = `==================================
-RESI OUTBOUND / PACKING SLIP
-INVENTORY WAREHOUSE OFFLINE
-Tanggal: ${dateStr}
-==================================
-No. Referensi : ${lastPackedOrder.referenceNumber}
-No. Order     : ${lastPackedOrder.orderNumber || '-'}
-No. PO        : ${lastPackedOrder.noPo || '-'}
-Customer      : ${lastPackedOrder.customerName || 'N/A'}
-Packer        : ${currentUser?.fullName || 'Simulated Packer'}
-Status        : 100% VERIFIED
-----------------------------------
-DETAIL BARANG:
-${itemsText}
-----------------------------------
-TOTAL QTY     : ${lastPackedOrder.totalQty} pcs
-==================================`;
-
-    navigator.clipboard.writeText(receiptText);
-    setCopiedReceipt(true);
-    setTimeout(() => setCopiedReceipt(false), 2500);
-  };
-
-  const handleDownloadReceipt = () => {
-    if (!lastPackedOrder) return;
-    const dateStr = new Date().toLocaleString('id-ID');
-    const itemsText = lastPackedOrder.items.map((item: any) => 
-      `- ${item.skuId} (${item.skuName}) | Rak: ${item.location} | Exp: ${item.expiredDate} | Qty: ${item.qty} pcs`
-    ).join('\n');
-
-    const receiptText = `==================================
-RESI OUTBOUND / PACKING SLIP
-INVENTORY WAREHOUSE OFFLINE
-Tanggal: ${dateStr}
-==================================
-No. Referensi : ${lastPackedOrder.referenceNumber}
-No. Order     : ${lastPackedOrder.orderNumber || '-'}
-No. PO        : ${lastPackedOrder.noPo || '-'}
-Customer      : ${lastPackedOrder.customerName || 'N/A'}
-Packer        : ${currentUser?.fullName || 'Simulated Packer'}
-Status        : 100% VERIFIED
-----------------------------------
-DETAIL BARANG:
-${itemsText}
-----------------------------------
-TOTAL QTY     : ${lastPackedOrder.totalQty} pcs
-==================================`;
-
-    const blob = new Blob([receiptText], { type: 'text/plain;charset=utf-8' });
-    const url = URL.createObjectURL(blob);
-    const link = document.createElement('a');
-    link.href = url;
-    link.download = `Resi_${lastPackedOrder.referenceNumber}.txt`;
-    document.body.appendChild(link);
-    link.click();
-    document.body.removeChild(link);
-    URL.revokeObjectURL(url);
+  const buildB2bShippingReceipt = (ord: {
+    referenceNumber: string;
+    orderNumber?: string;
+    noPo?: string;
+    customerName?: string;
+    timestamp?: string;
+    items: OutboundItem[];
+    totalQty?: number;
+    pickingBy?: string;
+  }): ShippingOrderData => {
+    const items = [...(ord.items || [])].sort(
+      (a, b) => getLocationRank(a.location || '') - getLocationRank(b.location || '')
+    );
+    const first = items[0];
+    const pickField = (getter: (item: OutboundItem) => string | undefined) => {
+      for (const row of items) {
+        const val = getter(row)?.trim();
+        if (val && val !== '-') return val;
+      }
+      return undefined;
+    };
+    return {
+      branchId: getActiveBranch(),
+      referenceNumber: ord.referenceNumber,
+      orderNumber: ord.orderNumber || first?.orderNumber,
+      orderId: (first as any)?.orderId || ord.orderNumber || ord.referenceNumber,
+      noPo: ord.noPo || pickField((i) => i.noPo),
+      customerName: ord.customerName || pickField((i) => i.customerName) || 'Pelanggan',
+      customerAddress: pickField((i) => i.customerAddress),
+      customerPhone: pickField((i) => i.customerPhone),
+      batchNumber: pickField((i) => i.batchNumber) || first?.batchNumber,
+      courier: (first as any)?.courier,
+      trackingNumber: (first as any)?.trackingNumber,
+      timestamp: ord.timestamp || first?.completedAt || first?.pickedAt || first?.timestamp || new Date().toISOString(),
+      items: items.map((it) => ({
+        id: it.id,
+        skuId: it.skuId,
+        skuName: it.skuName || it.skuId,
+        location: it.location,
+        expiredDate: it.expiredDate,
+        qty: it.qty,
+      })),
+      totalQty: ord.totalQty ?? items.reduce((sum, it) => sum + Number(it.qty || 0), 0),
+      packerName: currentUser?.fullName || currentUser?.username || pickField((i) => i.packedBy) || 'Packer Staff',
+      pickerName: ord.pickingBy || pickField((i) => i.pickedBy) || pickField((i) => i.pickingBy) || 'Picker Staff',
+      inputByName: pickField((i) => i.createdBy),
+    };
   };
 
   // New Barcode Scan states
@@ -899,14 +883,25 @@ TOTAL QTY     : ${lastPackedOrder.totalQty} pcs
         return;
       }
       if (!onEditOrderHistoryBatch) return;
+      const nowIso = new Date().toISOString();
+      const packerName = currentUser?.fullName || currentUser?.username || 'Packer Staff';
       const updatedItems = activeOrder.items.map((item: OutboundItem) => ({
         ...item,
         status: 'Completed' as const,
-        scanned: true
+        scanned: true,
+        packedBy: packerName,
+        packedAt: nowIso,
       }));
+      const orderToPrint = buildB2bShippingReceipt({ ...activeOrder, items: updatedItems });
       const success = await onEditOrderHistoryBatch(ref, updatedItems, false);
       if (success) {
-        setLastPackedOrder(activeOrder);
+        setLastPackedReceipt(orderToPrint);
+        try {
+          localStorage.setItem(lastB2bReceiptStorageKey, JSON.stringify(orderToPrint));
+        } catch {
+          // ignore
+        }
+        setReceiptOrder(orderToPrint);
         setActivePackingRef(null);
         setPackingTask(null);
         setPackingScannedQty({});
@@ -2840,7 +2835,28 @@ TOTAL QTY     : ${lastPackedOrder.totalQty} pcs
                     Berikut adalah daftar dokumen order outbound (Pending) yang diinput oleh Administrator. Packer wajib memindai setiap item fisik untuk validasi SKU dan kuantitas sebelum dikirim.
                   </p>
                 </div>
-                <div className="flex items-center gap-3">
+                <div className="flex flex-wrap items-center gap-3">
+                  <label className="inline-flex items-center gap-2 px-3 py-2 rounded-xl bg-slate-900 border border-slate-800 text-xs font-bold text-slate-300 cursor-pointer select-none">
+                    <input
+                      type="checkbox"
+                      checked={autoPrintReceipt}
+                      onChange={(e) => setAutoPrintReceipt(e.target.checked)}
+                      className="w-3.5 h-3.5 rounded accent-emerald-500 cursor-pointer"
+                    />
+                    <Printer className="w-3.5 h-3.5 text-emerald-400" />
+                    <span>Auto-Cetak Resi</span>
+                  </label>
+                  {lastPackedReceipt && (
+                    <button
+                      type="button"
+                      onClick={() => setReceiptOrder(lastPackedReceipt)}
+                      className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-xl bg-indigo-500/15 hover:bg-indigo-500/25 border border-indigo-500/35 text-xs font-bold text-indigo-300 transition-colors cursor-pointer"
+                      title={`Cetak ulang resi terakhir (${lastPackedReceipt.referenceNumber})`}
+                    >
+                      <Printer className="w-3.5 h-3.5" />
+                      <span>Cetak Ulang Resi</span>
+                    </button>
+                  )}
                   <div className="bg-slate-900 border border-slate-800 px-4 py-2 rounded-xl text-center">
                     <p className="text-[10px] font-bold text-slate-400 uppercase">Total Antrean</p>
                     <p className="text-lg font-black text-amber-400 font-mono">{packerPendingOrders.length} Order</p>
@@ -3610,266 +3626,18 @@ TOTAL QTY     : ${lastPackedOrder.totalQty} pcs
         </div>
       )}
 
-      {/* LAST PACKED ORDER PRINT MODAL */}
-      {lastPackedOrder && (
-        <div className="fixed inset-0 bg-slate-950/80 backdrop-blur-sm z-50 flex items-center justify-center p-4 overflow-y-auto">
-          <div className="bg-[#11141B] border border-slate-800 rounded-2xl w-full max-w-2xl overflow-hidden shadow-2xl animate-in zoom-in-95 duration-150 flex flex-col my-8">
-            
-            {/* Modal Header */}
-            <div className="bg-[#151922] px-6 py-4 border-b border-slate-800 flex items-center justify-between">
-              <div className="flex items-center gap-2 text-emerald-400">
-                <CheckCircle className="w-5 h-5 stroke-[2.5]" />
-                <h3 className="font-extrabold text-white text-sm uppercase tracking-wider">Packing Berhasil Diselesaikan!</h3>
-              </div>
-              <button 
-                onClick={() => setLastPackedOrder(null)}
-                className="text-slate-400 hover:text-white transition-colors p-1 rounded-lg hover:bg-slate-800 cursor-pointer"
-              >
-                <X className="w-5 h-5" />
-              </button>
-            </div>
-
-            {/* Modal Body / Printable Container */}
-            <div className="p-6 overflow-y-auto space-y-6 max-h-[70vh]">
-              <p className="text-xs text-slate-400 leading-relaxed">
-                Order <span className="font-mono font-bold text-white bg-slate-800 px-1.5 py-0.5 rounded">{lastPackedOrder.referenceNumber}</span> telah berhasil dipacking dengan kuantitas yang divalidasi penuh. Anda dapat langsung mencetak resi pengiriman / packing slip di bawah ini:
-              </p>
-
-              {isInIframe && (
-                <div className="bg-amber-500/10 border border-amber-500/20 rounded-xl p-3.5 text-xs text-amber-400 flex items-start gap-3">
-                  <AlertTriangle className="w-5 h-5 shrink-0 text-amber-500 mt-0.5" />
-                  <div className="space-y-1">
-                    <p className="font-extrabold uppercase tracking-wide text-[10px]">Peringatan Keamanan Browser (Iframe):</p>
-                    <p className="leading-relaxed text-[11px] text-slate-300">
-                      Browser memblokir pemanggilan dialog printer (<code className="font-mono bg-amber-500/10 px-1 py-0.5 rounded text-amber-400">window.print()</code>) karena aplikasi sedang berjalan di dalam panel preview editor ini. 
-                    </p>
-                    <p className="leading-relaxed text-[11px] text-slate-350">
-                      👉 <strong>Solusi:</strong> Silakan klik tombol <strong>"Buka di Tab Baru" (ikon di pojok kanan atas preview)</strong> agar printer fisik Anda dapat merespon, atau gunakan alternatif tombol <strong>"Salin Teks Resi"</strong> di bawah.
-                    </p>
-                  </div>
-                </div>
-              )}
-
-              {/* High fidelity thermal receipt / printable slip style container */}
-              <div 
-                id="printable-receipt"
-                className="bg-white text-slate-900 rounded-xl p-6 border-2 border-dashed border-slate-300 shadow-sm font-mono text-xs space-y-4"
-              >
-                {/* Print only CSS */}
-                <style dangerouslySetInnerHTML={{__html: `
-                  @media print {
-                    /* Reset everything to allow proper multi-page flowing */
-                    html, body, #root, #root > div {
-                      overflow: visible !important;
-                      height: auto !important;
-                      min-height: auto !important;
-                      max-height: none !important;
-                      position: relative !important;
-                      background: white !important;
-                      color: black !important;
-                      padding: 0 !important;
-                      margin: 0 !important;
-                    }
-                    
-                    /* Hide absolutely everything in body by default */
-                    body {
-                      background: white !important;
-                      color: black !important;
-                      visibility: hidden !important;
-                    }
-                    
-                    /* But make sure the printable receipt wrapper and all its contents are visible */
-                    #printable-receipt-wrapper,
-                    #printable-receipt-wrapper * {
-                      visibility: visible !important;
-                    }
-                    
-                    /* Ensure all ancestor divs of the printable wrapper allow overflow and do not enforce fixed size */
-                    div, section, main, header, footer {
-                      overflow: visible !important;
-                      max-height: none !important;
-                      height: auto !important;
-                    }
-                    
-                    /* Disable background dimmers and backdrop blurs during printing */
-                    .fixed {
-                      position: absolute !important;
-                      background: transparent !important;
-                      backdrop-filter: none !important;
-                      box-shadow: none !important;
-                      border: none !important;
-                      left: 0 !important;
-                      top: 0 !important;
-                      width: 100% !important;
-                      height: auto !important;
-                      max-height: none !important;
-                      padding: 0 !important;
-                      margin: 0 !important;
-                      overflow: visible !important;
-                    }
-                    
-                    /* Position the printable wrapper perfectly at the top left of the print viewport */
-                    #printable-receipt-wrapper {
-                      position: absolute !important;
-                      left: 0 !important;
-                      top: 0 !important;
-                      width: 100% !important;
-                      height: auto !important;
-                      overflow: visible !important;
-                      background: white !important;
-                      color: black !important;
-                      margin: 0 !important;
-                      padding: 0 !important;
-                      display: block !important;
-                    }
-                    
-                    /* Style the printable receipt box nicely for full-page standard or thermal prints */
-                    #printable-receipt {
-                      width: 100% !important;
-                      max-width: 100% !important;
-                      border: none !important;
-                      box-shadow: none !important;
-                      padding: 20px !important;
-                      margin: 0 !important;
-                      background: white !important;
-                      color: black !important;
-                    }
-                  }
-                `}} />
-
-                <div id="printable-receipt-wrapper">
-                  {/* Receipt Header */}
-                  <div className="text-center border-b border-slate-300 pb-4 space-y-1">
-                    <h2 className="text-lg font-black tracking-tight text-slate-950">RESI OUTBOUND / PACKING SLIP</h2>
-                    <p className="text-[10px] text-slate-600">INVENTORY WAREHOUSE OFFLINE</p>
-                    <p className="text-[9px] text-slate-500">{new Date().toLocaleString('id-ID')}</p>
-                  </div>
-
-                  {/* Metadata details */}
-                  <div className="grid grid-cols-2 gap-y-2 gap-x-4 text-[11px] border-b border-slate-300 pb-4 mt-4">
-                    <div>
-                      <span className="text-slate-500 uppercase block text-[9px] font-bold">No. Referensi:</span>
-                      <strong className="text-slate-950 font-mono text-xs">{lastPackedOrder.referenceNumber}</strong>
-                    </div>
-                    <div>
-                      <span className="text-slate-500 uppercase block text-[9px] font-bold">No. Order / Invoice:</span>
-                      <strong className="text-slate-950 font-mono">{lastPackedOrder.orderNumber || '-'}</strong>
-                    </div>
-                    <div>
-                      <span className="text-slate-500 uppercase block text-[9px] font-bold">No. PO:</span>
-                      <strong className="text-slate-950 font-mono">{lastPackedOrder.noPo || '-'}</strong>
-                    </div>
-                    <div>
-                      <span className="text-slate-500 uppercase block text-[9px] font-bold">Customer:</span>
-                      <strong className="text-slate-950">{lastPackedOrder.customerName || 'N/A'}</strong>
-                    </div>
-                    <div>
-                      <span className="text-slate-500 uppercase block text-[9px] font-bold">Packer / Validator:</span>
-                      <strong className="text-slate-950">{currentUser?.fullName || 'Simulated Packer'}</strong>
-                    </div>
-                    <div>
-                      <span className="text-slate-500 uppercase block text-[9px] font-bold">Status Validasi:</span>
-                      <strong className="text-emerald-700 uppercase">100% VERIFIED</strong>
-                    </div>
-                  </div>
-
-                  {/* Items Table */}
-                  <div className="space-y-2 mt-4">
-                    <span className="text-slate-500 uppercase text-[9px] font-bold block">Detail Item yang Dikemas:</span>
-                    <table className="w-full text-left text-[11px] border-collapse">
-                      <thead>
-                        <tr className="border-b-2 border-slate-950 text-slate-950 font-bold">
-                          <th className="py-1 text-left">SKU / Nama</th>
-                          <th className="py-1 text-center">Rak</th>
-                          <th className="py-1 text-center">Expired</th>
-                          <th className="py-1 text-right">Qty</th>
-                        </tr>
-                      </thead>
-                      <tbody className="divide-y divide-slate-200">
-                        {[...lastPackedOrder.items].sort((a: any, b: any) => getLocationRank(a.location || '') - getLocationRank(b.location || '')).map((item: any) => (
-                          <tr key={item.id} className="text-slate-900">
-                            <td className="py-2 pr-2">
-                              <span className="font-bold font-mono">{item.skuId}</span>
-                              <span className="block text-[10px] text-slate-600 line-clamp-1">{item.skuName}</span>
-                            </td>
-                            <td className="py-2 text-center font-mono font-bold text-slate-800">{item.location}</td>
-                            <td className="py-2 text-center text-slate-600 font-mono text-[10px]">{item.expiredDate}</td>
-                            <td className="py-2 text-right font-bold text-slate-950">{formatNumber(item.qty)} pcs</td>
-                          </tr>
-                        ))}
-                      </tbody>
-                    </table>
-                  </div>
-
-                  {/* Summary Totals */}
-                  <div className="border-t border-slate-300 pt-3 flex justify-between items-center text-xs mt-4">
-                    <span className="font-bold text-slate-950">TOTAL BARANG:</span>
-                    <strong className="text-sm font-black text-slate-950 font-mono">{formatNumber(lastPackedOrder.totalQty)} Pcs</strong>
-                  </div>
-
-                  {/* Signatures / Footers */}
-                  <div className="border-t border-dashed border-slate-300 pt-4 flex justify-between items-center text-[10px] text-slate-600 mt-6">
-                    <div className="text-center w-24">
-                      <p className="mb-8">Penerima,</p>
-                      <p className="border-t border-slate-400 pt-1 font-bold">( . . . . . . . . . )</p>
-                    </div>
-                    <div className="text-center w-24">
-                      <p className="mb-8">Packer,</p>
-                      <p className="border-t border-slate-400 pt-1 font-bold">({currentUser?.fullName?.split(' ')[0] || 'Packer'})</p>
-                    </div>
-                  </div>
-
-                  <div className="text-center text-[8px] text-slate-450 pt-4 border-t border-slate-200 mt-6">
-                    Terima kasih atas dedikasi Anda dalam pengemasan yang akurat dan tepat waktu!
-                  </div>
-                </div>
-              </div>
-            </div>
-
-            {/* Modal Actions */}
-            <div className="bg-[#151922] px-6 py-4 border-t border-slate-800 flex flex-col sm:flex-row gap-3">
-              <button
-                onClick={() => {
-                  window.print();
-                }}
-                className="flex-1 py-3 bg-emerald-500 hover:bg-emerald-450 text-slate-950 text-xs font-black rounded-xl tracking-wider uppercase transition-colors cursor-pointer flex items-center justify-center gap-2 shadow-lg shadow-emerald-500/10"
-              >
-                <Printer className="w-4 h-4" />
-                Cetak Resi / Print Packing Slip
-              </button>
-
-              <button
-                onClick={handleCopyReceipt}
-                className={`px-5 py-3 text-xs font-bold rounded-xl transition-all cursor-pointer flex items-center justify-center gap-2 border ${
-                  copiedReceipt 
-                    ? 'bg-emerald-500/15 border-emerald-500 text-emerald-400' 
-                    : 'bg-[#1a202c] border-slate-800 text-slate-350 hover:text-white hover:bg-slate-800'
-                }`}
-              >
-                <ClipboardList className="w-4 h-4" />
-                {copiedReceipt ? 'Teks Resi Disalin!' : 'Salin Teks Resi'}
-              </button>
-
-              <button
-                onClick={handleDownloadReceipt}
-                className="px-5 py-3 text-xs font-bold rounded-xl bg-[#1a202c] border border-slate-800 text-slate-350 hover:text-white hover:bg-slate-800 transition-all cursor-pointer flex items-center justify-center gap-2"
-                title="Unduh resi sebagai file .txt"
-              >
-                <FileText className="w-4 h-4 text-emerald-450" />
-                Unduh File Resi (.txt)
-              </button>
-              
-              <button
-                onClick={() => setLastPackedOrder(null)}
-                className="px-6 py-3 bg-slate-800 hover:bg-slate-700 text-slate-300 hover:text-white text-xs font-bold rounded-xl transition-colors cursor-pointer flex items-center justify-center gap-1.5"
-              >
-                Selesai & Lanjut Order Berikutnya
-                <ArrowRight className="w-4 h-4" />
-              </button>
-            </div>
-
-          </div>
-        </div>
+      {/* SHIPPING RECEIPT MODAL (IDENTIK DENGAN PROSES ONLINE) */}
+      {receiptOrder && createPortal(
+        <div className="theme-citrus fixed inset-0 z-[210]">
+          <ShippingReceiptModal
+            isOpen={true}
+            onClose={() => setReceiptOrder(null)}
+            order={receiptOrder}
+            currentUser={currentUser}
+            autoPrint={autoPrintReceipt}
+          />
+        </div>,
+        document.body
       )}
 
       {activeModeTab === 'history' && (
