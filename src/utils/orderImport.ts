@@ -1,7 +1,8 @@
 
-import type { StockItem, OutboundItem } from '../types';
+import type { CatalogItem, StockItem, OutboundItem } from '../types';
 import { getAvailableStockPool, getExpiredStatus, isZoneOrUrbanLocation, normalizeDateToDmy, isNoExpiryDate } from './calculations';
-export type ImportLine = { row:number; orderNumber:string; skuId:string; qty:number; customerName:string; customerAddress:string; customerPhone:string; noPo:string; batchNumber:string; errors:string[] };
+import { buildBundleMap, isBundleCatalogItem, normalizeBundleSkuKey } from './bundleExplode';
+export type ImportLine = { row:number; orderNumber:string; skuId:string; qty:number; customerName:string; customerAddress:string; customerPhone:string; noPo:string; batchNumber:string; errors:string[]; bundleSource?:string };
 export const ORDER_IMPORT_TEMPLATE_HEADERS = [
   'No Order',
   'SKU',
@@ -53,14 +54,59 @@ export function parseOrderTable(table:unknown[][]):ImportLine[] {
   return {...line,errors};
  });
 }
-export function planOrderImport(lines:ImportLine[],stock:StockItem[],history:OutboundItem[],warehouseId:string){
+export function expandImportLinesForBundles(lines:ImportLine[], catalog?:CatalogItem[]):ImportLine[]{
+ if(!catalog||catalog.length===0)return lines;
+ const bundleMap=buildBundleMap(catalog);
+ if(bundleMap.size===0)return lines;
+ const merged=new Map<string,ImportLine>();
+ const orderList:ImportLine[]=[];
+ const addOrMerge=(entry:ImportLine)=>{
+  const key=JSON.stringify([entry.orderNumber.toUpperCase(),entry.skuId.toUpperCase()]);
+  const existing=merged.get(key);
+  if(existing){
+   existing.qty+=entry.qty;
+   const errSet=new Set([...existing.errors,...entry.errors]);
+   existing.errors=Array.from(errSet);
+   if(entry.bundleSource){
+    const parts=new Set([existing.bundleSource,entry.bundleSource].filter(Boolean));
+    existing.bundleSource=Array.from(parts).join(', ');
+   }
+  }else{
+   const copy={...entry,errors:[...entry.errors]};
+   merged.set(key,copy);
+   orderList.push(copy);
+  }
+ };
+ for(const line of lines){
+  const bundle=bundleMap.get(normalizeBundleSkuKey(line.skuId));
+  if(bundle&&isBundleCatalogItem(bundle)&&bundle.bundleComponents&&line.qty>0){
+   const sourceLabel=`${normalizeBundleSkuKey(bundle.skuId)} x${line.qty}`;
+   for(const comp of bundle.bundleComponents){
+    const compSku=normalizeBundleSkuKey(comp.skuId);
+    if(!compSku)continue;
+    addOrMerge({
+     ...line,
+     skuId:compSku,
+     qty:line.qty*comp.qty,
+     bundleSource:sourceLabel,
+    });
+   }
+  }else{
+   addOrMerge(line);
+  }
+ }
+ return orderList;
+}
+
+export function planOrderImport(lines:ImportLine[],stock:StockItem[],history:OutboundItem[],warehouseId:string,catalog?:CatalogItem[]){
+ const expandedLines=expandImportLinesForBundles(lines,catalog);
  const validEd=(v:string | undefined | null)=>{if(isNoExpiryDate(v))return true;const norm=normalizeDateToDmy(v);if(norm==='No Expired'||norm==='--')return true;if(!/^\d{2}\/\d{2}\/\d{4}$/.test(norm))return false;const [d,m,y]=norm.split('/').map(Number),dt=new Date(y,m-1,d);return dt.getFullYear()===y&&dt.getMonth()===m-1&&dt.getDate()===d;};
  const pool=getAvailableStockPool(stock,history).filter(s=>(s.warehouseId||'WH-CENTRAL')===warehouseId&&validEd(s.expiredDate)&&!['Expired','Damage'].includes(getExpiredStatus(s.expiredDate))&&!['Expired','Damage'].includes(s.status)).map(s=>({...s})).sort((a,b)=>{
   const date=(v:string)=>{v=normalizeDateToDmy(v);return /^\d{2}\/\d{2}\/\d{4}$/.test(v)?v.slice(6)+v.slice(3,5)+v.slice(0,2):'99999999'};
   return date(a.expiredDate).localeCompare(date(b.expiredDate))||a.location.localeCompare(b.location,undefined,{numeric:true})||a.id.localeCompare(b.id);
  });
  const existing=new Set(history.filter(o=>o.status!=='Cancelled').flatMap(o=>[o.orderNumber,o.referenceNumber]).filter(Boolean).map(n=>n!.trim().toUpperCase()));
- return lines.map(line=>{
+ return expandedLines.map(line=>{
   const errors=[...line.errors],allocations:{stock:StockItem;qty:number}[]=[];
   if(existing.has(line.orderNumber.toUpperCase()))errors.push('Nomor order sudah terdaftar (aktif/selesai) di cabang ini.');
   const matches=pool.filter(s=>s.skuId.toUpperCase()===line.skuId&&s.qty>0);

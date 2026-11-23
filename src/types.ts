@@ -96,6 +96,8 @@ export interface OutboundItem {
   orderSource?: string;
   orderTypeAssignedAt?: string;
   orderTypeAssignedBy?: string;
+  bundleSku?: string;
+  bundleQty?: number;
 }
 
 export type BranchOperationType = 'B2B' | 'ONLINE' | 'HYBRID';
@@ -160,6 +162,12 @@ export interface PhysicalAuditItem {
   isAdjusted?: boolean;
 }
 
+export interface BundleComponent {
+  skuId: string;
+  skuName?: string;
+  qty: number;
+}
+
 export interface CatalogItem {
   id: string; // SKU ID
   skuId: string;
@@ -170,6 +178,8 @@ export interface CatalogItem {
   barcode?: string;
   qtyCtnSize: number;
   qtyInnerSize: number;
+  isBundle?: boolean;
+  bundleComponents?: BundleComponent[];
 }
 
 export interface ReturnItem {

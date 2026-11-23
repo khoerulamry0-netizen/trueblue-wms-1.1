@@ -12,6 +12,11 @@ import {
   planCrossBranchCatalogMerge,
   type ParsedCatalogSheetRow
 } from '../utils/catalogSync';
+import {
+  computeBundleAvailablePacks,
+  isBundleCatalogItem,
+  normalizeBundleComponents
+} from '../utils/bundleExplode';
 import * as XLSX from 'xlsx';
 import { 
   Plus, 
@@ -80,12 +85,27 @@ export default function ProductCatalog({
 }: ProductCatalogProps) {
   const { t, language } = useLanguage();
   const [searchTerm, setSearchTerm] = useState('');
-  const [activeTab, setActiveTab] = useState<'ALL' | 'IN_STOCK' | 'NO_STOCK' | 'PLACEHOLDER'>('ALL');
+  const [activeTab, setActiveTab] = useState<'ALL' | 'IN_STOCK' | 'NO_STOCK' | 'PLACEHOLDER' | 'BUNDLES'>('ALL');
 
   // Modal states
   const [isModalOpen, setIsModalOpen] = useState(false);
   const [modalMode, setModalMode] = useState<'add' | 'edit'>('add');
   const [editingSkuId, setEditingSkuId] = useState('');
+
+  // Master Bundling Modal states
+  const [isBundleModalOpen, setIsBundleModalOpen] = useState(false);
+  const [bundleModalMode, setBundleModalMode] = useState<'add' | 'edit'>('add');
+  const [bundleEditingSkuId, setBundleEditingSkuId] = useState('');
+  const [bundleSkuIdInput, setBundleSkuIdInput] = useState('');
+  const [bundleSkuNameInput, setBundleSkuNameInput] = useState('');
+  const [bundleBrandInput, setBundleBrandInput] = useState('');
+  const [bundleBarcodeInput, setBundleBarcodeInput] = useState('');
+  const [bundleRows, setBundleRows] = useState<Array<{ skuId: string; qty: string }>>([
+    { skuId: '', qty: '1' },
+    { skuId: '', qty: '1' }
+  ]);
+  const [bundleFormError, setBundleFormError] = useState('');
+  const [isSavingBundle, setIsSavingBundle] = useState(false);
 
   // Form states
   const [skuIdInput, setSkuIdInput] = useState('');
@@ -213,6 +233,44 @@ export default function ProductCatalog({
     return Array.from(unmappedMap.values());
   }, [catalog, stock]);
 
+  // Bundle availability map (Bundle SKU -> max available packs based on component stock)
+  const bundleAvailabilityMap = useMemo(() => {
+    const map = new Map<string, ReturnType<typeof computeBundleAvailablePacks>>();
+    catalog.forEach(item => {
+      if (!isBundleCatalogItem(item)) return;
+      const key = normalizeSkuKey(item.skuId);
+      if (key) {
+        map.set(key, computeBundleAvailablePacks(item, stock, [], undefined, catalog));
+      }
+    });
+    return map;
+  }, [catalog, stock]);
+
+  // Non-bundle SKU options for component picker autocomplete
+  const componentCatalogOptions = useMemo(() => {
+    const map = new Map<string, { skuId: string; skuName: string; stockQty: number }>();
+    catalog.forEach(item => {
+      if (isBundleCatalogItem(item)) return;
+      const key = normalizeSkuKey(item.skuId);
+      if (!key) return;
+      map.set(key, {
+        skuId: key,
+        skuName: item.skuName || key,
+        stockQty: stockSummaryMap.get(key)?.totalQtyPcs || 0
+      });
+    });
+    stock.forEach(s => {
+      const key = normalizeSkuKey(s.skuId);
+      if (!key || map.has(key)) return;
+      map.set(key, {
+        skuId: key,
+        skuName: s.skuName || key,
+        stockQty: stockSummaryMap.get(key)?.totalQtyPcs || 0
+      });
+    });
+    return Array.from(map.values()).sort((a, b) => a.skuId.localeCompare(b.skuId));
+  }, [catalog, stock, stockSummaryMap]);
+
   // Filtered Catalog
   const filteredCatalog = useMemo(() => {
     return catalog.filter(item => {
@@ -220,26 +278,36 @@ export default function ProductCatalog({
       const normSku = (item.skuId || '').toUpperCase();
       const itemBrand = getProductBrand(item.skuId, item.skuName, item.brand);
       const itemBarcode = getBarcodeForSku(item.skuId, item.barcode);
+      const isBundle = isBundleCatalogItem(item);
+      const componentMatch = isBundle && (item.bundleComponents || []).some(c =>
+        c.skuId.toLowerCase().includes(term) || (c.skuName || '').toLowerCase().includes(term)
+      );
 
       const matchesSearch = (
         normSku.toLowerCase().includes(term) ||
         (item.skuName || '').toLowerCase().includes(term) ||
         (itemBrand || '').toLowerCase().includes(term) ||
-        (itemBarcode || '').toLowerCase().includes(term)
+        (itemBarcode || '').toLowerCase().includes(term) ||
+        componentMatch
       );
 
       if (!matchesSearch) return false;
 
+      if (activeTab === 'BUNDLES') return isBundle;
+
       const stockData = stockSummaryMap.get(normSku);
-      const hasStock = stockData && stockData.totalQtyPcs > 0;
+      const bundleAvail = isBundle ? bundleAvailabilityMap.get(normSku) : undefined;
+      const hasStock = isBundle
+        ? Boolean(bundleAvail && bundleAvail.maxPacks > 0)
+        : Boolean(stockData && stockData.totalQtyPcs > 0);
 
       if (activeTab === 'IN_STOCK') return hasStock;
       if (activeTab === 'NO_STOCK') return !hasStock;
-      if (activeTab === 'PLACEHOLDER') return isPlaceholderSkuName(item.skuId, item.skuName);
+      if (activeTab === 'PLACEHOLDER') return !isBundle && isPlaceholderSkuName(item.skuId, item.skuName);
 
       return true;
     });
-  }, [catalog, searchTerm, activeTab, stockSummaryMap]);
+  }, [catalog, searchTerm, activeTab, stockSummaryMap, bundleAvailabilityMap]);
 
   const displayedCatalog = filteredCatalog;
 
@@ -286,9 +354,19 @@ export default function ProductCatalog({
     let skusWithStock = 0;
     let totalStockVolumePcs = 0;
     let placeholderCount = 0;
+    let bundleCount = 0;
 
     catalog.forEach(item => {
       const normSku = item.skuId.toUpperCase();
+      const isBundle = isBundleCatalogItem(item);
+      if (isBundle) {
+        bundleCount += 1;
+        const avail = bundleAvailabilityMap.get(normSku);
+        if (avail && avail.maxPacks > 0) {
+          skusWithStock += 1;
+        }
+        return;
+      }
       if (isPlaceholderSkuName(item.skuId, item.skuName)) {
         placeholderCount += 1;
       }
@@ -304,9 +382,10 @@ export default function ProductCatalog({
       skusWithStock,
       totalStockVolumePcs,
       unmappedStockCount: unmappedStockSkus.length,
-      placeholderCount
+      placeholderCount,
+      bundleCount
     };
-  }, [catalog, stockSummaryMap, unmappedStockSkus]);
+  }, [catalog, stockSummaryMap, bundleAvailabilityMap, unmappedStockSkus]);
 
   const crossBranchPlan = useMemo(() => {
     if (!selectedSourceBranch || sourceBranchCatalog.length === 0) return null;
@@ -337,8 +416,125 @@ export default function ProductCatalog({
     setIsModalOpen(true);
   };
 
+  const handleOpenAddBundleModal = () => {
+    if (!isAdmin) return;
+    setBundleModalMode('add');
+    setBundleEditingSkuId('');
+    setBundleSkuIdInput('');
+    setBundleSkuNameInput('');
+    setBundleBrandInput('');
+    setBundleBarcodeInput('');
+    setBundleRows([
+      { skuId: '', qty: '1' },
+      { skuId: '', qty: '1' }
+    ]);
+    setBundleFormError('');
+    setIsBundleModalOpen(true);
+  };
+
+  const handleOpenEditBundleModal = (item: CatalogItem) => {
+    if (!isAdmin) return;
+    setBundleModalMode('edit');
+    setBundleEditingSkuId(item.skuId);
+    setBundleSkuIdInput(item.skuId);
+    setBundleSkuNameInput(item.skuName);
+    setBundleBrandInput(getProductBrand(item.skuId, item.skuName, item.brand));
+    setBundleBarcodeInput(item.barcode && item.barcode !== '-' ? item.barcode : '');
+    setBundleRows(
+      (item.bundleComponents || []).length > 0
+        ? (item.bundleComponents || []).map(c => ({ skuId: c.skuId, qty: String(c.qty) }))
+        : [{ skuId: '', qty: '1' }]
+    );
+    setBundleFormError('');
+    setIsBundleModalOpen(true);
+  };
+
+  const handleBundleFormSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setBundleFormError('');
+    setSuccessMsg('');
+
+    const trimmedSkuId = bundleSkuIdInput.trim().toUpperCase();
+    const trimmedSkuName = bundleSkuNameInput.trim();
+    const trimmedBrand = getProductBrand(trimmedSkuId, trimmedSkuName, bundleBrandInput.trim());
+    const rawBarcode = bundleBarcodeInput.trim();
+    const trimmedBarcode = rawBarcode && rawBarcode !== '-' ? rawBarcode : '-';
+
+    if (!trimmedSkuId) {
+      setBundleFormError('Kode SKU Bundling tidak boleh kosong.');
+      return;
+    }
+    if (!trimmedSkuName) {
+      setBundleFormError('Nama Paket Bundling tidak boleh kosong.');
+      return;
+    }
+
+    const validation = normalizeBundleComponents(
+      bundleRows.map(r => ({
+        skuId: r.skuId,
+        qty: parseInt(r.qty, 10)
+      })),
+      trimmedSkuId,
+      catalog
+    );
+
+    if (!validation.ok) {
+      setBundleFormError(validation.error || 'Komponen bundling tidak valid.');
+      return;
+    }
+
+    setIsSavingBundle(true);
+    try {
+      if (bundleModalMode === 'add') {
+        const exists = catalog.some(item => normalizeSkuKey(item.skuId) === trimmedSkuId);
+        if (exists) {
+          setBundleFormError(`SKU "${trimmedSkuId}" sudah terdaftar dalam katalog.`);
+          return;
+        }
+        const ok = await onAddCatalogItem({
+          skuId: trimmedSkuId,
+          skuName: trimmedSkuName,
+          brand: trimmedBrand,
+          barcode: trimmedBarcode,
+          qtyCtnSize: 1,
+          qtyInnerSize: 1,
+          isBundle: true,
+          bundleComponents: validation.components
+        });
+        if (ok) {
+          setSuccessMsg(`Master Bundling "${trimmedSkuId}" (${validation.components.length} SKU komponen) berhasil disimpan.`);
+          setIsBundleModalOpen(false);
+        } else {
+          setBundleFormError('Gagal menyimpan Master Bundling. Silakan coba lagi.');
+        }
+      } else {
+        const ok = await onUpdateCatalogItem(bundleEditingSkuId, {
+          skuName: trimmedSkuName,
+          brand: trimmedBrand,
+          barcode: trimmedBarcode,
+          qtyCtnSize: 1,
+          qtyInnerSize: 1,
+          isBundle: true,
+          bundleComponents: validation.components
+        });
+        if (ok) {
+          setSuccessMsg(`Master Bundling "${trimmedSkuId}" berhasil diperbarui (${validation.components.length} SKU komponen).`);
+          setIsBundleModalOpen(false);
+        } else {
+          setBundleFormError('Gagal memperbarui Master Bundling. Silakan coba lagi.');
+        }
+      }
+    } finally {
+      setIsSavingBundle(false);
+    }
+  };
+
   const handleOpenEditModal = (item: CatalogItem) => {
     if (!isAdmin) return;
+    if (isBundleCatalogItem(item)) {
+      handleOpenEditBundleModal(item);
+      return;
+    }
     setModalMode('edit');
     setEditingSkuId(item.skuId);
     setSkuIdInput(item.skuId);
@@ -978,6 +1174,19 @@ export default function ProductCatalog({
               </button>
             )}
 
+            {/* Add New Bundle Button */}
+            {isAdmin && (
+              <button
+                id="btn-add-bundle-item"
+                onClick={handleOpenAddBundleModal}
+                className="flex items-center justify-center gap-1.5 px-3.5 py-2 bg-violet-600/20 hover:bg-violet-600/30 border border-violet-500/40 text-violet-200 active:scale-95 text-xs font-bold rounded-xl transition-all cursor-pointer shadow-md"
+                title="Buat SKU Bundling (paket virtual berisi beberapa SKU komponen)"
+              >
+                <Layers className="w-4 h-4 text-violet-400" />
+                <span>{language === 'en' ? 'Add Bundle' : 'Tambah Bundling'}</span>
+              </button>
+            )}
+
             {/* Add New SKU Button */}
             {isAdmin && (
               <button
@@ -1154,6 +1363,17 @@ export default function ProductCatalog({
             >
               {t('catalog.tabNoStock')} ({catalog.length - stats.skusWithStock})
             </button>
+            <button
+              onClick={() => setActiveTab('BUNDLES')}
+              className={`px-3 py-1.5 text-xs font-bold rounded-xl transition-all cursor-pointer whitespace-nowrap flex items-center gap-1.5 ${
+                activeTab === 'BUNDLES'
+                  ? 'bg-violet-500 text-white font-black shadow-md shadow-violet-500/20'
+                  : 'bg-[#161B25] text-violet-300 hover:text-violet-200 border border-violet-500/25'
+              }`}
+            >
+              <Layers className="w-3.5 h-3.5" />
+              <span>{language === 'en' ? 'Bundles' : 'Master Bundling'} ({stats.bundleCount})</span>
+            </button>
             {(stats.placeholderCount > 0 || activeTab === 'PLACEHOLDER') && (
               <button
                 onClick={() => setActiveTab('PLACEHOLDER')}
@@ -1250,6 +1470,8 @@ export default function ProductCatalog({
                   {displayedCatalog.map((item) => {
                   const normSku = normalizeSkuKey(item.skuId);
                   const isRowSelected = activeSelectedSkuSet.has(normSku);
+                  const isBundle = isBundleCatalogItem(item);
+                  const bundleAvail = isBundle ? bundleAvailabilityMap.get(normSku) : undefined;
                   const itemBrand = getProductBrand(item.skuId, item.skuName, item.brand);
                   const itemBarcode = getBarcodeForSku(item.skuId, item.barcode);
                   const stockData = stockSummaryMap.get(normSku);
@@ -1258,7 +1480,7 @@ export default function ProductCatalog({
                   const splits = calculatePackQuantities(totalQtyPcs, item.qtyCtnSize, item.qtyInnerSize);
 
                   return (
-                    <tr key={item.skuId} className={`transition-colors ${isRowSelected ? 'bg-rose-500/5 hover:bg-rose-500/10' : 'hover:bg-slate-800/20'}`}>
+                    <tr key={item.skuId} className={`transition-colors ${isRowSelected ? 'bg-rose-500/5 hover:bg-rose-500/10' : isBundle ? 'bg-violet-950/10 hover:bg-violet-950/20' : 'hover:bg-slate-800/20'}`}>
                       {isAdmin && (
                         <td className="py-3.5 px-3 text-center">
                           <input
@@ -1271,12 +1493,20 @@ export default function ProductCatalog({
                         </td>
                       )}
                       <td className="py-3.5 px-4 font-mono font-black text-indigo-400 select-all">
-                        {item.skuId}
+                        <div className="flex flex-col gap-1">
+                          <span>{item.skuId}</span>
+                          {isBundle && (
+                            <span className="inline-flex items-center gap-1 w-fit px-1.5 py-0.5 rounded bg-violet-500/20 border border-violet-500/40 text-[9px] font-extrabold text-violet-300 uppercase">
+                              <Layers className="w-2.5 h-2.5" />
+                              Bundling · {item.bundleComponents?.length || 0} SKU
+                            </span>
+                          )}
+                        </div>
                       </td>
                       <td className="py-3.5 px-4 font-semibold text-slate-200">
                         <div className="flex items-center flex-wrap gap-2">
                           <span>{item.skuName}</span>
-                          {isPlaceholderSkuName(item.skuId, item.skuName) && (
+                          {!isBundle && isPlaceholderSkuName(item.skuId, item.skuName) && (
                             <span
                               className="inline-flex items-center px-1.5 py-0.5 rounded bg-amber-500/15 border border-amber-500/30 text-[9px] font-bold text-amber-300"
                               title="Nama barang masih default sistem, belum diisi nama produk asli"
@@ -1285,6 +1515,20 @@ export default function ProductCatalog({
                             </span>
                           )}
                         </div>
+                        {isBundle && item.bundleComponents && item.bundleComponents.length > 0 && (
+                          <div className="flex flex-wrap gap-1 mt-1.5">
+                            {item.bundleComponents.map(comp => (
+                              <span
+                                key={comp.skuId}
+                                className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded bg-slate-900 border border-violet-500/30 text-[10px] font-mono text-slate-300"
+                                title={comp.skuName || comp.skuId}
+                              >
+                                <strong className="text-violet-300">{comp.qty}×</strong>
+                                <span>{comp.skuId}</span>
+                              </span>
+                            ))}
+                          </div>
+                        )}
                       </td>
                       {/* Brand Column beside Item Name */}
                       <td className="py-3.5 px-4">
@@ -1319,7 +1563,18 @@ export default function ProductCatalog({
                       </td>
                       {/* Stok Sistem Connected Column */}
                       <td className="py-3.5 px-4 text-center">
-                        {totalQtyPcs > 0 ? (
+                        {isBundle ? (
+                          <div className="space-y-0.5">
+                            <span className={`font-mono font-black text-xs ${(bundleAvail?.maxPacks || 0) > 0 ? 'text-violet-300' : 'text-rose-400'}`}>
+                              Maks. {formatNumber(bundleAvail?.maxPacks || 0)} Paket
+                            </span>
+                            {bundleAvail?.limitingSku && (
+                              <div className="text-[10px] text-slate-400 font-mono">
+                                Batas: {bundleAvail.limitingSku}
+                              </div>
+                            )}
+                          </div>
+                        ) : totalQtyPcs > 0 ? (
                           <div className="space-y-0.5">
                             <span className="font-mono font-black text-emerald-400 text-xs">
                               {formatNumber(totalQtyPcs)} Pcs
@@ -1338,7 +1593,11 @@ export default function ProductCatalog({
                       </td>
                       {/* Lokasi Rak Column */}
                       <td className="py-3.5 px-4 text-center">
-                        {locationsList.length > 0 ? (
+                        {isBundle ? (
+                          <span className="inline-block text-[10px] font-bold bg-violet-950/60 border border-violet-500/30 text-violet-300 px-2 py-0.5 rounded-md font-mono">
+                            Virtual BOM
+                          </span>
+                        ) : locationsList.length > 0 ? (
                           <div className="flex items-center justify-center flex-wrap gap-1 max-w-[140px] mx-auto">
                             {locationsList.slice(0, 3).map(loc => (
                               <span key={loc} className="text-[10px] font-mono font-bold bg-indigo-950/60 border border-indigo-500/30 text-indigo-300 px-1.5 py-0.5 rounded">
@@ -1384,6 +1643,194 @@ export default function ProductCatalog({
           </table>
         </div>
       </div>
+
+      {/* Master Bundling Add/Edit Modal */}
+      {isBundleModalOpen && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm p-4">
+          <div className="w-full max-w-xl bg-[#11141B] rounded-2xl border border-violet-500/40 shadow-2xl overflow-hidden relative max-h-[90vh] flex flex-col">
+            <button
+              type="button"
+              onClick={() => setIsBundleModalOpen(false)}
+              className="absolute top-4 right-4 p-1.5 text-slate-400 hover:text-white hover:bg-slate-800 rounded-xl transition-colors cursor-pointer"
+            >
+              <X className="w-4 h-4" />
+            </button>
+
+            <div className="p-5 border-b border-slate-850 bg-violet-950/20">
+              <h2 className="text-sm font-black text-slate-100 tracking-tight flex items-center gap-2">
+                <Layers className="w-4.5 h-4.5 text-violet-400" />
+                {bundleModalMode === 'add' ? 'Tambah Master Bundling (Virtual BOM)' : `Edit Bundling: ${bundleEditingSkuId}`}
+              </h2>
+              <p className="text-[11px] text-slate-400 mt-1">
+                Saat SKU Bundling diinput atau di-import pada Order B2B / Online, sistem otomatis memecahnya menjadi SKU komponen dan memotong stok fisik masing-masing komponen saat picking.
+              </p>
+            </div>
+
+            <form onSubmit={handleBundleFormSubmit} className="p-5 space-y-4 overflow-y-auto">
+              {bundleFormError && (
+                <div className="flex items-center gap-2 bg-rose-500/10 border border-rose-500/20 text-rose-400 text-xs p-2.5 rounded-lg">
+                  <AlertTriangle className="w-4 h-4 shrink-0 text-rose-500" />
+                  <span>{bundleFormError}</span>
+                </div>
+              )}
+
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                <div>
+                  <label className="block text-[10px] font-bold text-slate-400 uppercase mb-1.5">
+                    SKU Bundling
+                  </label>
+                  <input
+                    type="text"
+                    required
+                    disabled={bundleModalMode === 'edit'}
+                    placeholder="e.g. BUNDLE-HEMAT-3"
+                    value={bundleSkuIdInput}
+                    onChange={(e) => setBundleSkuIdInput(e.target.value)}
+                    className="w-full px-3 py-2 text-xs bg-[#161B25] border border-slate-850 rounded-xl text-slate-200 placeholder-slate-600 focus:outline-none focus:ring-1 focus:ring-violet-500 focus:border-violet-500 uppercase font-mono disabled:opacity-50 disabled:cursor-not-allowed"
+                  />
+                </div>
+                <div>
+                  <label className="block text-[10px] font-bold text-slate-400 uppercase mb-1.5">
+                    Nama Paket Bundling
+                  </label>
+                  <input
+                    type="text"
+                    required
+                    placeholder="e.g. Paket Glowing 3in1"
+                    value={bundleSkuNameInput}
+                    onChange={(e) => setBundleSkuNameInput(e.target.value)}
+                    className="w-full px-3 py-2 text-xs bg-[#161B25] border border-slate-850 rounded-xl text-slate-200 placeholder-slate-600 focus:outline-none focus:ring-1 focus:ring-violet-500 focus:border-violet-500"
+                  />
+                </div>
+              </div>
+
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                <div>
+                  <label className="block text-[10px] font-bold text-slate-400 uppercase mb-1.5">
+                    Brand / Merk (Opsional)
+                  </label>
+                  <input
+                    type="text"
+                    placeholder="e.g. TRUEBLUE"
+                    value={bundleBrandInput}
+                    onChange={(e) => setBundleBrandInput(e.target.value)}
+                    className="w-full px-3 py-2 text-xs bg-[#161B25] border border-slate-850 rounded-xl text-slate-200 placeholder-slate-600 focus:outline-none focus:ring-1 focus:ring-violet-500 focus:border-violet-500"
+                  />
+                </div>
+                <div>
+                  <label className="block text-[10px] font-bold text-slate-400 uppercase mb-1.5">
+                    Barcode Paket (Opsional)
+                  </label>
+                  <input
+                    type="text"
+                    placeholder="Opsional, jika ada barcode paket"
+                    value={bundleBarcodeInput}
+                    onChange={(e) => setBundleBarcodeInput(e.target.value)}
+                    className="w-full px-3 py-2 text-xs bg-[#161B25] border border-slate-850 rounded-xl text-slate-200 placeholder-slate-600 focus:outline-none focus:ring-1 focus:ring-violet-500 focus:border-violet-500 font-mono"
+                  />
+                </div>
+              </div>
+
+              {/* Components List */}
+              <div className="space-y-2.5">
+                <div className="flex items-center justify-between">
+                  <label className="text-[10px] font-bold text-violet-300 uppercase tracking-wider">
+                    Komponen SKU Penyusun (Qty per 1 Paket)
+                  </label>
+                  <button
+                    type="button"
+                    onClick={() => setBundleRows(prev => [...prev, { skuId: '', qty: '1' }])}
+                    className="inline-flex items-center gap-1 px-2.5 py-1 rounded-lg bg-violet-500/20 hover:bg-violet-500/30 border border-violet-500/40 text-[11px] font-bold text-violet-200 cursor-pointer"
+                  >
+                    <Plus className="w-3 h-3" />
+                    Tambah Komponen
+                  </button>
+                </div>
+
+                <datalist id="wms-bundle-component-skus">
+                  {componentCatalogOptions.map(opt => (
+                    <option key={opt.skuId} value={opt.skuId}>
+                      {opt.skuName} (Stok: {opt.stockQty} pcs)
+                    </option>
+                  ))}
+                </datalist>
+
+                <div className="space-y-2">
+                  {bundleRows.map((row, idx) => {
+                    const normComp = normalizeSkuKey(row.skuId);
+                    const matchedOpt = componentCatalogOptions.find(o => o.skuId === normComp);
+                    return (
+                      <div key={idx} className="flex items-center gap-2 bg-[#161B25] border border-slate-800 rounded-xl p-2">
+                        <span className="text-[10px] font-mono text-slate-500 w-5 text-center">{idx + 1}.</span>
+                        <div className="flex-1 min-w-0">
+                          <input
+                            type="text"
+                            list="wms-bundle-component-skus"
+                            required
+                            placeholder="Ketik atau pilih SKU komponen..."
+                            value={row.skuId}
+                            onChange={(e) => {
+                              const val = e.target.value;
+                              setBundleRows(prev => prev.map((r, i) => (i === idx ? { ...r, skuId: val } : r)));
+                            }}
+                            className="w-full px-2.5 py-1.5 text-xs bg-[#11141B] border border-slate-800 rounded-lg text-slate-200 placeholder-slate-600 focus:outline-none focus:ring-1 focus:ring-violet-500 font-mono uppercase"
+                          />
+                          {matchedOpt && (
+                            <div className="text-[10px] text-slate-400 truncate mt-0.5 px-1">
+                              {matchedOpt.skuName} · <span className="text-emerald-400 font-mono">Stok: {formatNumber(matchedOpt.stockQty)} pcs</span>
+                            </div>
+                          )}
+                        </div>
+                        <div className="w-20 shrink-0">
+                          <input
+                            type="number"
+                            min={1}
+                            required
+                            aria-label={`Qty komponen ${idx + 1}`}
+                            value={row.qty}
+                            onChange={(e) => {
+                              const val = e.target.value;
+                              setBundleRows(prev => prev.map((r, i) => (i === idx ? { ...r, qty: val } : r)));
+                            }}
+                            className="w-full px-2 py-1.5 text-xs text-center bg-[#11141B] border border-slate-800 rounded-lg text-violet-300 font-mono font-bold focus:outline-none focus:ring-1 focus:ring-violet-500"
+                          />
+                          <div className="text-[9px] text-slate-500 text-center mt-0.5">pcs/paket</div>
+                        </div>
+                        <button
+                          type="button"
+                          disabled={bundleRows.length <= 1}
+                          onClick={() => setBundleRows(prev => prev.filter((_, i) => i !== idx))}
+                          className="p-1.5 text-slate-500 hover:text-rose-400 disabled:opacity-30 rounded-lg cursor-pointer"
+                          title="Hapus baris komponen"
+                        >
+                          <Trash2 className="w-3.5 h-3.5" />
+                        </button>
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+
+              <div className="flex items-center justify-end gap-2 pt-3 border-t border-slate-850">
+                <button
+                  type="button"
+                  onClick={() => setIsBundleModalOpen(false)}
+                  className="px-4 py-2 text-xs font-bold text-slate-400 hover:text-white bg-slate-800/60 hover:bg-slate-800 rounded-xl transition-colors cursor-pointer"
+                >
+                  Batal
+                </button>
+                <button
+                  type="submit"
+                  disabled={isSavingBundle}
+                  className="px-4 py-2 text-xs font-black text-white bg-violet-600 hover:bg-violet-500 disabled:opacity-50 rounded-xl transition-colors cursor-pointer shadow-lg shadow-violet-600/20"
+                >
+                  {isSavingBundle ? 'Menyimpan...' : bundleModalMode === 'add' ? 'Simpan Master Bundling' : 'Perbarui Bundling'}
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
 
       {/* Catalog Add/Edit Modal */}
       {isModalOpen && (

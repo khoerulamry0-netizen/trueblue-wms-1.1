@@ -2,7 +2,7 @@
 import React,{useEffect,useMemo,useRef,useState} from 'react';
 import * as XLSX from 'xlsx';
 import { Upload, Download, CheckCircle } from 'lucide-react';
-import type { ChannelOperationType, StockItem, OutboundItem } from '../types';
+import type { CatalogItem, ChannelOperationType, StockItem, OutboundItem } from '../types';
 import { collection,db,doc,getDocs,getActiveBranch,supabase,writeBatch } from '../supabase';
 import {
   parseOrderTable,
@@ -15,13 +15,14 @@ import {
 import { normalizeStockBatch } from '../utils/stockNormalization';
 import { isNoExpiryDate } from '../utils/calculations';
 
-export default function OrderFileImport({stock,orderHistory,warehouseId,defaultOrderType}:{stock:StockItem[];orderHistory:OutboundItem[];warehouseId:string;defaultOrderType?:ChannelOperationType}){
+export default function OrderFileImport({stock,orderHistory,warehouseId,defaultOrderType,catalog=[]}:{stock:StockItem[];orderHistory:OutboundItem[];warehouseId:string;defaultOrderType?:ChannelOperationType;catalog?:CatalogItem[]}){
  const [lines,setLines]=useState<ImportLine[]>([]),[filename,setFilename]=useState(''),[batchInput,setBatchInput]=useState(''),[error,setError]=useState(''),[success,setSuccess]=useState(''),[busy,setBusy]=useState(false);
  const [attempt,setAttempt]=useState<{p_request_id:string;p_branch_id:string;p_warehouse_id:string;p_items:OutboundItem[]}|null>(null);
  const lock=useRef(false),fileInput=useRef<HTMLInputElement>(null);
  const branch=getActiveBranch();
- const plan=useMemo(()=>planOrderImport(lines,stock,orderHistory,warehouseId),[lines,stock,orderHistory,warehouseId]);
+ const plan=useMemo(()=>planOrderImport(lines,stock,orderHistory,warehouseId,catalog),[lines,stock,orderHistory,warehouseId,catalog]);
  const invalid=plan.filter(l=>l.errors.length),orderCount=new Set(lines.map(l=>l.orderNumber.toUpperCase())).size;
+ const expandedBundleCount=plan.filter(l=>Boolean(l.bundleSource)).length;
  const button='inline-flex items-center gap-2 rounded-lg border border-slate-700 bg-[#161B25] text-slate-200 hover:bg-slate-800 px-3 py-2 text-xs font-bold transition-colors cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed';
  const reset=()=>{setLines([]);setFilename('');setError('');setSuccess('');setAttempt(null);if(fileInput.current)fileInput.current.value='';};
  const template=()=>{
@@ -61,9 +62,9 @@ export default function OrderFileImport({stock,orderHistory,warehouseId,defaultO
       .filter(d => d.id !== 'SYSTEM_EMPTY_FLAG' && d.id !== 'SYSTEM_DEFAULTS_CONFIG')
       .map(d => d.data());
     const freshStock = normalizeStockBatch(rawStockRecords);
-    const fresh=planOrderImport(lines, freshStock, freshOrders, whAtStart);
+    const fresh=planOrderImport(lines, freshStock, freshOrders, whAtStart, catalog);
     if(fresh.some(l=>l.errors.length))throw new Error('Stok tidak cukup atau nomor order sudah terdaftar. Periksa pratinjau terbaru sebelum mencoba lagi.');
-    const requiredTotal = lines.reduce((sum, l) => sum + l.qty, 0);
+    const requiredTotal = fresh.reduce((sum, l) => sum + l.qty, 0);
     const allocatedTotal = fresh.reduce((sum, l) => sum + l.allocations.reduce((s, a) => s + a.qty, 0), 0);
     if (allocatedTotal < requiredTotal) throw new Error('Stok bebas tidak mencukupi untuk memenuhi seluruh kuantitas order.');
 
@@ -108,6 +109,7 @@ export default function OrderFileImport({stock,orderHistory,warehouseId,defaultO
        orderType: defaultOrderType,
        orderSource: defaultOrderType === 'ONLINE' ? 'IMPORT_ONLINE' : 'IMPORT_B2B',
      } : {}),
+     ...(l.bundleSource ? { bundleSku: l.bundleSource } : {}),
     })));
     if(items.length>5000)throw new Error('Alokasi melebihi 5.000 baris. Pecah file menjadi beberapa bagian.');
     payload={p_request_id:requestId,p_branch_id:branchAtStart,p_warehouse_id:whAtStart,p_items:items};
@@ -138,8 +140,8 @@ export default function OrderFileImport({stock,orderHistory,warehouseId,defaultO
   {plan.some(l=>l.reuseCancelled)&&<p className="wms-info-panel rounded-lg border border-blue-500/30 bg-blue-500/10 p-3 text-xs font-semibold text-blue-300">Nomor order yang dibatalkan akan dibuat sebagai transaksi baru. Riwayat pembatalan lama tetap tersimpan.</p>}
   {error&&<p role="alert" className="rounded-lg border border-rose-400 p-3 text-rose-400">{error}{attempt&&' Jika koneksi terputus, klik Coba Simpan Lagi; permintaan yang sama tidak menggandakan order.'}</p>}
   {success&&<p role="status" className="rounded-lg border border-emerald-400 p-3 text-emerald-400 flex gap-2"><CheckCircle className="w-5 h-5 shrink-0"/>{success}</p>}
-  {lines.length>0&&<><div className="text-sm rounded-lg bg-slate-800 p-3">{orderCount} order · {lines.length} baris · {lines.reduce((a,l)=>a+l.qty,0).toLocaleString('id-ID')} pcs · <strong>{invalid.length} baris bermasalah</strong><p className="mt-1 text-slate-400">Semua baris harus valid. Stok dialokasikan dari rak aktif menurut kedaluwarsa terdekat; area buffer, rusak, dan kedaluwarsa dikecualikan. Stok fisik baru dipotong saat picking.</p></div>
-  <div className="max-h-96 overflow-auto rounded-lg border"><table className="w-full text-left text-sm"><thead className="sticky top-0 bg-slate-800"><tr>{['Baris','No Order','No PO','SKU','Qty pcs','Pelanggan','Alamat / Telepon','Hasil pemeriksaan'].map(h=><th key={h} className="p-2 whitespace-nowrap">{h}</th>)}</tr></thead><tbody>{plan.map(l=><tr key={l.row} className="border-t"><td className="p-2">{l.row}</td><td className="p-2">{l.orderNumber}</td><td className="p-2 whitespace-nowrap font-mono">{l.noPo||'—'}</td><td className="p-2 whitespace-nowrap">{l.skuId}</td><td className="p-2">{l.qty}</td><td className="p-2">{l.customerName||'—'}</td><td className="p-2 min-w-[220px] whitespace-pre-wrap">{l.customerAddress||'—'}<div className="mt-1 font-mono">{l.customerPhone||'—'}</div></td><td className="p-2">{l.errors.length?<span className="text-rose-400">{l.errors.join(' ')}</span>:<span className="text-emerald-400">{l.allocations.map(a=>a.stock.location+' · '+a.stock.expiredDate+' · '+a.qty+' pcs').join('; ')}</span>}</td></tr>)}</tbody></table></div>
+  {lines.length>0&&<><div className="text-sm rounded-lg bg-slate-800 p-3">{orderCount} order · {plan.length} baris komponen{expandedBundleCount>0?` (${expandedBundleCount} dari bundling)`:''} · {plan.reduce((a,l)=>a+l.qty,0).toLocaleString('id-ID')} pcs · <strong>{invalid.length} baris bermasalah</strong><p className="mt-1 text-slate-400">Semua baris harus valid. SKU Bundling otomatis dipecah menjadi SKU komponen. Stok dialokasikan dari rak aktif menurut kedaluwarsa terdekat; area buffer, rusak, dan kedaluwarsa dikecualikan. Stok fisik baru dipotong saat picking.</p></div>
+  <div className="max-h-96 overflow-auto rounded-lg border"><table className="w-full text-left text-sm"><thead className="sticky top-0 bg-slate-800"><tr>{['Baris','No Order','No PO','SKU','Qty pcs','Pelanggan','Alamat / Telepon','Hasil pemeriksaan'].map(h=><th key={h} className="p-2 whitespace-nowrap">{h}</th>)}</tr></thead><tbody>{plan.map(l=><tr key={`${l.row}-${l.skuId}`} className="border-t"><td className="p-2">{l.row}</td><td className="p-2">{l.orderNumber}</td><td className="p-2 whitespace-nowrap font-mono">{l.noPo||'—'}</td><td className="p-2 whitespace-nowrap"><div>{l.skuId}</div>{l.bundleSource&&<div className="mt-0.5 inline-block px-1.5 py-0.5 rounded bg-violet-500/20 border border-violet-500/30 text-[10px] font-bold text-violet-300">Bundling: {l.bundleSource}</div>}</td><td className="p-2">{l.qty}</td><td className="p-2">{l.customerName||'—'}</td><td className="p-2 min-w-[220px] whitespace-pre-wrap">{l.customerAddress||'—'}<div className="mt-1 font-mono">{l.customerPhone||'—'}</div></td><td className="p-2">{l.errors.length?<span className="text-rose-400">{l.errors.join(' ')}</span>:<span className="text-emerald-400">{l.allocations.map(a=>a.stock.location+' · '+a.stock.expiredDate+' · '+a.qty+' pcs').join('; ')}</span>}</td></tr>)}</tbody></table></div>
   <button type="button" disabled={busy||(!attempt&&invalid.length>0)} onClick={()=>void save()} className={button+' bg-emerald-500 text-slate-950'}>{busy?'Menyimpan…':attempt?'Coba Simpan Lagi':'Simpan '+orderCount+' Order Pending'}</button></>}
  </section>;
 }
