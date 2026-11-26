@@ -443,14 +443,14 @@ export default function MarketplaceIntegration({ currentUser, catalog }: { curre
             </div>
 
             {/* TikTok Shop Guide */}
-            <div className="rounded-xl border border-cyan-500/30 bg-cyan-950/15 p-4 space-y-2.5 text-xs">
+            <div className="rounded-xl border border-teal-500/40 bg-teal-950/15 p-4 space-y-2.5 text-xs">
               <div className="flex items-center justify-between">
-                <span className="font-black text-cyan-300 text-sm">2. TikTok Shop Partner Center</span>
+                <span className="font-black text-teal-500 text-sm">2. TikTok Shop Partner Center</span>
                 <a
                   href="https://partner.tiktokshop.com"
                   target="_blank"
                   rel="noreferrer"
-                  className="inline-flex items-center gap-1 text-cyan-300 hover:text-cyan-200 font-bold underline"
+                  className="inline-flex items-center gap-1 text-teal-500 hover:text-teal-400 font-bold underline"
                 >
                   partner.tiktokshop.com <ExternalLink size={12} />
                 </a>
@@ -464,7 +464,7 @@ export default function MarketplaceIntegration({ currentUser, catalog }: { curre
               <div className="pt-1">
                 <div className="text-[10px] font-bold uppercase text-slate-400 mb-1">Redirect / Callback URL TikTok Shop:</div>
                 <div className="flex items-center gap-2 bg-[#161B25] border border-slate-700 rounded-lg px-2.5 py-1.5">
-                  <code className="text-[11px] text-cyan-200 truncate flex-1">{tiktokCallbackUrl}</code>
+                  <code className="text-[11px] text-teal-500 font-semibold truncate flex-1">{tiktokCallbackUrl}</code>
                   <button
                     type="button"
                     onClick={() => copyText('tiktok-cb', tiktokCallbackUrl)}
@@ -533,7 +533,7 @@ export default function MarketplaceIntegration({ currentUser, catalog }: { curre
               id="btn-connect-tiktok-live"
               onClick={() => connectLive('TIKTOK')}
               disabled={busy !== null}
-              className="inline-flex items-center gap-1.5 rounded-xl border border-cyan-500/40 bg-cyan-500/15 hover:bg-cyan-500/25 px-3 py-2 text-xs font-extrabold text-cyan-200 disabled:opacity-50 cursor-pointer"
+              className="inline-flex items-center gap-1.5 rounded-xl border border-teal-500/50 bg-teal-600/20 hover:bg-teal-600/30 px-3 py-2 text-xs font-extrabold text-teal-500 disabled:opacity-50 cursor-pointer"
             >
               <Link2 size={14} /> Hubungkan TikTok Shop Live
             </button>
