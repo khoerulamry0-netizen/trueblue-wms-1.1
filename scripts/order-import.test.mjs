@@ -76,3 +76,44 @@ test('OrderFileImport uses template constants and shows No PO in instructions an
   assert.ok(source.includes('dan No PO opsional'));
   assert.ok(source.includes('l.noPo'));
 });
+
+test('parseOrderTable directly parses Upfos detail order export with decimal .0 quantities', () => {
+  const upfosTable = [
+    [
+      'Waktu Pembuatan', 'Platform', 'Nama Toko', 'Nomor Transaksi Platform', 'Nomor order pengiriman',
+      'Manajemen Logistik', 'Layanan logistik', 'No.Logistik Pengembalian', 'Gudang', 'Kode Produk',
+      'Nama Produk', 'Kode Spesifik Produk', 'Nama SKU', 'Produk Qty', 'Nama pembeli',
+      'Nama Penerima', 'Nomor HP penerima', 'Nomor Telpon Penerima', 'Daerah', 'Kode Pos Penerima',
+      'Alamat Penerima', 'Port code', 'Penanda Sistem', 'Waktu Pemindaian', 'Berat', 'Sumber',
+      'Atribut Produk', 'NDD Waktu hadiah',
+    ],
+    [
+      '2026-11-24 08:58:33', 'Shopee', 'SHOPEE - HER HARMONY', '26112450B90A0H', '105785215867',
+      'SPX Sameday', '', '26112450B90A0H', 'SWH', 'POMTR253045621',
+      'Her Harmony Terragenix', 'POMTR253045621', 'POMTR253045621', '1.0', 'daganganlaris2018',
+      'R**i', '******88', '', 'Dki Jakarta/Kota Adm. Jakarta Utara/Cilincing', '14140',
+      '******rand orchard, KOTA JAKARTA UTARA', '', 'Waktu,Distribusi kota', '2026-11-24 09:58:30', '0.024', '',
+      'Produk General', '',
+    ],
+    [
+      '2026-11-24 08:58:33', 'Shopee', 'SHOPEE - HER HARMONY', '26112450B90A0H', '105785215867',
+      'SPX Sameday', '', '26112450B90A0H', 'SWH', 'BUBBLEWRAP-3 LAYER',
+      'BUBBLE WRAP 3 LAYER', 'BUBBLEWRAP-3 LAYER', 'BUBBLE WRAP 3 LAYER', '3.0', 'daganganlaris2018',
+      'R**i', '******88', '', 'Dki Jakarta/Kota Adm. Jakarta Utara/Cilincing', '14140',
+      '******rand orchard, KOTA JAKARTA UTARA', '', 'Waktu,Distribusi kota', '2026-11-24 09:58:30', '0.024', '',
+      'Produk General', '',
+    ],
+  ];
+
+  const parsed = parseOrderTable(upfosTable);
+  assert.equal(parsed.length, 2);
+  assert.deepEqual(parsed[0].errors, []);
+  assert.deepEqual(parsed[1].errors, []);
+  assert.equal(parsed[0].orderNumber, '26112450B90A0H');
+  assert.equal(parsed[0].skuId, 'POMTR253045621');
+  assert.equal(parsed[0].qty, 1);
+  assert.equal(parsed[0].customerName, 'R**i');
+  assert.equal(parsed[0].customerPhone, '******88');
+  assert.equal(parsed[1].skuId, 'BUBBLEWRAP-3 LAYER');
+  assert.equal(parsed[1].qty, 3);
+});

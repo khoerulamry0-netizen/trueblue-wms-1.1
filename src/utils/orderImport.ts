@@ -23,7 +23,7 @@ export const ORDER_IMPORT_TEMPLATE_COL_WIDTHS = [
   { wch: 22 },
   { wch: 22 },
 ] as const;
-const aliases:Record<string,string> = { noorder:'orderNumber', nomororder:'orderNumber', ordernumber:'orderNumber', orderid:'orderNumber', sku:'skuId', skuid:'skuId', kodebarang:'skuId', qty:'qty', jumlah:'qty', qtypcs:'qty', customer:'customerName', pelanggan:'customerName', namapelanggan:'customerName', customername:'customerName', alamat:'customerAddress', alamatpelanggan:'customerAddress', alamatpenerima:'customerAddress', customeraddress:'customerAddress', address:'customerAddress', teleponpelanggan:'customerPhone', telepon:'customerPhone', nomortelepon:'customerPhone', nohp:'customerPhone', hp:'customerPhone', customerphone:'customerPhone', phone:'customerPhone', nopo:'noPo', nomorpo:'noPo', po:'noPo', ponumber:'noPo', pono:'noPo', purchaseorder:'noPo', batch:'batchNumber', nomorbatch:'batchNumber', batchnumber:'batchNumber' };
+const aliases:Record<string,string> = { noorder:'orderNumber', nomororder:'orderNumber', ordernumber:'orderNumber', orderid:'orderNumber', nomortransaksiplatform:'orderNumber', sku:'skuId', skuid:'skuId', kodebarang:'skuId', kodeproduk:'skuId', qty:'qty', jumlah:'qty', qtypcs:'qty', produkqty:'qty', customer:'customerName', pelanggan:'customerName', namapelanggan:'customerName', customername:'customerName', namapenerima:'customerName', alamat:'customerAddress', alamatpelanggan:'customerAddress', alamatpenerima:'customerAddress', customeraddress:'customerAddress', address:'customerAddress', teleponpelanggan:'customerPhone', telepon:'customerPhone', nomortelepon:'customerPhone', nohp:'customerPhone', hp:'customerPhone', customerphone:'customerPhone', phone:'customerPhone', nomorhppenerima:'customerPhone', nopo:'noPo', nomorpo:'noPo', po:'noPo', ponumber:'noPo', pono:'noPo', purchaseorder:'noPo', batch:'batchNumber', nomorbatch:'batchNumber', batchnumber:'batchNumber' };
 export function parseOrderTable(table:unknown[][]):ImportLine[] {
  if(table.length<2) throw new Error('File harus memiliki header dan minimal satu baris order.');
  const headers=table[0].map(v=>aliases[String(v??'').toLowerCase().replace(/[^a-z0-9]/g,'')]||'');
@@ -36,7 +36,7 @@ export function parseOrderTable(table:unknown[][]):ImportLine[] {
   const errors:string[]=[];
   if(!data.orderNumber||data.orderNumber.length>128)errors.push('No Order wajib diisi, maksimal 128 karakter.');
   if(!data.skuId||data.skuId.length>128)errors.push('SKU wajib diisi, maksimal 128 karakter.');
-  if(!/^[1-9][0-9]*$/.test(data.qty||'')||!Number.isSafeInteger(Number(data.qty)))errors.push('Qty harus bilangan bulat positif dalam pcs, tanpa pemisah ribuan.');
+  if(!/^[1-9][0-9]*(?:\.0+)?$/.test(data.qty||'')||!Number.isSafeInteger(Number(data.qty)))errors.push('Qty harus bilangan bulat positif dalam pcs, tanpa pemisah ribuan.');
   if((data.customerName||'').length>200||(data.noPo||'').length>128||(data.batchNumber||'').length>128)errors.push('Pelanggan maksimal 200 karakter; PO dan batch maksimal 128.');
   if((data.customerAddress||'').length>1000)errors.push('Alamat pelanggan maksimal 1.000 karakter.');
   if((data.customerPhone||'').length>40)errors.push('Telepon pelanggan maksimal 40 karakter.');
